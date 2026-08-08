@@ -1,38 +1,8 @@
-//
 // Copyright (c) 2012-2026 Duzy Chan <smart@extbit.io> and ExtBit LLC.
-// All rights reserverd.
+// All rights reserved.
 //
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are
-// met:
-//
-//    * Redistributions of source code must retain the above copyright
-//      notice, this list of conditions and the following disclaimer.
-//    * Redistributions in binary form must reproduce the above
-//      copyright notice, this list of conditions and the following disclaimer
-//      in the documentation and/or other materials provided with the
-//      distribution.
-//    * Neither the name of ExtBit LLC, Duzy Chan, nor the names of
-//      contributors may be used to endorse or promote products derived
-//      from this software without specific prior written permission.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
-// THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
-// PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS
-// BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
-// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
-// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
-// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
-// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
-// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
-// THE POSSIBILITY OF SUCH DAMAGE.
-//
-// --------------------------------------------------------------------------------
-// Use of this source code is governed by a BSD-style license as above and a copy
-// of it can be found in the LICENSE file. Duzy Chan and ExtBit LLC hold all rights
-// for explanations.
-//
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
 
 package smart
 
@@ -2992,6 +2962,12 @@ const (
 	opRegexCon                         // Consumes matching regex literals
 	opMatchLiteral                     // Matches a string literal
 	opMatchLiteralRev                  // Matches a string literal (reversed direction)
+	opFallbackGlobSeg                  // Fallback-matches a string literal
+	opFallbackGlobSegRev               // Fallback-matches a string literal (reversed direction)
+	opFallbackGlobGreed                // Fallback-matches a string literal
+	opFallbackGlobGreedRev             // Fallback-matches a string literal (reversed direction)
+	opFallbackGlobCross                // Fallback-matches a string literal
+	opFallbackGlobCrossRev             // Fallback-matches a string literal (reversed direction)
 	opGlobQues                         // Matches a single '?' wildcard
 	opGlobQuesRev                      // Matches a single '?' wildcard (reversed direction)
 	opGlobAsterisk                     // Matches a segment '*' wildcard
@@ -3219,17 +3195,21 @@ func (s *symstr) nfa_eval_meta(target posym, op evalop) bool {
 
 // HELPER 2: Retrieve the literal lookahead safely
 func (s *symstr) nfa_next_lit() posym {
+	syms := s.syms
+	s.syms = nil
 	for len(s.ops) > 0 {
 		switch s.ops[len(s.ops)-1] {
-		case opUnrollMatch, opRetMatch, opRetPack:
-			s.step()
-			continue
 		case opMatchLiteral:
-			lit := s.operands[len(s.operands)-1].(posym)
-			if lit.Symbol != symEmpty { return lit }
+			s.syms = syms
+			return s.operands[len(s.operands)-1].(posym)
+		default:
+			if s.step(); s.syms != nil {
+				syms = append(syms, s.syms...)
+				s.syms = nil
+			}
 		}
-		break
 	}
+	s.syms = syms
 	return posym{}
 }
 
@@ -3298,228 +3278,173 @@ func (s *symstr) nfa_push_unconsumed(rightValid bool, right posym, targetIdx int
 	}
 }
 
+type fallback_glob struct {
+	idx    int
+	target posym
+	lit    posym
+	bt     backtrack
+}
+
 func (s *symstr) op_match_literal(l int) {
 	lit := s.operands[len(s.operands)-1].(posym)
 	s.operands = s.operands[:len(s.operands)-1]
 
-	ret := func(sym Symbol) {
-		s.ops = append(s.ops, opRetPack)
-		s.operands = append(s.operands, posym{lit.Pos, sym})
-	}
-
-	if s.tie == nil {
-		s.err = errMatchFailedStarvedT
-		ret(lit.Symbol)
-		return
-	}
-
-	if !s.tie.ensured_syms() {
-		s.tie.err = io.EOF
+	if s.tie.ensured_syms() {
 		if lit.Symbol == symEmpty {
-			ret(symEmpty)
-		} else {
-			s.err = errMatchFailedStarvedT
-		}
-		return
-	} else if len(s.tie.str) != 0 {
-		erro(s, "ensured_syms left str=%s", s.tie.str)
-	}
-
-	if lit.Symbol == symEmpty {
-		if s.tie != nil && len(s.tie.syms) > 0 {
 			switch s.tie.syms[0].Symbol {
-			case symEmpty: s.tie.syms = s.tie.syms[1:]
+			case symEmpty:
+				s.tie.syms = s.tie.syms[1:]
 			case symQues, symAsterisk, symAsteriskAst, symAsteriskQues:
 				s.err = errMatchFailedCrossSeg
-				return
 			}
-		}
-		ret(symEmpty)
-		return
-	}
-
-	target := s.tie.syms[0]
-
-	if lit.Symbol == target.Symbol {
-		ret(s.tie.pop_head().Symbol)
-		return
-	}
-
-	const bidirectional_fallback_ret_literal = false
-
-	if target.Symbol == symQues {
-		if lit.Symbol == symSlash {
-			s.err = errMatchFailedCrossSeg
 			return
 		}
 
-		s.tie.pop_head()
-		s.vpos = lit.Pos
-		s.str = lit.Symbol.String()
-		r, size := s.decodeRune()
-		if size == 0 || r == 0 {
-			s.err = errMatchFailedZeroRune
+		const bidirectional_fallback_ret_literal = false
+
+		target := s.tie.syms[0]
+
+		switch target.Symbol {
+		case lit.Symbol:
+			lit.Symbol = target.Symbol
+			s.tie.syms = s.tie.syms[1:]
+			s.ops = append(s.ops, opRetPack)
+			s.operands = append(s.operands, lit)
 			return
-		}
 
-		s.ops = append(s.ops, opMatchLiteral)
-		s.operands = append(s.operands, posym{lit.Pos, intern(s.str)})
-		s.vpos = NoPos
-		s.str = ""
-
-		if bidirectional_fallback_ret_literal { ret(intern(string(r))) } else { ret(target.Symbol) }
-		return
-	}
-
-	if target.Symbol == symAsterisk || target.Symbol == symAsteriskAst || target.Symbol == symAsteriskQues {
-		if bidirectional_fallback_ret_literal { ret(lit.Symbol) } else { ret(target.Symbol) }
-
-		s.tie.pop_head()
-
-		var nextTarget posym
-		if s.tie.ensured_syms() { nextTarget = s.tie.syms[0] }
-
-	_ops_subloop_:
-		for len(s.ops) > 0 && s.err == nil {
-			switch s.ops[len(s.ops)-1] {
-			case opUnrollMatch, opRetMatch, opRetPack:
-				s.step()
-				continue
-			case opGlobQues, opGlobAsterisk, opGlobAstGreed, opGlobAstCross:
-				var os Symbol
-				switch s.ops[len(s.ops)-1] {
-				case opGlobQues: os = symQues
-				case opGlobAsterisk: os = symAsterisk
-				case opGlobAstGreed: os = symAsteriskAst
-				case opGlobAstCross: os = symAsteriskQues
-				}
-				s.ops = s.ops[:len(s.ops)-1]
-				s.opsDone++
-				if bidirectional_fallback_ret_literal { ret(os) }
-				s.stems = append(s.stems, capture{start: -1})
-				continue
-			case opRegexMatch:
-				rx := s.operands[len(s.operands)-1].(*regexp.Regexp)
-				s.operands = s.operands[:len(s.operands)-1]
-				s.ops = s.ops[:len(s.ops)-1]
-				s.opsDone++
-				names := rx.SubexpNames()
-				for i := 1; i < len(names); i++ {
-					name := symEmptyName
-					if names[i] != "" { name = intern(names[i]) }
-					s.stems = append(s.stems, capture{start: -1, name: posym{NoPos, name}})
-				}
-				if bidirectional_fallback_ret_literal { ret(intern(rx.String())) }
-				continue
-			case opMatchLiteral:
-				lit = s.operands[len(s.operands)-1].(posym)
-			default:
-				break _ops_subloop_
-			}
-
-			if lit.Symbol == symEmpty {
-				s.err = errMatchFailedWildback
-				break _ops_subloop_
-			}
-			if lit.Symbol == symSlash && target.Symbol == symAsterisk && nextTarget.Symbol != symSlash {
-				s.err = errMatchFailedWildback
-				break _ops_subloop_
-			}
-			if lit.Symbol == nextTarget.Symbol {
-				break _ops_subloop_
-			}
-
-			if nextTarget.Symbol != symEmpty {
-				var matched bool
-				var absorbed, leftover string
-
-				if idx := lit.last_index(nextTarget.Symbol); idx != -1 {
-					slashIdx := lit.index(symSlash)
-					if target.Symbol == symAsterisk && slashIdx != -1 && slashIdx < idx {
-						s.err = errMatchFailedCrossSeg
-						return
-					}
-					str := lit.String()
-					absorbed = str[:idx]
-					leftover = str[idx:]
-					matched = true
-				}
-
-				if !matched && target.Symbol == symAsterisk {
-					if lit.index(symSlash) != -1 {
-						s.err = errMatchFailedCrossSeg
-						return
-					}
-				}
-
-				if matched {
-					if len(leftover) > 0 {
-						s.operands[len(s.operands)-1] = posym{lit.Pos, intern(leftover)}
-					}
-					if bidirectional_fallback_ret_literal && len(absorbed) > 0 {
-						ret(intern(absorbed))
-					}
-					break _ops_subloop_
-				}
-			} else if target.Symbol == symAsterisk && lit.index(symSlash) != -1 {
+		case symQues:
+			if lit.Symbol == symSlash {
 				s.err = errMatchFailedCrossSeg
 				return
 			}
 
-			s.operands = s.operands[:len(s.operands)-1]
-			s.ops = s.ops[:len(s.ops)-1]
-			s.opsDone++
-		}
+			s.tie.syms = s.tie.syms[1:]
 
-		return
-	}
-
-	if lit.Symbol == symSlash || target.Symbol == symSlash || lit.Kind() != target.Kind() {
-		s.err = errMatchFailed
-
-		if checkpoints {
-			if lit.String() == target.String() {
-				erro(pc(s,lit.Pos), "symbol corruption: %v == %v", lit.Symbol, target.Symbol, unwind{})
+			s.vpos = lit.Pos
+			s.str = lit.Symbol.String()
+			r, size := s.decodeRune()
+			if size == 0 || r == 0 {
+				s.err = errMatchFailedZeroRune
+				return
 			}
+
+			lit.Symbol = intern(s.str)
+			s.ops = append(s.ops, opMatchLiteral)
+			s.operands = append(s.operands, lit)
+			s.vpos = NoPos
+			s.str = ""
+
+			if bidirectional_fallback_ret_literal {
+				lit.Symbol = intern(string(r))
+			} else {
+				lit.Symbol = target.Symbol
+			}
+			s.ops = append(s.ops, opRetPack)
+			s.operands = append(s.operands, lit)
+			return
+
+		case symAsterisk, symAsteriskAst, symAsteriskQues:
+			if !bidirectional_fallback_ret_literal { lit.Symbol = target.Symbol }
+			s.ops = append(s.ops, opRetPack)
+			s.operands = append(s.operands, lit)
+
+			s.tie.syms = s.tie.syms[1:]
+
+			var nextTarget posym
+			if s.tie.ensured_syms() { nextTarget = s.tie.syms[0] }
+
+			var idx int
+			if nextTarget.Symbol != symEmpty {
+				if target.Symbol == symAsteriskQues {
+					idx = lit.index(nextTarget.Symbol)
+				} else {
+					idx = lit.last_index(nextTarget.Symbol)
+				}
+			} else {
+				idx = -1
+			}
+
+			if idx != -1 {
+				if target.Symbol == symAsterisk {
+					slashIdx := lit.index(symSlash)
+					if slashIdx != -1 && slashIdx < idx {
+						idx = -1
+					}
+				}
+			}
+
+			if idx == -1 && target.Symbol == symAsterisk {
+				if lit.index(symSlash) != -1 {
+					s.err = errMatchFailedCrossSeg
+					return
+				}
+			}
+
+			var fallbackOp evalop
+			switch target.Symbol {
+			case symAsterisk: fallbackOp = opFallbackGlobSeg
+			case symAsteriskAst: fallbackOp = opFallbackGlobGreed
+			case symAsteriskQues: fallbackOp = opFallbackGlobCross
+			}
+
+			fg := &fallback_glob{idx: idx, target: target, lit: lit}
+			s.ops = append(s.ops, fallbackOp)
+			s.operands = append(s.operands, fg)
+
+			fg.bt = s.checkpoint(undoBranch)
+
+			s.ops = s.ops[:len(s.ops)-1]
+			s.operands = s.operands[:len(s.operands)-1]
+
+			if idx != -1 {
+				leftover := lit.String()[idx:]
+				s.ops = append(s.ops, opMatchLiteral)
+				s.operands = append(s.operands, posym{lit.Pos, intern(leftover)})
+			}
+			return
 		}
-		return
-	}
 
-	if target.has_prefix(lit.Symbol) {
-		ll := lit.len()
-
-		if target.Pos != NoPos {
-			s.tie.vpos = target.Pos + Pos(ll)
-		} else {
-			s.tie.vpos = NoPos
-		}
-
-		s.tie.str = target.String()[ll:]
-		ret(lit.Symbol)
-		s.tie.pop_head()
-		return
-	}
-
-	if lit.has_prefix(target.Symbol) {
-		leftover := intern(lit.String()[target.len():])
-		ret(target.Symbol)
-		s.tie.pop_head()
-		s.ops = append(s.ops, opMatchLiteral)
-		s.operands = append(s.operands, posym{lit.Pos, leftover})
-		return
-	}
-
-	str := lit.String()
-
-	for len(str) > 0 {
-		if !s.tie.ensured_syms() {
+		if lit.Symbol == symSlash || target.Symbol == symSlash || lit.Kind() != target.Kind() {
 			s.err = errMatchFailed
 			return
 		}
 
-		tpos := s.tie.syms[0].Pos
+		if target.has_prefix(lit.Symbol) {
+			s.tie.pop_head()
+
+			ll := lit.len()
+			if target.Pos != NoPos {
+				s.tie.vpos = target.Pos + Pos(ll)
+			} else {
+				s.tie.vpos = NoPos
+			}
+
+			s.tie.str = target.String()[ll:]
+
+			s.ops = append(s.ops, opRetPack)
+			s.operands = append(s.operands, lit)
+			return
+		}
+
+		if lit.has_prefix(target.Symbol) {
+			s.tie.pop_head()
+
+			sym := intern(lit.String()[target.len():])
+
+			lit.Symbol = target.Symbol
+			s.ops = append(s.ops, opRetPack)
+			s.operands = append(s.operands, lit)
+
+			lit.Symbol = sym
+			s.ops = append(s.ops, opMatchLiteral)
+			s.operands = append(s.operands, lit)
+			return
+		}
+
+		str := lit.String()
+		tpos := target.Pos
 		s.tie.vpos = tpos
-		s.tie.str = s.tie.syms[0].String()
+		s.tie.str = target.String()
 		s.tie.pop_head()
 
 		n := len(str)
@@ -3535,235 +3460,191 @@ func (s *symstr) op_match_literal(l int) {
 			s.err = errMatchFailed
 			return
 		}
+
 		str = str[n:]
 		s.tie.str = s.tie.str[n:]
 
 		if tpos != NoPos {
 			s.tie.vpos = tpos + Pos(n)
 		}
-	}
 
-	if s.err == nil { ret(lit.Symbol) }
+		lit.Symbol = intern(frag)
+		s.ops = append(s.ops, opMatchLiteral)
+		s.operands = append(s.operands, lit)
+
+		if len(str) > 0 {
+			lit.Symbol = intern(str)
+			s.ops = append(s.ops, opMatchLiteral)
+			s.operands = append(s.operands, lit)
+		}
+
+	} else if len(s.tie.str) != 0 {
+		erro(s, "ensured_syms left str=%s", s.tie.str)
+	} else if lit.Symbol != symEmpty {
+		s.err = errMatchFailedStarvedT
+	}
 }
 
 func (s *symstr) op_match_literal_rev(l int) {
 	lit := s.operands[len(s.operands)-1].(posym)
 	s.operands = s.operands[:len(s.operands)-1]
 
-	ret := func(sym Symbol) {
-		s.ops = append(s.ops, opRetPackRev)
-		s.operands = append(s.operands, posym{lit.Pos, sym})
-	}
-
-	if s.tie == nil {
-		s.err = errMatchFailedStarvedT
-		ret(lit.Symbol)
-		return
-	}
-
-	if !s.tie.ensured_syms() {
-		s.tie.err = io.EOF
+	if s.tie.ensured_syms() {
 		if lit.Symbol == symEmpty {
-			ret(symEmpty)
-		} else {
-			s.err = errMatchFailedStarvedT
-		}
-		return
-	} else if len(s.tie.str) != 0 {
-		erro(s, "ensured_syms left str=%s", s.tie.str)
-	}
-
-	if lit.Symbol == symEmpty {
-		if s.tie != nil && len(s.tie.syms) > 0 {
 			switch s.tie.syms[0].Symbol {
-			case symEmpty: s.tie.syms = s.tie.syms[1:]
+			case symEmpty:
+				s.tie.syms = s.tie.syms[1:]
 			case symQues, symAsterisk, symAsteriskAst, symAsteriskQues:
 				s.err = errMatchFailedCrossSeg
-				return
 			}
-		}
-		ret(symEmpty)
-		return
-	}
-
-	target := s.tie.syms[0]
-
-	if lit.Symbol == target.Symbol {
-		ret(s.tie.pop_head().Symbol)
-		return
-	}
-
-	const bidirectional_fallback_ret_literal = false
-
-	if target.Symbol == symQues {
-		if lit.Symbol == symSlash {
-			s.err = errMatchFailedCrossSeg
 			return
 		}
 
-		s.tie.pop_head()
-		s.vpos = lit.Pos
-		s.str = lit.Symbol.String()
+		const bidirectional_fallback_ret_literal = false
 
-		// FIX: Decode rune from the right end for reverse matching!
-		r, size := s.decodeRuneRev()
-		if size == 0 || r == 0 {
-			s.err = errMatchFailedZeroRune
+		target := s.tie.syms[0]
+
+		switch target.Symbol {
+		case lit.Symbol:
+			lit.Symbol = target.Symbol
+			s.tie.syms = s.tie.syms[1:]
+			s.ops = append(s.ops, opRetPackRev)
+			s.operands = append(s.operands, lit)
 			return
-		}
 
-		s.ops = append(s.ops, opMatchLiteralRev)
-		s.operands = append(s.operands, posym{lit.Pos, intern(s.str)})
-		s.vpos = NoPos
-		s.str = ""
-
-		if bidirectional_fallback_ret_literal { ret(intern(string(r))) } else { ret(target.Symbol) }
-		return
-	}
-
-	if target.Symbol == symAsterisk || target.Symbol == symAsteriskAst || target.Symbol == symAsteriskQues {
-		if bidirectional_fallback_ret_literal { ret(lit.Symbol) } else { ret(target.Symbol) }
-
-		s.tie.pop_head()
-
-		var nextTarget posym
-		if s.tie.ensured_syms() { nextTarget = s.tie.syms[0] }
-
-	_ops_subloop_:
-		for len(s.ops) > 0 && s.err == nil {
-			switch s.ops[len(s.ops)-1] {
-			case opUnrollMatchRev, opRetMatchRev, opRetPackRev:
-				s.step()
-				continue
-			case opGlobQuesRev, opGlobAsteriskRev, opGlobAstGreedRev, opGlobAstCrossRev:
-				var os Symbol
-				switch s.ops[len(s.ops)-1] {
-				case opGlobQuesRev: os = symQues
-				case opGlobAsteriskRev: os = symAsterisk
-				case opGlobAstGreedRev: os = symAsteriskAst
-				case opGlobAstCrossRev: os = symAsteriskQues
-				}
-				s.ops = s.ops[:len(s.ops)-1]
-				s.opsDone++
-				if bidirectional_fallback_ret_literal { ret(os) }
-				s.stems = append(s.stems, capture{start: -1})
-				continue
-			case opRegexMatchRev:
-				rx := s.operands[len(s.operands)-1].(*regexp.Regexp)
-				s.operands = s.operands[:len(s.operands)-1]
-				s.ops = s.ops[:len(s.ops)-1]
-				s.opsDone++
-				names := rx.SubexpNames()
-				for i := 1; i < len(names); i++ {
-					name := symEmptyName
-					if names[i] != "" { name = intern(names[i]) }
-					s.stems = append(s.stems, capture{start: -1, name: posym{NoPos, name}})
-				}
-				if bidirectional_fallback_ret_literal { ret(intern(rx.String())) }
-				continue
-			case opMatchLiteralRev:
-				lit = s.operands[len(s.operands)-1].(posym)
-			default:
-				break _ops_subloop_
-			}
-
-			if lit.Symbol == symEmpty {
-				s.err = errMatchFailedWildback
-				break _ops_subloop_
-			}
-			if lit.Symbol == symSlash && target.Symbol == symAsterisk && nextTarget.Symbol != symSlash {
-				s.err = errMatchFailedWildback
-				break _ops_subloop_
-			}
-			if lit.Symbol == nextTarget.Symbol {
-				break _ops_subloop_
-			}
-
-			if nextTarget.Symbol != symEmpty {
-				var matched bool
-				var absorbed, leftover string
-
-				if idx := lit.index(nextTarget.Symbol); idx != -1 {
-					slashIdx := lit.last_index(symSlash)
-					if target.Symbol == symAsterisk && slashIdx != -1 && slashIdx > idx {
-						s.err = errMatchFailedCrossSeg
-						return
-					}
-					str, align := lit.String(), nextTarget.len()
-					leftover = str[:idx+align]
-					absorbed = str[idx+align:]
-					matched = true
-				}
-
-				if !matched && target.Symbol == symAsterisk {
-					if lit.index(symSlash) != -1 {
-						s.err = errMatchFailedCrossSeg
-						return
-					}
-				}
-
-				if matched {
-					if len(leftover) > 0 {
-						s.operands[len(s.operands)-1] = posym{lit.Pos, intern(leftover)}
-					}
-					if bidirectional_fallback_ret_literal && len(absorbed) > 0 {
-						ret(intern(absorbed))
-					}
-					break _ops_subloop_
-				}
-			} else if target.Symbol == symAsterisk && lit.index(symSlash) != -1 {
+		case symQues:
+			if lit.Symbol == symSlash {
 				s.err = errMatchFailedCrossSeg
 				return
 			}
 
-			s.operands = s.operands[:len(s.operands)-1]
-			s.ops = s.ops[:len(s.ops)-1]
-			s.opsDone++
-		}
+			s.tie.syms = s.tie.syms[1:]
 
-		return
-	}
-
-	if lit.Symbol == symSlash || target.Symbol == symSlash || lit.Kind() != target.Kind() {
-		s.err = errMatchFailed
-
-		if checkpoints {
-			if lit.String() == target.String() {
-				erro(pc(s,lit.Pos), "symbol corruption: %v == %v", lit.Symbol, target.Symbol, unwind{})
+			s.vpos = lit.Pos
+			s.str = lit.Symbol.String()
+			r, size := s.decodeRuneRev()
+			if size == 0 || r == 0 {
+				s.err = errMatchFailedZeroRune
+				return
 			}
+
+			lit.Symbol = intern(s.str)
+			s.ops = append(s.ops, opMatchLiteralRev)
+			s.operands = append(s.operands, lit)
+			s.vpos = NoPos
+			s.str = ""
+
+			if bidirectional_fallback_ret_literal {
+				lit.Symbol = intern(string(r))
+			} else {
+				lit.Symbol = target.Symbol
+			}
+			s.ops = append(s.ops, opRetPackRev)
+			s.operands = append(s.operands, lit)
+			return
+
+		case symAsterisk, symAsteriskAst, symAsteriskQues:
+			if !bidirectional_fallback_ret_literal { lit.Symbol = target.Symbol }
+			s.ops = append(s.ops, opRetPackRev)
+			s.operands = append(s.operands, lit)
+
+			s.tie.syms = s.tie.syms[1:]
+
+			var nextTarget posym
+			if s.tie.ensured_syms() { nextTarget = s.tie.syms[0] }
+
+			var idx int
+			if nextTarget.Symbol != symEmpty {
+				if target.Symbol == symAsteriskQues {
+					idx = lit.last_index(nextTarget.Symbol)
+				} else {
+					idx = lit.index(nextTarget.Symbol)
+				}
+			} else {
+				idx = -1
+			}
+
+			if idx != -1 {
+				if target.Symbol == symAsterisk {
+					slashIdx := lit.last_index(symSlash)
+					if slashIdx != -1 && slashIdx > idx {
+						idx = -1
+					}
+				}
+			}
+
+			if idx == -1 && target.Symbol == symAsterisk {
+				if lit.index(symSlash) != -1 {
+					s.err = errMatchFailedCrossSeg
+					return
+				}
+			}
+
+			var fallbackOp evalop
+			switch target.Symbol {
+			case symAsterisk: fallbackOp = opFallbackGlobSegRev
+			case symAsteriskAst: fallbackOp = opFallbackGlobGreedRev
+			case symAsteriskQues: fallbackOp = opFallbackGlobCrossRev
+			}
+
+			fg := &fallback_glob{idx: idx, target: target, lit: lit}
+			s.ops = append(s.ops, fallbackOp)
+			s.operands = append(s.operands, fg)
+
+			fg.bt = s.checkpoint(undoBranch)
+
+			s.ops = s.ops[:len(s.ops)-1]
+			s.operands = s.operands[:len(s.operands)-1]
+
+			if idx != -1 {
+				leftover := lit.String()[:idx+nextTarget.len()]
+				s.ops = append(s.ops, opMatchLiteralRev)
+				s.operands = append(s.operands, posym{lit.Pos, intern(leftover)})
+			}
+			return
 		}
-		return
-	}
 
-	if target.has_suffix(lit.Symbol) {
-		str := target.String()
-		s.tie.vpos = target.Pos
-		s.tie.str = str[:len(str)-lit.len()]
-		ret(lit.Symbol)
-		s.tie.pop_head()
-		return
-	}
-
-	if lit.has_suffix(target.Symbol) {
-		leftover := intern(lit.String()[:lit.len()-target.len()])
-		ret(target.Symbol)
-		s.tie.pop_head()
-		s.ops = append(s.ops, opMatchLiteralRev)
-		s.operands = append(s.operands, posym{lit.Pos, leftover})
-		return
-	}
-
-	str := lit.String()
-
-	for len(str) > 0 {
-		if !s.tie.ensured_syms() {
+		if lit.Symbol == symSlash || target.Symbol == symSlash || lit.Kind() != target.Kind() {
 			s.err = errMatchFailed
 			return
 		}
 
-		tpos := s.tie.syms[0].Pos
+		if target.has_suffix(lit.Symbol) {
+			s.tie.pop_head()
+
+			ll := lit.len()
+			if target.Pos != NoPos {
+				s.tie.vpos = target.Pos
+			} else {
+				s.tie.vpos = NoPos
+			}
+
+			s.tie.str = target.String()[:target.len()-ll]
+
+			s.ops = append(s.ops, opRetPackRev)
+			s.operands = append(s.operands, lit)
+			return
+		}
+
+		if lit.has_suffix(target.Symbol) {
+			s.tie.pop_head()
+
+			sym := intern(lit.String()[:lit.len()-target.len()])
+
+			lit.Symbol = target.Symbol
+			s.ops = append(s.ops, opRetPackRev)
+			s.operands = append(s.operands, lit)
+
+			lit.Symbol = sym
+			s.ops = append(s.ops, opMatchLiteralRev)
+			s.operands = append(s.operands, lit)
+			return
+		}
+
+		str := lit.String()
+		tpos := target.Pos
 		s.tie.vpos = tpos
-		s.tie.str = s.tie.syms[0].String()
+		s.tie.str = target.String()
 		s.tie.pop_head()
 
 		n := len(str)
@@ -3779,11 +3660,244 @@ func (s *symstr) op_match_literal_rev(l int) {
 			s.err = errMatchFailed
 			return
 		}
+
 		str = str[:len(str)-n]
 		s.tie.str = s.tie.str[:len(s.tie.str)-n]
+
+		if tpos != NoPos {
+			s.tie.vpos = tpos
+		}
+
+		lit.Symbol = intern(frag)
+		s.ops = append(s.ops, opRetPackRev)
+		s.operands = append(s.operands, lit)
+
+		if len(str) > 0 {
+			lit.Symbol = intern(str)
+			s.ops = append(s.ops, opMatchLiteralRev)
+			s.operands = append(s.operands, lit)
+		}
+
+	} else if len(s.tie.str) != 0 {
+		erro(s, "ensured_syms left str=%s", s.tie.str)
+	} else if lit.Symbol != symEmpty {
+		s.err = errMatchFailedStarvedT
+	}
+}
+
+func (s *symstr) fallback_glob_greedy(l int, fallbackOp evalop, checkSlash bool) {
+	idx := s.operands[l-1].(int)
+	fg := s.operands[l-2].(*fallback_glob)
+
+	if s.err == nil { return }
+	s.unwind(&fg.bt)
+	s.err = nil
+
+	if idx == -1 {
+		s.operands = s.operands[:l-2]
+		s.err = errMatchFailed
+		return
 	}
 
-	if s.err == nil { ret(lit.Symbol) }
+	var nextTarget posym
+	if s.tie.ensured_syms() { nextTarget = s.tie.syms[0] }
+
+	nextIdx := -1
+	if nextTarget.Symbol != symEmpty && idx > 0 {
+		str := fg.lit.String()
+		tStr := nextTarget.String()
+		for i := idx - 1; i >= 0; i-- {
+			if strings.HasPrefix(str[i:], tStr) {
+				nextIdx = i
+				break
+			}
+		}
+	}
+
+	if nextIdx == -1 && checkSlash {
+		if fg.lit.index(symSlash) != -1 {
+			s.operands = s.operands[:l-2]
+			s.err = errMatchFailedCrossSeg
+			return
+		}
+	}
+
+	if checkSlash && nextIdx != -1 {
+		slashIdx := fg.lit.index(symSlash)
+		if slashIdx != -1 && slashIdx < nextIdx {
+			s.operands = s.operands[:l-2]
+			s.err = errMatchFailedCrossSeg
+			return
+		}
+	}
+
+	s.ops = append(s.ops, fallbackOp)
+	s.operands = append(s.operands, nextIdx, fg)
+
+	fg.bt = s.checkpoint(undoBranch)
+
+	s.ops = s.ops[:len(s.ops)-1]
+	s.operands = s.operands[:len(s.operands)-2]
+
+	if nextIdx != -1 {
+		leftover := fg.lit.String()[nextIdx:]
+		s.ops = append(s.ops, opMatchLiteral)
+		s.operands = append(s.operands, posym{fg.lit.Pos, intern(leftover)})
+	}
+}
+
+func (s *symstr) fallback_glob_greedy_rev(l int, fallbackOp evalop, checkSlash bool) {
+	idx := s.operands[l-1].(int)
+	fg := s.operands[l-2].(*fallback_glob)
+
+	if s.err == nil { return }
+	s.unwind(&fg.bt)
+	s.err = nil
+
+	if idx == -1 {
+		s.operands = s.operands[:l-2]
+		s.err = errMatchFailed
+		return
+	}
+
+	var nextTarget posym
+	if s.tie.ensured_syms() { nextTarget = s.tie.syms[0] }
+
+	nextIdx := -1
+	if nextTarget.Symbol != symEmpty && idx != -1 {
+		str := fg.lit.String()
+		tStr := nextTarget.String()
+		for i := idx + 1; i <= len(str)-len(tStr); i++ {
+			if strings.HasPrefix(str[i:], tStr) {
+				nextIdx = i
+				break
+			}
+		}
+	}
+
+	if nextIdx == -1 && checkSlash {
+		if fg.lit.index(symSlash) != -1 {
+			s.operands = s.operands[:l-2]
+			s.err = errMatchFailedCrossSeg
+			return
+		}
+	}
+
+	if checkSlash && nextIdx != -1 {
+		slashIdx := fg.lit.last_index(symSlash)
+		if slashIdx != -1 && slashIdx > nextIdx {
+			s.operands = s.operands[:l-2]
+			s.err = errMatchFailedCrossSeg
+			return
+		}
+	}
+
+	s.ops = append(s.ops, fallbackOp)
+	s.operands = append(s.operands, nextIdx, fg)
+
+	fg.bt = s.checkpoint(undoBranch)
+
+	s.ops = s.ops[:len(s.ops)-1]
+	s.operands = s.operands[:len(s.operands)-2]
+
+	if nextIdx != -1 {
+		leftover := fg.lit.String()[:nextIdx+nextTarget.len()]
+		s.ops = append(s.ops, opMatchLiteralRev)
+		s.operands = append(s.operands, posym{fg.lit.Pos, intern(leftover)})
+	}
+}
+
+// func (s *symstr) op_fallback_glob_seg(l int)
+// func (s *symstr) op_fallback_glob_seg_rev(l int)
+// func (s *symstr) op_fallback_glob_greed(l int)
+// func (s *symstr) op_fallback_glob_greed_rev(l int)
+
+func (s *symstr) op_fallback_glob_cross(l int) {
+	idx := s.operands[l-1].(int)
+	fg := s.operands[l-2].(*fallback_glob)
+
+	if s.err == nil { return }
+	s.unwind(&fg.bt)
+	s.err = nil
+
+	if idx == -1 {
+		s.operands = s.operands[:l-2]
+		s.err = errMatchFailed
+		return
+	}
+
+	var nextTarget posym
+	if s.tie.ensured_syms() { nextTarget = s.tie.syms[0] }
+
+	nextIdx := -1
+	if nextTarget.Symbol != symEmpty && idx != -1 {
+		str := fg.lit.String()
+		tStr := nextTarget.String()
+		for i := idx + 1; i <= len(str)-len(tStr); i++ {
+			if strings.HasPrefix(str[i:], tStr) {
+				nextIdx = i
+				break
+			}
+		}
+	}
+
+	s.ops = append(s.ops, opFallbackGlobCross)
+	s.operands = append(s.operands, nextIdx, fg)
+
+	fg.bt = s.checkpoint(undoBranch)
+
+	s.ops = s.ops[:len(s.ops)-1]
+	s.operands = s.operands[:len(s.operands)-2]
+
+	if nextIdx != -1 {
+		leftover := fg.lit.String()[nextIdx:]
+		s.ops = append(s.ops, opMatchLiteral)
+		s.operands = append(s.operands, posym{fg.lit.Pos, intern(leftover)})
+	}
+}
+
+func (s *symstr) op_fallback_glob_cross_rev(l int) {
+	idx := s.operands[l-1].(int)
+	fg := s.operands[l-2].(*fallback_glob)
+
+	if s.err == nil { return }
+	s.unwind(&fg.bt)
+	s.err = nil
+
+	if idx == -1 {
+		s.operands = s.operands[:l-2]
+		s.err = errMatchFailed
+		return
+	}
+
+	var nextTarget posym
+	if s.tie.ensured_syms() { nextTarget = s.tie.syms[0] }
+
+	nextIdx := -1
+	if nextTarget.Symbol != symEmpty && idx > 0 {
+		str := fg.lit.String()
+		tStr := nextTarget.String()
+		for i := idx - 1; i >= 0; i-- {
+			if strings.HasPrefix(str[i:], tStr) {
+				nextIdx = i
+				break
+			}
+		}
+	}
+
+	s.ops = append(s.ops, opFallbackGlobCrossRev)
+	s.operands = append(s.operands, nextIdx, fg)
+
+	fg.bt = s.checkpoint(undoBranch)
+
+	s.ops = s.ops[:len(s.ops)-1]
+	s.operands = s.operands[:len(s.operands)-2]
+
+	if nextIdx != -1 {
+		leftover := fg.lit.String()[:nextIdx+nextTarget.len()]
+		s.ops = append(s.ops, opMatchLiteralRev)
+		s.operands = append(s.operands, posym{fg.lit.Pos, intern(leftover)})
+	}
 }
 
 func (s *symstr) op_glob_ques(l int, targetOp evalop) []posym {
@@ -4297,11 +4411,6 @@ func (s *symstr) op_glob_seg_rev(l int) {
 	s.err = errMatchFailed
 }
 
-type matchcount struct {
-	lit posym
-	k   int
-}
-
 /*
  * Algorithm: VM-Driven Incremental Greedy Wildcard Matching
  * Applies to: op_glob_greed (Forward) and op_glob_greed_rev (Reverse)
@@ -4346,192 +4455,151 @@ type matchcount struct {
  *    - If `bt == nil`, the required token was never found, triggering `errMatchFailed`.
  */
 
+type op_glob struct {
+	idx       int
+	lookahead posym
+	stem      []posym
+	bt        backtrack
+}
+
 func (s *symstr) op_glob_greed(l int) {
-	var nextLit posym
-	var stem []posym
+	g := s.operands[l-1].(*op_glob)
 
-	if l >= 2 {
-		if st, ok := s.operands[l-1].([]posym); ok {
-			if lit, ok := s.operands[l-2].(posym); ok {
-				stem = st
-				nextLit = lit
-				s.operands = s.operands[:l-2]
-			}
-		}
-	}
-	if stem == nil && l >= 1 {
-		if lit, ok := s.operands[l-1].(posym); ok {
-			nextLit = lit
-			s.operands = s.operands[:l-1]
-		}
-	}
-
-	if nextLit.Symbol == symEmpty {
-		nextLit = s.nfa_next_lit()
-	}
-
-	if len(s.tie.syms) > 0 {
-		if s.nfa_eval_meta(s.tie.syms[0], opConseqAstGreed) { return }
-	}
-
-	if s.err != nil {
-		return
+	if g.lookahead.Symbol == symEmpty && s.err != io.EOF {
+		s.operands = s.operands[:l-1] // HIDE `g` temporarily
+		g.lookahead = s.nfa_next_lit()
+		s.operands = append(s.operands, g)
 	}
 
 	if s.tie.ensured_syms() {
-		stem = append(stem, s.tie.syms...)
-		s.tie.syms = nil
+		if s.nfa_eval_meta(s.tie.syms[0], opConseqAstGreed) { return }
 
-		if nextLit.Symbol == symEmpty {
+		if g.lookahead.Symbol == symEmpty {
+			g.stem = append(g.stem, s.tie.syms...)
 			s.ops = append(s.ops, opConseqAstGreed)
-			s.operands = append(s.operands, nextLit, stem)
+			s.tie.syms = nil
 			return
 		}
 
 		var totalBytes int
-		for _, ps := range stem { totalBytes += ps.len() }
+		for _, ps := range s.tie.syms { totalBytes += ps.len() }
 
-		idx := __posymSeqLastIndex(stem, totalBytes-1, nextLit.Symbol)
-
-		if idx == -1 {
+		if g.idx = __posymSeqLastIndex(s.tie.syms, totalBytes-1, g.lookahead.Symbol); g.idx == -1 {
+			// Token not in chunk. Safe to mutate g.stem because we haven't checkpointed this chunk yet!
+			g.stem = append(g.stem, s.tie.syms...)
 			s.ops = append(s.ops, opConseqAstGreed)
-			s.operands = append(s.operands, nextLit, stem)
+			s.tie.syms = nil
+		} else {
+			// 1. Push Try Catch to track backtracking
+			s.ops = append(s.ops, opTryGlobGreed)
+
+			// 2. Lock the state (saves opTryGlobGreed and `g` internally)
+			g.bt = s.checkpoint(undoBranch)
+
+			// 3. POP from ACTIVE path so downstream AST evaluations don't panic on *op_glob!
+			s.ops = s.ops[:len(s.ops)-1]
+			s.operands = s.operands[:len(s.operands)-2]
+
+			// 4. Yield execution
+			left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, g.idx)
+
+			var restore []posym
+			if right.Symbol != symEmpty || right.len() > 0 {
+				restore = append(restore, right)
+			}
+			if targetIdx != -1 && targetIdx+1 < len(s.tie.syms) {
+				restore = append(restore, s.tie.syms[targetIdx+1:]...)
+			}
+			s.tie.syms = restore
+
+			origStemsCount := len(s.stems)
+			var origStemsLen int
+			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
+			s.nfa_emit(left, origStemsCount, origStemsLen)
+		}
+	} else {
+		s.operands = s.operands[:l-1]
+
+		if g.lookahead.Symbol == symEmpty {
+			origStemsCount := len(s.stems)
+			var origStemsLen int
+			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
+			s.nfa_emit(g.stem, origStemsCount, origStemsLen)
 			return
 		}
 
-		s.ops = append(s.ops, opTryGlobGreed)
-		s.operands = append(s.operands, nextLit, idx, stem)
-
-		s.checkpoint(undoBranch)
-
-		s.ops = s.ops[:len(s.ops)-1]
-		s.operands = s.operands[:len(s.operands)-3]
-
-		left, right, targetIdx := __posymSeqSplitAt(stem, idx)
-		rightValid := right.Symbol != symEmpty || right.len() > 0
-
-		origStemsCount := len(s.stems)
-		var origStemsLen int
-		if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-
-		s.nfa_emit(left, origStemsCount, origStemsLen)
-
-		var restore []posym
-		if rightValid { restore = append(restore, right) }
-		if targetIdx != -1 && targetIdx+1 < len(stem) {
-			restore = append(restore, stem[targetIdx+1:]...)
+		if len(g.stem) > 0 {
+			origStemsCount := len(s.stems)
+			var origStemsLen int
+			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
+			s.nfa_emit(g.stem, origStemsCount, origStemsLen)
 		}
-		s.tie.syms = restore
-		return
+
+		s.tie.syms = g.stem
+		s.err = errMatchFailed
 	}
-
-	if nextLit.Symbol == symEmpty {
-		origStemsCount := len(s.stems)
-		var origStemsLen int
-		if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-		s.nfa_emit(stem, origStemsCount, origStemsLen)
-		return
-	}
-
-	if len(stem) > 0 {
-		var totalBytes int
-		for _, ps := range stem { totalBytes += ps.len() }
-		idx := totalBytes
-
-		s.ops = append(s.ops, opTryGlobGreed)
-		s.operands = append(s.operands, nextLit, idx, stem)
-
-		s.checkpoint(undoBranch)
-
-		s.ops = s.ops[:len(s.ops)-1]
-		s.operands = s.operands[:len(s.operands)-3]
-
-		left, right, targetIdx := __posymSeqSplitAt(stem, idx)
-		rightValid := right.Symbol != symEmpty || right.len() > 0
-
-		origStemsCount := len(s.stems)
-		var origStemsLen int
-		if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-
-		s.nfa_emit(left, origStemsCount, origStemsLen)
-
-		var restore []posym
-		if rightValid { restore = append(restore, right) }
-		if targetIdx != -1 && targetIdx+1 < len(stem) {
-			restore = append(restore, stem[targetIdx+1:]...)
-		}
-		s.tie.syms = restore
-		return
-	}
-
-	if s.tie != nil { s.tie.syms = stem }
-	s.err = errMatchFailed
 }
 
 func (s *symstr) op_try_glob_greed(l int) {
-	var nextLit posym
-	var lastIdx int
-	var stem []posym
+	g := s.operands[l-1].(*op_glob)
 
-	if l >= 3 {
-		if st, ok := s.operands[l-1].([]posym); ok {
-			if idx, ok := s.operands[l-2].(int); ok {
-				if lit, ok := s.operands[l-3].(posym); ok {
-					stem = st
-					lastIdx = idx
-					nextLit = lit
-					s.operands = s.operands[:l-3]
-				}
-			}
-		}
+	if s.err == nil {
+		return
 	}
 
-	idx := -1
-	searchStart := lastIdx - 1
+	s.unwind(&g.bt)
+	s.err = nil
+	l = len(s.operands) // Refresh length dynamically post-unwind
 
+	nextIdx := -1
+	searchStart := g.idx - 1
 	if searchStart >= 0 {
-		if nextLit.Symbol != symEmpty {
-			idx = __posymSeqLastIndex(stem, searchStart, nextLit.Symbol)
+		if g.lookahead.Symbol != symEmpty {
+			nextIdx = __posymSeqLastIndex(s.tie.syms, searchStart, g.lookahead.Symbol)
 		}
-		if idx == -1 {
-			idx = searchStart
+		if nextIdx == -1 {
+			nextIdx = searchStart
 		}
 	}
 
-	if idx < 0 {
-		if s.tie != nil && s.tie.ensured_syms() {
+	if nextIdx < 0 {
+		// Exhausted current chunk. Re-invoke the main loop to pull the NEXT chunk organically!
+		if s.tie.ensured_syms() {
 			s.ops = append(s.ops, opConseqAstGreed)
-			s.operands = append(s.operands, nextLit, stem)
+			s.operands = s.operands[:l-1] // Pop idx, but leave `g` on the stack for the loop
 			return
 		}
-		if s.tie != nil { s.tie.syms = stem }
+
+		s.operands = s.operands[:l-2] // Pop `g`
 		s.err = errMatchFailed
 		return
 	}
 
 	s.ops = append(s.ops, opTryGlobGreed)
-	s.operands = append(s.operands, nextLit, idx, stem)
+	s.operands = append(s.operands, nextIdx)
 
-	s.checkpoint(undoBranch)
+	g.bt = s.checkpoint(undoBranch)
 
+	// Pop fallback and `g` from active path
 	s.ops = s.ops[:len(s.ops)-1]
-	s.operands = s.operands[:len(s.operands)-3]
+	s.operands = s.operands[:len(s.operands)-2]
 
-	left, right, targetIdx := __posymSeqSplitAt(stem, idx)
-	rightValid := right.Symbol != symEmpty || right.len() > 0
+	left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, nextIdx)
+
+	var restore []posym
+	if right.Symbol != symEmpty || right.len() > 0 {
+		restore = append(restore, right)
+	}
+	if targetIdx != -1 && targetIdx+1 < len(s.tie.syms) {
+		restore = append(restore, s.tie.syms[targetIdx+1:]...)
+	}
+	s.tie.syms = restore
 
 	origStemsCount := len(s.stems)
 	var origStemsLen int
 	if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
 
 	s.nfa_emit(left, origStemsCount, origStemsLen)
-
-	var restore []posym
-	if rightValid { restore = append(restore, right) }
-	if targetIdx != -1 && targetIdx+1 < len(stem) {
-		restore = append(restore, stem[targetIdx+1:]...)
-	}
-	s.tie.syms = restore
 }
 
 func (s *symstr) op_glob_greed_rev(l int) {
@@ -4578,35 +4646,32 @@ func (s *symstr) op_glob_greed_rev(l int) {
 
 		idx := __posymSeqIndex(stem, 0, nextLit.Symbol)
 
-		if idx == -1 {
-			s.ops = append(s.ops, opConseqAstGreedRev)
-			s.operands = append(s.operands, nextLit, stem)
+		if idx != -1 {
+			t := s.checkpoint(undoBranch)
+
+			s.ops = append(s.ops, opTryGlobGreedRev)
+			s.operands = append(s.operands, nextLit, idx, stem, &t)
+
+			left, right, targetIdx := __posymSeqSplitAt(stem, idx)
+			rightValid := right.Symbol != symEmpty || right.len() > 0
+
+			origStemsCount := len(s.stems)
+			var origStemsLen int
+			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
+
+			s.nfa_emit_rev(left, origStemsCount, origStemsLen)
+
+			var restore []posym
+			if rightValid { restore = append(restore, right) }
+			if targetIdx != -1 && targetIdx+1 < len(stem) {
+				restore = append(restore, stem[targetIdx+1:]...)
+			}
+			s.tie.syms = restore
 			return
 		}
 
-		s.ops = append(s.ops, opTryGlobGreedRev)
-		s.operands = append(s.operands, nextLit, idx, stem)
-
-		s.checkpoint(undoBranch)
-
-		s.ops = s.ops[:len(s.ops)-1]
-		s.operands = s.operands[:len(s.operands)-3]
-
-		left, right, targetIdx := __posymSeqSplitAt(stem, idx)
-		rightValid := right.Symbol != symEmpty || right.len() > 0
-
-		origStemsCount := len(s.stems)
-		var origStemsLen int
-		if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-
-		s.nfa_emit_rev(left, origStemsCount, origStemsLen)
-
-		var restore []posym
-		if rightValid { restore = append(restore, right) }
-		if targetIdx != -1 && targetIdx+1 < len(stem) {
-			restore = append(restore, stem[targetIdx+1:]...)
-		}
-		s.tie.syms = restore
+		s.ops = append(s.ops, opConseqAstGreedRev)
+		s.operands = append(s.operands, nextLit, stem)
 		return
 	}
 
@@ -4621,13 +4686,10 @@ func (s *symstr) op_glob_greed_rev(l int) {
 	if len(stem) > 0 {
 		idx := 0
 
+		t := s.checkpoint(undoBranch)
+
 		s.ops = append(s.ops, opTryGlobGreedRev)
-		s.operands = append(s.operands, nextLit, idx, stem)
-
-		s.checkpoint(undoBranch)
-
-		s.ops = s.ops[:len(s.ops)-1]
-		s.operands = s.operands[:len(s.operands)-3]
+		s.operands = append(s.operands, nextLit, idx, stem, &t)
 
 		left, right, targetIdx := __posymSeqSplitAt(stem, idx)
 		rightValid := right.Symbol != symEmpty || right.len() > 0
@@ -4655,19 +4717,30 @@ func (s *symstr) op_try_glob_greed_rev(l int) {
 	var nextLit posym
 	var lastIdx int
 	var stem []posym
+	var bt *backtrack
 
-	if l >= 3 {
-		if st, ok := s.operands[l-1].([]posym); ok {
-			if idx, ok := s.operands[l-2].(int); ok {
-				if lit, ok := s.operands[l-3].(posym); ok {
-					stem = st
-					lastIdx = idx
-					nextLit = lit
-					s.operands = s.operands[:l-3]
+	if l >= 4 {
+		if b, ok := s.operands[l-1].(*backtrack); ok {
+			bt = b
+			if st, ok := s.operands[l-2].([]posym); ok {
+				if idx, ok := s.operands[l-3].(int); ok {
+					if lit, ok := s.operands[l-4].(posym); ok {
+						stem = st
+						lastIdx = idx
+						nextLit = lit
+						s.operands = s.operands[:l-4]
+					}
 				}
 			}
 		}
 	}
+
+	if s.err == nil {
+		return
+	}
+
+	s.unwind(bt)
+	s.err = nil
 
 	var totalBytes int
 	for _, ps := range stem { totalBytes += ps.len() }
@@ -4695,13 +4768,10 @@ func (s *symstr) op_try_glob_greed_rev(l int) {
 		return
 	}
 
+	t := s.checkpoint(undoBranch)
+
 	s.ops = append(s.ops, opTryGlobGreedRev)
-	s.operands = append(s.operands, nextLit, idx, stem)
-
-	s.checkpoint(undoBranch)
-
-	s.ops = s.ops[:len(s.ops)-1]
-	s.operands = s.operands[:len(s.operands)-3]
+	s.operands = append(s.operands, nextLit, idx, stem, &t)
 
 	left, right, targetIdx := __posymSeqSplitAt(stem, idx)
 	rightValid := right.Symbol != symEmpty || right.len() > 0
@@ -6422,7 +6492,7 @@ func (s *symstr) op_unroll_match(l int) {
 
 	case *conjunction:
 		s.ops = append(s.ops, opMatchLiteral, opUnrollMatch)
-		s.operands = append(s.operands, posym{v.list.Pos(), symRbrace}, v.list.elems)
+		s.operands = append(s.operands, posym{v.list.Pos(), symRbrace}, &v.list)
 		if v.sep != nil {
 			s.ops = append(s.ops, opMatchLiteral, opUnrollMatch, opMatchLiteral)
 			s.operands = append(s.operands, posym{v.sep.Pos(), symRparen}, v.sep, posym{v.sep.Pos(), symLparen})
@@ -6786,7 +6856,7 @@ func (s *symstr) op_unroll_match_rev(l int) {
 			s.operands = append(s.operands, posym{v.sep.Pos(), symLparen}, v.sep, posym{v.sep.Pos(), symRparen})
 		}
 		s.ops = append(s.ops, opUnrollMatchRev, opMatchLiteralRev)
-		s.operands = append(s.operands, v.list.elems, posym{v.list.Pos(), symRbrace})
+		s.operands = append(s.operands, &v.list, posym{v.list.Pos(), symRbrace})
 
 	case *disjunction:
 		s.ops = append(s.ops, opMatchLiteralRev, opUnrollMatchRev, opMatchLiteralRev)
@@ -7527,12 +7597,20 @@ _op_switch_:
 		s.operands = s.operands[:l-1]
 		s.unwind(&bt)
 
-	case opMatchLiteral: s.op_match_literal(l)
+	case opMatchLiteral   : s.op_match_literal(l)
 	case opMatchLiteralRev: s.op_match_literal_rev(l)
 
-	case opRegexMatch: s.op_regex_match(l)
+	case opFallbackGlobSeg   : s.fallback_glob_greedy(l, opFallbackGlobSeg, true)
+	case opFallbackGlobSegRev: s.fallback_glob_greedy_rev(l, opFallbackGlobSegRev, true)
+	case opFallbackGlobGreed   : s.fallback_glob_greedy(l, opFallbackGlobGreed, false)
+	case opFallbackGlobGreedRev: s.fallback_glob_greedy_rev(l, opFallbackGlobGreedRev, false)
+	case opFallbackGlobCross   : s.op_fallback_glob_cross(l)
+	case opFallbackGlobCrossRev: s.op_fallback_glob_cross_rev(l)
+
+	case opRegexMatch   : s.op_regex_match(l)
 	case opRegexMatchRev: s.op_regex_match_rev(l)
-	case opGlobRange: s.op_glob_range(l)
+
+	case opGlobRange   : s.op_glob_range(l)
 	case opGlobRangeRev: s.op_glob_range_rev(l)
 	case opGlobQues:
 		if emitted := s.op_glob_ques(l, opGlobQues); len(emitted) > 0 {
@@ -7549,39 +7627,21 @@ _op_switch_:
 			}
 		}
 
-	// FIX: Unified initialization routing based exclusively on Opcodes
-	case opGlobAsterisk, opGlobAsteriskRev, opGlobAstGreed, opGlobAstGreedRev, opGlobAstCross, opGlobAstCrossRev:
-		s.stems = append(s.stems, capture{start: -1, name: posym{NoPos, symEmptyName}, syms: nil})
+	case opGlobAsterisk   : s.ops = append(s.ops, opConseqAsterisk   ); s.stems = append(s.stems, capture{start:-1})
+	case opGlobAsteriskRev: s.ops = append(s.ops, opConseqAsteriskRev); s.stems = append(s.stems, capture{start:-1})
+	case opGlobAstGreed   : s.ops = append(s.ops, opConseqAstGreed   ); s.stems = append(s.stems, capture{start:-1}); s.operands = append(s.operands, new(op_glob))
+	case opGlobAstGreedRev: s.ops = append(s.ops, opConseqAstGreedRev); s.stems = append(s.stems, capture{start:-1}); s.operands = append(s.operands, new(op_glob))
+	case opGlobAstCross   : s.ops = append(s.ops, opConseqAstCross   ); s.stems = append(s.stems, capture{start:-1}); s.operands = append(s.operands, new(op_glob))
+	case opGlobAstCrossRev: s.ops = append(s.ops, opConseqAstCrossRev); s.stems = append(s.stems, capture{start:-1}); s.operands = append(s.operands, new(op_glob))
 
-		for len(s.ops) > 0 {
-			switch s.ops[len(s.ops)-1] {
-			case opGlobAsterisk, opGlobAsteriskRev, opGlobAstGreed, opGlobAstGreedRev, opGlobAstCross, opGlobAstCrossRev:
-				s.ops = s.ops[:len(s.ops)-1]
-				continue
-			}
-			break
-		}
-
-		isRev := op == opGlobAsteriskRev || op == opGlobAstGreedRev || op == opGlobAstCrossRev
-		switch op {
-		case opGlobAsterisk, opGlobAsteriskRev:
-			if isRev { s.ops = append(s.ops, opConseqAsteriskRev) } else { s.ops = append(s.ops, opConseqAsterisk) }
-		case opGlobAstGreed, opGlobAstGreedRev:
-			if isRev { s.ops = append(s.ops, opConseqAstGreedRev) } else { s.ops = append(s.ops, opConseqAstGreed) }
-		case opGlobAstCross, opGlobAstCrossRev:
-			if isRev { s.ops = append(s.ops, opConseqAstCrossRev) } else { s.ops = append(s.ops, opConseqAstCross) }
-		}
-
-	case opConseqAsterisk: s.op_glob_seg(l)
+	case opConseqAsterisk   : s.op_glob_seg(l)
 	case opConseqAsteriskRev: s.op_glob_seg_rev(l)
-
-	case opConseqAstGreed: s.op_glob_greed(l)
+	case opConseqAstGreed   : s.op_glob_greed(l)
 	case opConseqAstGreedRev: s.op_glob_greed_rev(l)
-
-	case opConseqAstCross: s.op_glob_cross(l)
+	case opConseqAstCross   : s.op_glob_cross(l)
 	case opConseqAstCrossRev: s.op_glob_cross_rev(l)
 
-	case opTryGlobGreed: s.op_try_glob_greed(l)
+	case opTryGlobGreed   : s.op_try_glob_greed(l)
 	case opTryGlobGreedRev: s.op_try_glob_greed_rev(l)
 
 	case opModify:
