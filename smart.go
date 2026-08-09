@@ -2931,37 +2931,76 @@ var (
 
 type evalop uint8
 
-// NOTE: all ops take inputs (args) from operands stack; and put outputs to the results stack.
-// The VM switch block statically knows how many operands to pop for each instruction.
 const (
-	// --- System & Control Bytecodes ---
+	// ============================================================================
+	// 1. MISC (System, Control & Stack Manipulation)
+	// General VM routing, debugging, and memory stack alignments.
+	// ============================================================================
 	opEnd                evalop = iota // Halts VM execution
 	opUnwind                           // Restores a previously saved backtracking checkpoint
 	opDebug                            // Prints debugging telemetry
 	opRestoreContext                   // Restores the previous context environment
-
-	// --- Stack & Data Manipulation Bytecodes ---
 	opSwap                             // Swap N results to operands
 	opCons                             // Consolidate N results to 1 operand (Variadic Swap)
 	opCompact                          // Consolidate N operands to 1 operand
 	opValidate                         // Validate N results and swap to operands if valid
 	opCompactValid                     // Validate N operands and consolidate valid items back
 
-	// --- Return & Yield Bytecodes ---
+	// ============================================================================
+	// 2. EVALUATOR (AST -> AST)
+	// Executes runtime logic, resolves macros/variables, and mutates AST nodes.
+	// Primary stack: s.results
+	// ============================================================================
+	// -- Execution & Resolution --
+	opEval                             // Evaluates an AST node
+	opEvalRev                          // Evaluates an AST node (reversed direction)
+	opEvoke                            // Evokes a callable/function
+	opEvokeRet                         // Finalizes an evoke call and yields the result
+	opResolve                          // Resolves a symbol/variable
+	opExpandArgs                       // Expands variadic arguments
+	opExpandArgsRev                    // Expands variadic arguments (reversed direction)
+	opSelect                           // Executes a select/match branch evaluation
+
+	// -- Transformers --
+	opEase                             // Eases N results into a single list or scalar result
+	opMerge                            // Recursively merges one result into elements of []Value
+	opModify                           // Applies AST modification/mutation
+	opPathStr                          // Converts path components to string equivalents
+	opUnloc                            // Strips location metadata from N results
+	opLoc                              // Annotates the top result with location metadata
+	opFullname                         // Resolves absolute path values
+
+	// -- AST Constructors --
+	opCompound                         // Combines N results into a compound node
+	opQualword                         // Combines N results into a qualword node
+	opGlobbrace                        // Combines N results into a globbrace node
+	opPath                             // Combines N results into a path node
+	opConjunct                         // Merges results into a logical AND node
+	opDisjunct                         // Merges results into a logical OR node
+	opNegate                           // Applies logical negation wrapping
+	opFlag                             // Applies flag wrapping
+	opPair                             // Combines results into key-value pairs
+	opRule                             // Instantiates a rule AST
+	opCompose                          // Composes complex element constructs
+
+	// ============================================================================
+	// 3. SYMBOLIZE (AST -> Symbols)
+	// Flattens ASTs into strings or consumes them against the NFA tape (Match).
+	// Primary stacks: s.syms, s.tie
+	// ============================================================================
+	opUnroll                           // Unrolls a value onto the stack for normal return
+	opUnrollRev                        // Unrolls a value onto the stack for normal return (reversed)
+	opUnrollMatch                      // Unrolls a value onto the stack for matched return
+	opUnrollMatchRev                   // Unrolls a value onto the stack for matched return (reversed)
 	opRet                              // Yields a normal return value
 	opRetRev                           // Yields a normal return value (reversed direction)
-	opRetPack                          // Yields and packs a value
-	opRetPackRev                       // Yields and packs a value (reversed direction)
 	opRetMatch                         // Yields a match value
 	opRetMatchRev                      // Yields a match value (reversed direction)
-	opEvokeRet                         // Finalizes an evoke call and yields the result
-
-	// --- Match Mode Bytecodes ---
+	opMatchLiteral                     // Matches a string literal
+	opMatchLiteralRev                  // Matches a string literal (reversed direction)
 	opRegexMatch                       // Executes a regex match
 	opRegexMatchRev                    // Executes a regex match (reversed direction)
 	opRegexCon                         // Consumes matching regex literals
-	opMatchLiteral                     // Matches a string literal
-	opMatchLiteralRev                  // Matches a string literal (reversed direction)
 	opFallbackGlobSeg                  // Fallback-matches a string literal
 	opFallbackGlobSegRev               // Fallback-matches a string literal (reversed direction)
 	opFallbackGlobGreed                // Fallback-matches a string literal
@@ -2974,10 +3013,10 @@ const (
 	opGlobAsteriskRev                  // Matches a segment '*' wildcard (reversed direction)
 	opGlobAstGreed                     // Matches a greedy '**' wildcard
 	opGlobAstGreedRev                  // Matches a greedy '**' wildcard (reversed direction)
-	opTryGlobGreed                     // Implements try-catch fallback for greedy wildcards
-	opTryGlobGreedRev                  // Implements try-catch fallback for greedy wildcards (reversed direction)
 	opGlobAstCross                     // Matches a reluctant cross '**?' wildcard
 	opGlobAstCrossRev                  // Matches a reluctant cross '**?' wildcard (reversed direction)
+	opTryGlobGreed                     // Implements try-catch fallback for greedy wildcards
+	opTryGlobGreedRev                  // Implements try-catch fallback for greedy wildcards (reversed)
 	opGlobRange                        // Matches a character range
 	opGlobRangeRev                     // Matches a character range (reversed direction)
 	opConseqAsterisk                   // Resolves consecutive segment asterisks
@@ -2987,43 +3026,18 @@ const (
 	opConseqAstCross                   // Resolves consecutive reluctant asterisks
 	opConseqAstCrossRev                // Resolves consecutive reluctant asterisks (reversed direction)
 
-	// --- Evaluate Mode Bytecodes ---
-	opEval                             // Evaluates an AST node
-	opUnroll                           // Unrolls a value onto the stack for normal return
-	opUnrollRev                        // Unrolls a value onto the stack for normal return (reversed direction)
+	// ============================================================================
+	// 4. STRUCTURALIZE (Symbols -> AST)
+	// Accumulates raw symbols and packs them back into concrete AST boundaries.
+	// Primary stack: s.vmpack
+	// ============================================================================
 	opUnrollPack                       // Unrolls a value onto the stack for packed return
-	opUnrollPackRev                    // Unrolls a value onto the stack for packed return (reversed direction)
-	opUnrollMatch                      // Unrolls a value onto the stack for matched return
-	opUnrollMatchRev                   // Unrolls a value onto the stack for matched return (reversed direction)
-	opMerge                            // Recursively merges one result into elements of []Value
-	opCompound                         // Combines N results into a compound node
-	opQualword                         // Combines N results into a qualword node
-	opGlobbrace                        // Combines N results into a globbrace node
-	opPath                             // Combines N results into a path node
-	opPathStr                          // Converts path components to string equivalents
-	opEase                             // Eases N results into a single list or scalar result
-	opEvoke                            // Evokes a callable/function
-	opTraverse                         // Traverses an AST node
-	opResolve                          // Resolves a symbol/variable
-	opExpandArgs                       // Expands variadic arguments
-	opExpandArgsRev                    // Expands variadic arguments (reversed direction)
-	opExpand                           // Expands a list or collection
-	opExpandRev                        // Expands a list or collection (reversed direction)
-	opReduce                           // Reduces a scoped expansion
-	opReduceRev                        // Reduces a scoped expansion (reversed direction)
-	opUnloc                            // Strips location metadata from N results
-	opLoc                              // Annotates the top result with location metadata
-	opLocPack                          // Annotates packed elements with location metadata
-	opNegate                           // Applies logical negation wrapping
-	opFlag                             // Applies flag wrapping
-	opPair                             // Combines results into key-value pairs
-	opCompose                          // Composes complex element constructs
-	opConjunct                         // Merges results into a logical AND
-	opDisjunct                         // Merges results into a logical OR
-	opFullname                         // Resolves absolute path values
-	opRule                             // Instantiates a rule AST
-	opModify                           // Applies AST modification/mutation
-	opSelect                           // Executes a select/match branch evaluation
+	opUnrollPackRev                    // Unrolls a value onto the stack for packed return (reversed)
+	opRetPack                          // Yields and packs a value into the buffer
+	opRetPackRev                       // Yields and packs a value into the buffer (reversed)
+	opReduce                           // Reduces a scoped expansion buffer into a concrete result
+	opReduceRev                        // Reduces a scoped expansion buffer into a concrete result (reversed)
+	opLocPack                          // Annotates packed buffer elements with location metadata
 )
 
 const (
@@ -5546,7 +5560,7 @@ func (s *symstr) op_evoke(l int) {
 						s.ops = append(s.ops, opRestoreContext)
 						s.operands = append(s.operands, s.Context)
 
-						s.ops = append(s.ops, opExpand)
+						s.ops = append(s.ops, opEval)
 						s.operands = append(s.operands, d.value)
 
 						de := &evoke_def_ctx{evocation{automatic{Context: s.Context, defs: make(def_map)}}, d}
@@ -5618,7 +5632,7 @@ func (s *symstr) op_evoke(l int) {
 					s.ops = append(s.ops, opRestoreContext)
 					s.operands = append(s.operands, s.Context)
 
-					s.ops = append(s.ops, opExpand)
+					s.ops = append(s.ops, opEval)
 					s.operands = append(s.operands, tx)
 
 					if len(a) > 0 {
@@ -5705,7 +5719,7 @@ func (s *symstr) op_unroll(l int, retOp evalop) {
 		if truly(s.Context, is_com_ctx{}) {
 			retVal(v.Value)
 		} else {
-			s.ops = append(s.ops, retOp, opSwap, opFullname, opSwap, opExpand)
+			s.ops = append(s.ops, retOp, opSwap, opFullname, opSwap, opEval)
 			s.operands = append(s.operands, 1, v, 1, v.Value)
 		}
 
@@ -5724,15 +5738,15 @@ func (s *symstr) op_unroll(l int, retOp evalop) {
 		}
 
 	case negative:
-		s.ops = append(s.ops, retOp, opSwap, opNegate, opMerge, opExpand)
+		s.ops = append(s.ops, retOp, opSwap, opNegate, opMerge, opEval)
 		s.operands = append(s.operands, 1, v.Value)
 
 	case flag:
-		s.ops = append(s.ops, retOp, opSwap, opFlag, opMerge, opExpand)
+		s.ops = append(s.ops, retOp, opSwap, opFlag, opMerge, opEval)
 		s.operands = append(s.operands, 1, v.Value)
 
 	case *pair:
-		s.ops = append(s.ops, retOp, opSwap, opPair, opMerge, opExpand, opMerge, opExpand)
+		s.ops = append(s.ops, retOp, opSwap, opPair, opMerge, opEval, opMerge, opEval)
 		s.operands = append(s.operands, 1, v.key, v.val)
 
 	case *compound, *qualword, *globbrace, *path:
@@ -5747,7 +5761,7 @@ func (s *symstr) op_unroll(l int, retOp evalop) {
 		}
 
 		if retOp == opRetPack {
-			s.ops = append(s.ops, opRetPack, opSwap, opRestoreContext, composeOp, opExpand)
+			s.ops = append(s.ops, opRetPack, opSwap, opRestoreContext, composeOp, opEval)
 			s.operands = append(s.operands, 1, s.Context, len(elems), elems)
 			s.Context = &com_ctx{s.Context, 0}
 		} else if len(elems) == 0 {
@@ -5823,7 +5837,7 @@ func (s *symstr) op_unroll(l int, retOp evalop) {
 		case LBRACE, STRING, STRCOMP: isRuleEnt = true
 		}
 
-		s.ops = append(s.ops, retOp, opSwap, opRestoreContext, opEvoke, opCons, opEase, opExpandArgs, opEase, opExpand, opResolve, opSwap, opExpand)
+		s.ops = append(s.ops, retOp, opSwap, opRestoreContext, opEvoke, opCons, opEase, opExpandArgs, opEase, opEval, opResolve, opSwap, opEval)
 		s.operands = append(s.operands, 1, s.Context, v, isClosure, 4, v.Pos(), len(d.a), d.a, v.Pos(), len(d.o), d.o, isRuleEnt, isClosure, 1, d.x)
 
 		if isClosure {
@@ -5833,15 +5847,15 @@ func (s *symstr) op_unroll(l int, retOp evalop) {
 		}
 
 	case *arrow:
-		s.ops = append(s.ops, retOp, opSwap, opSelect, opSwap, opExpand, opExpand)
+		s.ops = append(s.ops, retOp, opSwap, opSelect, opSwap, opEval, opEval)
 		s.operands = append(s.operands, 1, v, 2, v.o, v.s)
 
 	case *conjunction:
-		s.ops = append(s.ops, retOp, opSwap, opConjunct, opCons, opExpand, opExpand)
+		s.ops = append(s.ops, retOp, opSwap, opConjunct, opCons, opEval, opEval)
 		s.operands = append(s.operands, 1, v, 1+len(v.list.elems), v.list.elems, v.sep)
 
 	case *disjunction:
-		s.ops = append(s.ops, retOp, opSwap, opDisjunct, opSwap, opExpand)
+		s.ops = append(s.ops, retOp, opSwap, opDisjunct, opSwap, opEval)
 		s.operands = append(s.operands, 1, v, 1, v.val)
 
 	case *rule, *stemmed_rule, matched_rule:
@@ -5852,7 +5866,7 @@ func (s *symstr) op_unroll(l int, retOp evalop) {
 		case *stemmed_rule: target = r.rule.target; rNode = r.rule
 		case matched_rule:  target = r.rule.target; rNode = r.rule
 		}
-		s.ops = append(s.ops, retOp, opSwap, opRule, opSwap, opExpand)
+		s.ops = append(s.ops, retOp, opSwap, opRule, opSwap, opEval)
 		s.operands = append(s.operands, 1, rNode, 1, target)
 
 	case *quote, *group, *recipe, *plain, *plainline:
@@ -5922,7 +5936,7 @@ func (s *symstr) op_unroll(l int, retOp evalop) {
 
 	case *strlit:
 		if truly(s.Context, ex_path_str{}) {
-			s.ops = append(s.ops, retOp, opSwap, opPathStr, opExpand)
+			s.ops = append(s.ops, retOp, opSwap, opPathStr, opEval)
 			s.operands = append(s.operands, 1, v, true, v.s)
 		} else if retOp == opRetPack {
 			retVal(v)
@@ -5934,7 +5948,7 @@ func (s *symstr) op_unroll(l int, retOp evalop) {
 
 	case *strval:
 		if truly(s.Context, ex_path_str{}) {
-			s.ops = append(s.ops, retOp, opSwap, opPathStr, opExpand)
+			s.ops = append(s.ops, retOp, opSwap, opPathStr, opEval)
 			s.operands = append(s.operands, 1, v, true, v.v)
 		} else {
 			if len(v.v) == 0 { return }
@@ -5943,7 +5957,7 @@ func (s *symstr) op_unroll(l int, retOp evalop) {
 
 	case *strcomp:
 		if truly(s.Context, ex_path_str{}) {
-			s.ops = append(s.ops, retOp, opSwap, opPathStr, opExpand)
+			s.ops = append(s.ops, retOp, opSwap, opPathStr, opEval)
 			s.operands = append(s.operands, 1, v, false, v.elems)
 		} else {
 			retVal(posym{v.Pos(), symQuotation})
@@ -6014,7 +6028,7 @@ func (s *symstr) op_unroll_rev(l int, retOp evalop) {
 		if truly(s.Context, is_com_ctx{}) {
 			retVal(v.Value)
 		} else {
-			s.ops = append(s.ops, retOp, opSwap, opFullname, opSwap, opExpandRev)
+			s.ops = append(s.ops, retOp, opSwap, opFullname, opSwap, opEvalRev)
 			s.operands = append(s.operands, 1, v, 1, v.Value)
 		}
 
@@ -6033,15 +6047,15 @@ func (s *symstr) op_unroll_rev(l int, retOp evalop) {
 		}
 
 	case negative:
-		s.ops = append(s.ops, retOp, opSwap, opNegate, opMerge, opExpandRev)
+		s.ops = append(s.ops, retOp, opSwap, opNegate, opMerge, opEvalRev)
 		s.operands = append(s.operands, 1, v.Value)
 
 	case flag:
-		s.ops = append(s.ops, retOp, opSwap, opFlag, opMerge, opExpandRev)
+		s.ops = append(s.ops, retOp, opSwap, opFlag, opMerge, opEvalRev)
 		s.operands = append(s.operands, 1, v.Value)
 
 	case *pair:
-		s.ops = append(s.ops, retOp, opSwap, opPair, opMerge, opExpandRev, opMerge, opExpandRev)
+		s.ops = append(s.ops, retOp, opSwap, opPair, opMerge, opEvalRev, opMerge, opEvalRev)
 		s.operands = append(s.operands, 1, v.key, v.val)
 
 	case *compound, *qualword, *globbrace, *path:
@@ -6056,7 +6070,7 @@ func (s *symstr) op_unroll_rev(l int, retOp evalop) {
 		}
 
 		if retOp == opRetPackRev {
-			s.ops = append(s.ops, opRetPackRev, opSwap, opRestoreContext, composeOp, opExpandRev)
+			s.ops = append(s.ops, opRetPackRev, opSwap, opRestoreContext, composeOp, opEvalRev)
 			s.operands = append(s.operands, 1, s.Context, len(elems), elems)
 			s.Context = &com_ctx{s.Context, 0}
 		} else if len(elems) == 0 {
@@ -6132,7 +6146,7 @@ func (s *symstr) op_unroll_rev(l int, retOp evalop) {
 		case LBRACE, STRING, STRCOMP: isRuleEnt = true
 		}
 
-		s.ops = append(s.ops, retOp, opSwap, opRestoreContext, opEvoke, opCons, opEase, opExpandArgsRev, opEase, opExpandRev, opResolve, opSwap, opExpandRev)
+		s.ops = append(s.ops, retOp, opSwap, opRestoreContext, opEvoke, opCons, opEase, opExpandArgsRev, opEase, opEvalRev, opResolve, opSwap, opEvalRev)
 		s.operands = append(s.operands, 1, s.Context, v, isClosure, 4, v.Pos(), len(d.a), d.a, v.Pos(), len(d.o), d.o, isRuleEnt, isClosure, 1, d.x)
 
 		if isClosure {
@@ -6142,15 +6156,15 @@ func (s *symstr) op_unroll_rev(l int, retOp evalop) {
 		}
 
 	case *arrow:
-		s.ops = append(s.ops, retOp, opSwap, opSelect, opSwap, opExpandRev, opExpandRev)
+		s.ops = append(s.ops, retOp, opSwap, opSelect, opSwap, opEvalRev, opEvalRev)
 		s.operands = append(s.operands, 1, v, 2, v.o, v.s)
 
 	case *conjunction:
-		s.ops = append(s.ops, retOp, opSwap, opConjunct, opCons, opExpandRev, opExpandRev)
+		s.ops = append(s.ops, retOp, opSwap, opConjunct, opCons, opEvalRev, opEvalRev)
 		s.operands = append(s.operands, 1, v, 1+len(v.list.elems), v.list.elems, v.sep)
 
 	case *disjunction:
-		s.ops = append(s.ops, retOp, opSwap, opDisjunct, opSwap, opExpandRev)
+		s.ops = append(s.ops, retOp, opSwap, opDisjunct, opSwap, opEvalRev)
 		s.operands = append(s.operands, 1, v, 1, v.val)
 
 	case *rule, *stemmed_rule, matched_rule:
@@ -6161,7 +6175,7 @@ func (s *symstr) op_unroll_rev(l int, retOp evalop) {
 		case *stemmed_rule: target = r.rule.target; rNode = r.rule
 		case matched_rule:  target = r.rule.target; rNode = r.rule
 		}
-		s.ops = append(s.ops, retOp, opSwap, opRule, opSwap, opExpandRev)
+		s.ops = append(s.ops, retOp, opSwap, opRule, opSwap, opEvalRev)
 		s.operands = append(s.operands, 1, rNode, 1, target)
 
 	case *quote, *group, *recipe, *plain, *plainline:
@@ -6231,7 +6245,7 @@ func (s *symstr) op_unroll_rev(l int, retOp evalop) {
 
 	case *strlit:
 		if truly(s.Context, ex_path_str{}) {
-			s.ops = append(s.ops, retOp, opSwap, opPathStr, opExpandRev)
+			s.ops = append(s.ops, retOp, opSwap, opPathStr, opEvalRev)
 			s.operands = append(s.operands, 1, v, true, v.s)
 		} else if retOp == opRetPackRev {
 			retVal(v)
@@ -6243,7 +6257,7 @@ func (s *symstr) op_unroll_rev(l int, retOp evalop) {
 
 	case *strval:
 		if truly(s.Context, ex_path_str{}) {
-			s.ops = append(s.ops, retOp, opSwap, opPathStr, opExpandRev)
+			s.ops = append(s.ops, retOp, opSwap, opPathStr, opEvalRev)
 			s.operands = append(s.operands, 1, v, true, v.v)
 		} else {
 			if len(v.v) == 0 { return }
@@ -6252,7 +6266,7 @@ func (s *symstr) op_unroll_rev(l int, retOp evalop) {
 
 	case *strcomp:
 		if truly(s.Context, ex_path_str{}) {
-			s.ops = append(s.ops, retOp, opSwap, opPathStr, opExpandRev)
+			s.ops = append(s.ops, retOp, opSwap, opPathStr, opEvalRev)
 			s.operands = append(s.operands, 1, v, false, v.elems)
 		} else {
 			retVal(posym{v.Pos(), symQuotation})
@@ -6320,7 +6334,7 @@ func (s *symstr) op_unroll_match(l int) {
 		if truly(s.Context, is_com_ctx{}) {
 			retVal(v.Value)
 		} else {
-			s.ops = append(s.ops, opSwap, opFullname, opSwap, opExpand)
+			s.ops = append(s.ops, opUnrollMatch, opSwap, opFullname, opSwap, opEval)
 			s.operands = append(s.operands, 1, v, 1, v.Value)
 		}
 
@@ -6588,15 +6602,16 @@ func (s *symstr) op_unroll_match(l int) {
 
 	case *strlit:
 		if truly(s.Context, ex_path_str{}) {
-			s.ops = append(s.ops, opSwap, opPathStr, opExpand)
-			s.operands = append(s.operands, 1, v, true, v.s)
+			w := &word{valbase{v.Pos()}, intern(v.s)}
+			s.ops = append(s.ops, opUnrollMatch, opSwap, opPathStr, opEval)
+			s.operands = append(s.operands, 1, v, true, w)
 		} else {
 			retVal(v)
 		}
 
 	case *strval:
 		if truly(s.Context, ex_path_str{}) {
-			s.ops = append(s.ops, opSwap, opPathStr, opExpand)
+			s.ops = append(s.ops, opUnrollMatch, opSwap, opPathStr, opEval)
 			s.operands = append(s.operands, 1, v, true, v.v)
 		} else {
 			if len(v.v) == 0 { return }
@@ -6605,7 +6620,7 @@ func (s *symstr) op_unroll_match(l int) {
 
 	case *strcomp:
 		if truly(s.Context, ex_path_str{}) {
-			s.ops = append(s.ops, opSwap, opPathStr, opExpand)
+			s.ops = append(s.ops, opUnrollMatch, opSwap, opPathStr, opEval)
 			s.operands = append(s.operands, 1, v, false, v.elems)
 		} else {
 			s.ops = append(s.ops, opMatchLiteral)
@@ -6678,7 +6693,7 @@ func (s *symstr) op_unroll_match_rev(l int) {
 		if truly(s.Context, is_com_ctx{}) {
 			retVal(v.Value)
 		} else {
-			s.ops = append(s.ops, opSwap, opFullname, opSwap, opExpandRev)
+			s.ops = append(s.ops, opUnrollMatchRev, opSwap, opFullname, opSwap, opEvalRev)
 			s.operands = append(s.operands, 1, v, 1, v.Value)
 		}
 
@@ -6946,15 +6961,16 @@ func (s *symstr) op_unroll_match_rev(l int) {
 
 	case *strlit:
 		if truly(s.Context, ex_path_str{}) {
-			s.ops = append(s.ops, opSwap, opPathStr, opExpandRev)
-			s.operands = append(s.operands, 1, v, true, v.s)
+			w := &word{valbase{v.Pos()}, intern(v.s)}
+			s.ops = append(s.ops, opUnrollMatchRev, opSwap, opPathStr, opEvalRev)
+			s.operands = append(s.operands, 1, v, true, w)
 		} else {
 			retVal(v)
 		}
 
 	case *strval:
 		if truly(s.Context, ex_path_str{}) {
-			s.ops = append(s.ops, opSwap, opPathStr, opExpandRev)
+			s.ops = append(s.ops, opUnrollMatchRev, opSwap, opPathStr, opEvalRev)
 			s.operands = append(s.operands, 1, v, true, v.v)
 		} else {
 			if len(v.v) == 0 { return }
@@ -6963,7 +6979,7 @@ func (s *symstr) op_unroll_match_rev(l int) {
 
 	case *strcomp:
 		if truly(s.Context, ex_path_str{}) {
-			s.ops = append(s.ops, opSwap, opPathStr, opExpandRev)
+			s.ops = append(s.ops, opUnrollMatchRev, opSwap, opPathStr, opEvalRev)
 			s.operands = append(s.operands, 1, v, false, v.elems)
 		} else {
 			s.ops = append(s.ops, opMatchLiteralRev)
@@ -7862,7 +7878,7 @@ _op_switch_:
 			if lst, isList := v.(*list); isList {
 				s.ops = append(s.ops, opEase)
 				s.operands = append(s.operands, lst.Pos(), len(lst.elems))
-				if reverse { s.ops = append(s.ops, opExpandRev) } else { s.ops = append(s.ops, opExpand) }
+				if reverse { s.ops = append(s.ops, opEvalRev) } else { s.ops = append(s.ops, opEval) }
 				s.operands = append(s.operands, lst.elems)
 			} else {
 				if reverse { s.ops = append(s.ops, opReduceRev) } else { s.ops = append(s.ops, opReduce) }
@@ -7878,47 +7894,51 @@ _op_switch_:
 			s.results = append(s.results, v)
 		}
 
-	case opExpand, opExpandRev:
+	case opEval, opEvalRev:
 		arg := s.operands[l-1]
 		s.operands = s.operands[:l-1]
-		reverse := op == opExpandRev
+		reverse := op == opEvalRev
 
-		switch v := arg.(type) {
+		switch val := arg.(type) {
 		case nil:
 			s.results = append(s.results, nil)
 		case []Value:
-			if len(v) == 0 { break _op_switch_ }
+			// Native VM slice iteration (Zero-for-loop)
+			if len(val) == 0 { break _op_switch_ }
 			if reverse {
-				if len(v) > 1 {
-					s.ops = append(s.ops, opExpandRev)
-					s.operands = append(s.operands, v[:len(v)-1])
+				if len(val) > 1 {
+					s.ops = append(s.ops, opEvalRev)
+					s.operands = append(s.operands, val[:len(val)-1])
 				}
-				s.ops = append(s.ops, opExpandRev)
-				s.operands = append(s.operands, v[len(v)-1])
+				s.ops = append(s.ops, opEvalRev)
+				s.operands = append(s.operands, val[len(val)-1])
 			} else {
-				if len(v) > 1 {
-					s.ops = append(s.ops, opExpand)
-					s.operands = append(s.operands, v[1:])
+				if len(val) > 1 {
+					s.ops = append(s.ops, opEval)
+					s.operands = append(s.operands, val[1:])
 				}
-				s.ops = append(s.ops, opExpand)
-				s.operands = append(s.operands, v[0])
+				s.ops = append(s.ops, opEval)
+				s.operands = append(s.operands, val[0])
 			}
 		case Value:
-			if lst, isList := v.(*list); isList {
+			if lst, isList := val.(*list); isList {
+				// Delegate list execution back to the slice iterator
 				s.ops = append(s.ops, opEase)
 				s.operands = append(s.operands, lst.Pos(), len(lst.elems))
-				s.ops = append(s.ops, op) // Pushes opExpand or opExpandRev accordingly
+				if reverse { s.ops = append(s.ops, opEvalRev) } else { s.ops = append(s.ops, opEval) }
 				s.operands = append(s.operands, lst.elems)
 			} else {
+				// Establish the Evaluation Frame
 				if reverse { s.ops = append(s.ops, opReduceRev) } else { s.ops = append(s.ops, opReduce) }
-				s.operands = append(s.operands, []any{s.vmpack, s.class, rl, v.Pos()})
+				s.operands = append(s.operands, []any{s.vmpack, s.class, rl, val.Pos()})
 
-				// Clean vmpack so unrolled items have a fresh container
 				s.vmpack = &vmpack{}
 
 				if reverse { s.ops = append(s.ops, opUnrollPackRev) } else { s.ops = append(s.ops, opUnrollPack) }
-				s.operands = append(s.operands, v)
+				s.operands = append(s.operands, val)
 			}
+		default:
+			erro(s, "VM execution trap: opEval received unexpected type %T", arg)
 		}
 
 	case opReduce, opReduceRev:
@@ -8077,8 +8097,6 @@ _op_switch_:
 		}
 		s.results = append(s.results, res)
 
-	case opTraverse:
-
 	case opRule:
 		target := s.operands[l-1].(Value)
 		r := s.operands[l-2].(*rule)
@@ -8164,12 +8182,14 @@ _op_switch_:
 
 	case opCompose: s.op_compose(l)
 	case opSelect: s.op_select(l)
+
 	case opUnroll: s.op_unroll(l, opRet)
 	case opUnrollRev: s.op_unroll_rev(l, opRetRev)
 	case opUnrollPack: s.op_unroll(l, opRetPack)
 	case opUnrollPackRev: s.op_unroll_rev(l, opRetPackRev)
 	case opUnrollMatch: s.op_unroll_match(l)
 	case opUnrollMatchRev: s.op_unroll_match_rev(l)
+
 	case opEvoke: s.op_evoke(l)
 	case opEvokeRet:
 		pos := s.operands[l-1].(Pos)
@@ -9384,9 +9404,9 @@ func (s *symstr) evals(nodes ...Value) (res []Value) {
 	startOps := len(s.ops)
 	startRes := len(s.results)
 
-	// Bootstrap with opExpand!
-	// The matcher frameworks strictly rely on this to stringify literal nodes.
-	s.ops = append(s.ops, opExpand)
+	// Bootstrap with opEval!
+	// The Evaluator pipeline strictly relies on this to execute nodes to s.results.
+	s.ops = append(s.ops, opEval)
 	s.operands = append(s.operands, nodes)
 
 	for len(s.ops) > startOps && s.err == nil { s.step() }
@@ -9466,7 +9486,7 @@ func (s *symstr) evoke(x Value, o, a []Value) (res Value) {
 
 	s.ops = append(s.ops, opEase)
 	s.operands = append(s.operands, d.Pos(), len(d.o))
-	s.ops = append(s.ops, opExpand)
+	s.ops = append(s.ops, opEval)
 	s.operands = append(s.operands, d.o)
 
 	// Inject opResolve and feed `x` directly to it!
