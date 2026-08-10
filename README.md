@@ -35,7 +35,7 @@ However, because every build environment is unique, ExtBit LLC offers commercial
 * Specialized CI/CD pipeline integrations.
 * Advanced build caching and distributed compilation modules.
 
-Need a custom plugin or dedicated support for your company? [Contact ExtBit LLC](mailto:biz@extbit.com) or hire us directly via our [Upwork Project Catalog](your-upwork-link-here).
+Need a custom plugin or dedicated support for your company? [Contact ExtBit LLC](mailto:biz@extbit.com) or hire us directly via our [Upwork Project Catalog](https://www.upwork.com/services/product/development-it-custom-build-automation-or-modular-makefile-migration-using-smart-2085770956140247247?ref=project_share).
 
 ---
 
