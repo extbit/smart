@@ -3251,10 +3251,9 @@ func (s *symstr) nfa_push_unconsumed(rightValid bool, right posym, targetIdx int
 
 const bidirectional_fallback_ret_literal = false
 
-type ret struct { v any }
-type ret_val struct { v Value }
-type ret_sym struct { posym }
 type match_lit struct { posym }
+type pack_sym struct { posym }
+type pack_val struct { v Value }
 
 func (s *symstr) next_lit() posym {
 	// 1. Sandbox the lookahead to prevent side effects
@@ -5726,7 +5725,7 @@ func (s *symstr) op_compose(l int) {
 	s.results = append(s.results, res)
 }
 
-func (s *symstr) op_evoke(l int) {
+func (s *symstr) opEvoke(l int) {
 	cons := s.operands[l-1].([]any)
 	isClosure := s.operands[l-2].(bool)
 	v := s.operands[l-3].(Value)
@@ -9264,11 +9263,10 @@ _op_switch_:
 		}
 		s.results = append(s.results, res)
 
-	case opExpandArgs, opExpandArgsRev:
+	case opExpandArgs:
 		var args []Value
 		var idx int
 
-		reverse := op == opExpandArgsRev
 		if val, isInt := s.operands[l-1].(int); isInt {
 			idx = val
 			args = s.operands[l-2].([]Value)
@@ -9276,21 +9274,13 @@ _op_switch_:
 		} else {
 			args = s.operands[l-1].([]Value)
 			s.operands = s.operands[:l-1]
-			if reverse { idx = len(args) - 1 } else { idx = 0 }
+			idx = 0
 		}
 
 		if len(args) == 0 || idx < 0 || idx >= len(args) { break _op_switch_ }
-
-		if reverse {
-			if idx > 0 {
-				s.ops = append(s.ops, opExpandArgsRev)
-				s.operands = append(s.operands, args, idx-1)
-			}
-		} else {
-			if idx < len(args)-1 {
-				s.ops = append(s.ops, opExpandArgs)
-				s.operands = append(s.operands, args, idx+1)
-			}
+		if idx < len(args)-1 {
+			s.ops = append(s.ops, opExpandArgs)
+			s.operands = append(s.operands, args, idx+1)
 		}
 
 		v := args[idx]
@@ -9303,63 +9293,134 @@ _op_switch_:
 			if lst, isList := v.(*list); isList {
 				s.ops = append(s.ops, opEase)
 				s.operands = append(s.operands, lst.Pos(), len(lst.elems))
-				if reverse { s.ops = append(s.ops, opEvalRev) } else { s.ops = append(s.ops, opEval) }
+				s.ops = append(s.ops, opEval)
 				s.operands = append(s.operands, lst.elems)
 			} else {
-				if reverse { s.ops = append(s.ops, opReduceRev) } else { s.ops = append(s.ops, opReduce) }
+				s.ops = append(s.ops, opReduce)
 				s.operands = append(s.operands, []any{s.vmpack, s.class, rl, v.Pos()})
 
 				// Clean vmpack so unrolled items have a fresh container
 				s.vmpack = &vmpack{}
 
-				if reverse { s.ops = append(s.ops, opUnrollPackRev) } else { s.ops = append(s.ops, opUnrollPack) }
+				s.ops = append(s.ops, opUnrollPack)
 				s.operands = append(s.operands, v)
 			}
 		} else {
 			s.results = append(s.results, v)
 		}
 
-	case opEval, opEvalRev:
+	case opExpandArgsRev:
+		var args []Value
+		var idx int
+
+		if val, isInt := s.operands[l-1].(int); isInt {
+			idx = val
+			args = s.operands[l-2].([]Value)
+			s.operands = s.operands[:l-2]
+		} else {
+			args = s.operands[l-1].([]Value)
+			s.operands = s.operands[:l-1]
+			idx = len(args) - 1
+		}
+
+		if len(args) == 0 || idx < 0 || idx >= len(args) { break _op_switch_ }
+		if idx > 0 {
+			s.ops = append(s.ops, opExpandArgsRev)
+			s.operands = append(s.operands, args, idx-1)
+		}
+
+		v := args[idx]
+		if v == nil {
+			s.results = append(s.results, nil)
+			break _op_switch_
+		}
+
+		if truly(s.Context, arg_expansion{idx}) {
+			if lst, isList := v.(*list); isList {
+				s.ops = append(s.ops, opEase)
+				s.operands = append(s.operands, lst.Pos(), len(lst.elems))
+				s.ops = append(s.ops, opEvalRev)
+				s.operands = append(s.operands, lst.elems)
+			} else {
+				s.ops = append(s.ops, opReduceRev)
+				s.operands = append(s.operands, []any{s.vmpack, s.class, rl, v.Pos()})
+
+				// Clean vmpack so unrolled items have a fresh container
+				s.vmpack = &vmpack{}
+
+				s.ops = append(s.ops, opUnrollPackRev)
+				s.operands = append(s.operands, v)
+			}
+		} else {
+			s.results = append(s.results, v)
+		}
+
+	case opEval:
 		arg := s.operands[l-1]
 		s.operands = s.operands[:l-1]
-		reverse := op == opEvalRev
-
 		switch val := arg.(type) {
 		case nil:
 			s.results = append(s.results, nil)
 		case []Value:
 			// Native VM slice iteration (Zero-for-loop)
 			if len(val) == 0 { break _op_switch_ }
-			if reverse {
-				if len(val) > 1 {
-					s.ops = append(s.ops, opEvalRev)
-					s.operands = append(s.operands, val[:len(val)-1])
-				}
-				s.ops = append(s.ops, opEvalRev)
-				s.operands = append(s.operands, val[len(val)-1])
-			} else {
-				if len(val) > 1 {
-					s.ops = append(s.ops, opEval)
-					s.operands = append(s.operands, val[1:])
-				}
+			if len(val) > 1 {
 				s.ops = append(s.ops, opEval)
-				s.operands = append(s.operands, val[0])
+				s.operands = append(s.operands, val[1:])
 			}
+			s.ops = append(s.ops, opEval)
+			s.operands = append(s.operands, val[0])
 		case Value:
 			if lst, isList := val.(*list); isList {
 				// Delegate list execution back to the slice iterator
 				s.ops = append(s.ops, opEase)
 				s.operands = append(s.operands, lst.Pos(), len(lst.elems))
-				if reverse { s.ops = append(s.ops, opEvalRev) } else { s.ops = append(s.ops, opEval) }
+				s.ops = append(s.ops, opEval)
 				s.operands = append(s.operands, lst.elems)
 			} else {
 				// Establish the Evaluation Frame
-				if reverse { s.ops = append(s.ops, opReduceRev) } else { s.ops = append(s.ops, opReduce) }
+				s.ops = append(s.ops, opReduce)
 				s.operands = append(s.operands, []any{s.vmpack, s.class, rl, val.Pos()})
 
 				s.vmpack = &vmpack{}
 
-				if reverse { s.ops = append(s.ops, opUnrollPackRev) } else { s.ops = append(s.ops, opUnrollPack) }
+				s.ops = append(s.ops, opUnrollPack)
+				s.operands = append(s.operands, val)
+			}
+		default:
+			erro(s, "VM execution trap: opEval received unexpected type %T", arg)
+		}
+
+	case opEvalRev:
+		arg := s.operands[l-1]
+		s.operands = s.operands[:l-1]
+		switch val := arg.(type) {
+		case nil:
+			s.results = append(s.results, nil)
+		case []Value:
+			// Native VM slice iteration (Zero-for-loop)
+			if len(val) == 0 { break _op_switch_ }
+			if len(val) > 1 {
+				s.ops = append(s.ops, opEvalRev)
+				s.operands = append(s.operands, val[:len(val)-1])
+			}
+			s.ops = append(s.ops, opEvalRev)
+			s.operands = append(s.operands, val[len(val)-1])
+		case Value:
+			if lst, isList := val.(*list); isList {
+				// Delegate list execution back to the slice iterator
+				s.ops = append(s.ops, opEase)
+				s.operands = append(s.operands, lst.Pos(), len(lst.elems))
+				s.ops = append(s.ops, opEvalRev)
+				s.operands = append(s.operands, lst.elems)
+			} else {
+				// Establish the Evaluation Frame
+				s.ops = append(s.ops, opReduceRev)
+				s.operands = append(s.operands, []any{s.vmpack, s.class, rl, val.Pos()})
+
+				s.vmpack = &vmpack{}
+
+				s.ops = append(s.ops, opUnrollPackRev)
 				s.operands = append(s.operands, val)
 			}
 		default:
@@ -9615,7 +9676,7 @@ _op_switch_:
 	case opUnrollMatch   : s.opUnrollMatch(l)
 	case opUnrollMatchRev: s.opUnrollMatchRev(l)
 
-	case opEvoke: s.op_evoke(l)
+	case opEvoke: s.opEvoke(l)
 	case opEvokeRet:
 		pos := s.operands[l-1].(Pos)
 		s.operands = s.operands[:l-1]

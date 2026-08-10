@@ -2,10 +2,11 @@
 *~
 *.5
 *.6
+_/
 /.emacs.desktop
 /.emacs.desktop.lock
 /Q.md
-/Ques*.md
+/Ques*
 /TODO.pdf
 /TODO.tex
 /compilation.log
@@ -36,5 +37,4 @@
 /.smart/
 \*shell:*\*
 \.#*
-_/
-/Ques*.txt
+
