@@ -10850,14 +10850,14 @@ func (s *symstr) builtin(t *builtin, o, a []Value) Value {
 type named_stem struct{ Value; name Symbol }
 func (p *named_stem) String() string { return p.Value.String() }
 
-func (s *symstr) match(pat, val Value) (matched bool, res, rem Value, stems []Value) {
+func (s *symstr) match(pattern, target Value) (matched bool, res, rem Value, stems []Value) {
 	trail := truly(s.Context, propReversal)
 
 	// LAYER 0: Bootstrap the Matcher (Unrolls the Pattern AST)
 	var matchOp evalop
 	if trail { matchOp = opUnrollMatchRev } else { matchOp = opUnrollMatch }
 	s.ops = append(s.ops, opEnd, matchOp) // CRITICAL: Bootstrap with opEnd to guarantee io.EOF
-	s.operands = append(s.operands, pat)
+	s.operands = append(s.operands, pattern)
 
 	// LAYER 1: The Generator (Unrolls the Target AST)
 	var genOp evalop
@@ -10865,7 +10865,7 @@ func (s *symstr) match(pat, val Value) (matched bool, res, rem Value, stems []Va
 
 	gen := &symstr{Context: s.Context}
 	gen.ops = append(gen.ops, opEnd, genOp)
-	gen.operands = append(gen.operands, val)
+	gen.operands = append(gen.operands, target)
 
 	// LAYER 2: Configure this symstr instance as the Matcher
 	s.tie = gen
@@ -10914,7 +10914,6 @@ func (s *symstr) match(pat, val Value) (matched bool, res, rem Value, stems []Va
 	gen.vmpack = nil // Clean up
 
 	// 3. Extract `stems` natively from the Matcher's captures
-
 	if numStems := len(s.stems); numStems > 0 {
 		stems = make([]Value, numStems)
 		for i, capture := range s.stems {
@@ -10955,36 +10954,37 @@ func (s *symstr) match(pat, val Value) (matched bool, res, rem Value, stems []Va
 	if checkpoints {
 		if matched {
 			if !s.exhausted() {
-				warn(pc(s.Context, pat), "pattern stream not exhausted: %v %v; ops=%v str=%q syms=%v",
-					pat, val, s.ops, s.str, s.syms)
+				warn(pc(s.Context, pattern), "pattern stream not exhausted: %v %v; ops=%v str=%q syms=%v",
+					pattern, target, s.ops, s.str, s.syms)
 			}
 			if force_full_match_anchor && !gen.exhausted() {
-				warn(pc(s.Context, val), "value stream not exhausted: %v %v; ops=%v str=%q syms=%v",
-					pat, val, gen.ops, gen.str, gen.syms)
+				warn(pc(s.Context, target), "value stream not exhausted: %v %v; ops=%v str=%q syms=%v",
+					pattern, target, gen.ops, gen.str, gen.syms)
 			}
 			if rem == nil && len(gen.str) > 0 {
-				warn(pc(s.Context, val), "leaked fractional shattering: %v %v -> %s",
-					pat, val, gen.str)
+				warn(pc(s.Context, target), "leaked fractional shattering: %v %v -> %s",
+					pattern, target, gen.str)
 			}
 		}
-		check_match(s.Context, pat, val, trail)(&matched, &res, &rem, &stems)
+		check_match(s.Context, pattern, target, trail)(&matched, &res, &rem, &stems)
 	}
 	return
 }
 
 // match matches pattern `pat` against value `val`.
-func match(ctx Context, pat, val Value) (matched bool, res, rem Value, stems []Value) {
-	if val == nil || pat == nil { return false, nil, val, nil }
+func match(ctx Context, pattern, target Value) (matched bool, res, rem Value, stems []Value) {
+	if target == nil || pattern == nil { return false, nil, target, nil }
 
 	if checkpoints {
-		switch sf("%v %v", pat, val) {
-		case "foo/bar/xx/yy/zz.h *.h", "foo/bar/xx/yy/zz.h **.h":
-			debug(ctx, "match: %v %v", pat, val)
-			d_step = true; defer func() { d_step = false } () }
+		switch sf("%v %v", pattern, target) {
+		case "foo/bar/xx/yy/zz.h *.h", "foo/bar/xx/yy/zz.h **.h", "*.h foo/bar/xx/yy/zz.h", "**.h foo/bar/xx/yy/zz.h":
+			debug(ctx, "match: %v %v", pattern, target)
+			d_step = true; defer func() { d_step = false } ()
+		}
 	}
 
 	matcher := &symstr{Context: ctx}
-	return matcher.match(pat, val)
+	return matcher.match(pattern, target)
 }
 
 // eval fully leverages the Virtual Machine's single-stream Generator Mode
