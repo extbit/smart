@@ -2936,15 +2936,15 @@ const (
 	// 1. MISC (System, Control & Stack Manipulation)
 	// General VM routing, debugging, and memory stack alignments.
 	// ============================================================================
-	opEnd                evalop = iota // 0 - Halts VM execution
-	opUnwind                           // 1 - Restores a previously saved backtracking checkpoint
-	opDebug                            // 2 - Prints debugging telemetry
-	opRestoreContext                   // 3 - Restores the previous context environment
-	opSwap                             // 4 - Swap N results to operands
-	opCons                             // 5 - Consolidate N results to 1 operand (Variadic Swap)
-	opCompact                          // 6 - Consolidate N operands to 1 operand
-	opValidate                         // 7 - Validate N results and swap to operands if valid
-	opCompactValid                     // 8 - Validate N operands and consolidate valid items back
+	opEnd               evalop = iota // 0 - Halts VM execution
+	opUnwind                          // 1 - Restores a previously saved backtracking checkpoint
+	opDebug                           // 2 - Prints debugging telemetry
+	opRestoreContext                  // 3 - Restores the previous context environment
+	opSwap                            // 4 - Swap N results to operands
+	opCons                            // 5 - Consolidate N results to 1 operand (Variadic Swap)
+	opCompact                         // 6 - Consolidate N operands to 1 operand
+	opValidate                        // 7 - Validate N results and swap to operands if valid
+	opCompactValid                    // 8 - Validate N operands and consolidate valid items back
 
 	// ============================================================================
 	// 2. EVALUATOR (AST -> AST)
@@ -2952,88 +2952,86 @@ const (
 	// Primary stack: s.results
 	// ============================================================================
 	// -- Execution & Resolution --
-	opEval                             // 9 - Evaluates an AST node
-	opEvalRev                          // 10 - Evaluates an AST node (reversed direction)
-	opEvoke                            // 11 - Evokes a callable/function
-	opEvokeRet                         // 12 - Finalizes an evoke call and yields the result
-	opResolve                          // 13 - Resolves a symbol/variable
-	opExpandArgs                       // 14 - Expands variadic arguments
-	opExpandArgsRev                    // 15 - Expands variadic arguments (reversed direction)
-	opSelect                           // 16 - Executes a select/match branch evaluation
+	opEval                            // 9 - Evaluates an AST node
+	opEvalRev                         // 10 - Evaluates an AST node (reversed direction)
+	opEvoke                           // 11 - Evokes a callable/function
+	opEvokeRet                        // 12 - Finalizes an evoke call and yields the result
+	opResolve                         // 13 - Resolves a symbol/variable
+	opExpandArgs                      // 14 - Expands variadic arguments
+	opExpandArgsRev                   // 15 - Expands variadic arguments (reversed direction)
+	opSelect                          // 16 - Executes a select/match branch evaluation
 
 	// -- Transformers --
-	opEase                             // 17 - Eases N results into a single list or scalar result
-	opMerge                            // 18 - Recursively merges one result into elements of []Value
-	opModify                           // 19 - Applies AST modification/mutation
-	opPathStr                          // 20 - Converts path components to string equivalents
-	opUnloc                            // 21 - Strips location metadata from N results
-	opLoc                              // 22 - Annotates the top result with location metadata
-	opFullname                         // 23 - Resolves absolute path values
+	opEase                            // 17 - Eases N results into a single list or scalar result
+	opMerge                           // 18 - Recursively merges one result into elements of []Value
+	opModify                          // 19 - Applies AST modification/mutation
+	opPathStr                         // 20 - Converts path components to string equivalents
+	opFullname                        // 21 - Resolves absolute path values
 
 	// -- AST Constructors --
-	opCompound                         // 24 - Combines N results into a compound node
-	opQualword                         // 25 - Combines N results into a qualword node
-	opGlobbrace                        // 26 - Combines N results into a globbrace node
-	opPath                             // 27 - Combines N results into a path node
-	opConjunct                         // 28 - Merges results into a logical AND node
-	opDisjunct                         // 29 - Merges results into a logical OR node
-	opNegate                           // 30 - Applies logical negation wrapping
-	opFlag                             // 31 - Applies flag wrapping
-	opPair                             // 32 - Combines results into key-value pairs
-	opRule                             // 33 - Instantiates a rule AST
-	opCompose                          // 34 - Composes complex element constructs
+	opCompound                        // 22 - Combines N results into a compound node
+	opQualword                        // 23 - Combines N results into a qualword node
+	opGlobbrace                       // 24 - Combines N results into a globbrace node
+	opPath                            // 25 - Combines N results into a path node
+	opConjunct                        // 26 - Merges results into a logical AND node
+	opDisjunct                        // 27 - Merges results into a logical OR node
+	opNegate                          // 28 - Applies logical negation wrapping
+	opFlag                            // 29 - Applies flag wrapping
+	opPair                            // 30 - Combines results into key-value pairs
+	opRule                            // 31 - Instantiates a rule AST
+	opCompose                         // 32 - Composes complex element constructs
 
 	// ============================================================================
 	// 3. SYMBOLIZE (AST -> Symbols)
 	// Flattens ASTs into strings or consumes them against the NFA tape (Match).
 	// Primary stacks: s.syms, s.tie
 	// ============================================================================
-	opUnroll                           // 35 - Unrolls a value onto the stack for normal return
-	opUnrollRev                        // 36 - Unrolls a value onto the stack for normal return (reversed)
-	opUnrollMatch                      // 37 - Unrolls a value onto the stack for matched return
-	opUnrollMatchRev                   // 38 - Unrolls a value onto the stack for matched return (reversed)
-	opMatchLiteral                     // 39 - Matches a string literal
-	opMatchLiteralRev                  // 40 - Matches a string literal (reversed direction)
-	opRegexMatch                       // 41 - Executes a regex match
-	opRegexMatchRev                    // 42 - Executes a regex match (reversed direction)
-	opRegexCon                         // 43 - Consumes matching regex literals
-	opFallbackGlobSeg                  // 44 - Fallback-matches a string literal
-	opFallbackGlobSegRev               // 45 - Fallback-matches a string literal (reversed direction)
-	opFallbackGlobGreed                // 46 - Fallback-matches a string literal
-	opFallbackGlobGreedRev             // 47 - Fallback-matches a string literal (reversed direction)
-	opFallbackGlobCross                // 48 - Fallback-matches a string literal
-	opFallbackGlobCrossRev             // 49 - Fallback-matches a string literal (reversed direction)
-	opGlobQues                         // 50 - Matches a single '?' wildcard
-	opGlobQuesRev                      // 51 - Matches a single '?' wildcard (reversed direction)
-	opGlobRange                        // 52 - Matches a character range
-	opGlobRangeRev                     // 53 - Matches a character range (reversed direction)
-	opGlobAsterisk                     // 54 - Matches a segment '*' wildcard
-	opGlobAsteriskRev                  // 55 - Matches a segment '*' wildcard (reversed direction)
-	opGlobAstGreed                     // 56 - Matches a greedy '**' wildcard
-	opGlobAstGreedRev                  // 57 - Matches a greedy '**' wildcard (reversed direction)
-	opGlobAstCross                     // 58 - Matches a reluctant cross '**?' wildcard
-	opGlobAstCrossRev                  // 59 - Matches a reluctant cross '**?' wildcard (reversed direction)
-	opTryGlobGreed                     // 60 - Implements try-catch fallback for greedy wildcards
-	opTryGlobGreedRev                  // 61 - Implements try-catch fallback for greedy wildcards (reversed)
-	opConseqAsterisk                   // 62 - Resolves consecutive segment asterisks
-	opConseqAsteriskRev                // 63 - Resolves consecutive segment asterisks (reversed direction)
-	opConseqAstGreed                   // 64 - Resolves consecutive greedy asterisks
-	opConseqAstGreedRev                // 65 - Resolves consecutive greedy asterisks (reversed direction)
-	opConseqAstCross                   // 66 - Resolves consecutive reluctant asterisks
-	opConseqAstCrossRev                // 67 - Resolves consecutive reluctant asterisks (reversed direction)
+	opUnroll                          // 33 - Unrolls a value onto the stack for normal return
+	opUnrollRev                       // 34 - Unrolls a value onto the stack for normal return (reversed)
+	opUnrollMatch                     // 35 - Unrolls a value onto the stack for matched return
+	opUnrollMatchRev                  // 36 - Unrolls a value onto the stack for matched return (reversed)
+	opMatchLiteral                    // 37 - Matches a string literal
+	opMatchLiteralRev                 // 38 - Matches a string literal (reversed direction)
+	opRegexMatch                      // 39 - Executes a regex match
+	opRegexMatchRev                   // 40 - Executes a regex match (reversed direction)
+	opRegexCon                        // 41 - Consumes matching regex literals
+	opFallbackGlobSeg                 // 42 - Fallback-matches a string literal
+	opFallbackGlobSegRev              // 43 - Fallback-matches a string literal (reversed direction)
+	opFallbackGlobGreed               // 44 - Fallback-matches a string literal
+	opFallbackGlobGreedRev            // 45 - Fallback-matches a string literal (reversed direction)
+	opFallbackGlobCross               // 46 - Fallback-matches a string literal
+	opFallbackGlobCrossRev            // 47 - Fallback-matches a string literal (reversed direction)
+	opGlobQues                        // 48 - Matches a single '?' wildcard
+	opGlobQuesRev                     // 49 - Matches a single '?' wildcard (reversed direction)
+	opGlobRange                       // 50 - Matches a character range
+	opGlobRangeRev                    // 51 - Matches a character range (reversed direction)
+	opGlobAsterisk                    // 52 - Matches a segment '*' wildcard
+	opGlobAsteriskRev                 // 53 - Matches a segment '*' wildcard (reversed direction)
+	opGlobAstGreed                    // 54 - Matches a greedy '**' wildcard
+	opGlobAstGreedRev                 // 55 - Matches a greedy '**' wildcard (reversed direction)
+	opGlobAstCross                    // 56 - Matches a reluctant cross '**?' wildcard
+	opGlobAstCrossRev                 // 57 - Matches a reluctant cross '**?' wildcard (reversed direction)
+	opTryGlobGreed                    // 58 - Implements try-catch fallback for greedy wildcards
+	opTryGlobGreedRev                 // 59 - Implements try-catch fallback for greedy wildcards (reversed)
+	opConseqAsterisk                  // 60 - Resolves consecutive segment asterisks
+	opConseqAsteriskRev               // 61 - Resolves consecutive segment asterisks (reversed direction)
+	opConseqAstGreed                  // 62 - Resolves consecutive greedy asterisks
+	opConseqAstGreedRev               // 63 - Resolves consecutive greedy asterisks (reversed direction)
+	opConseqAstCross                  // 64 - Resolves consecutive reluctant asterisks
+	opConseqAstCrossRev               // 65 - Resolves consecutive reluctant asterisks (reversed direction)
 
 	// ============================================================================
 	// 4. STRUCTURALIZE (Symbols -> AST)
 	// Accumulates raw symbols and packs them back into concrete AST boundaries.
 	// Primary stack: s.vmpack
 	// ============================================================================
-	opUnrollPack                       // 68 - Unrolls a value onto the stack for packed return
-	opUnrollPackRev                    // 69 - Unrolls a value onto the stack for packed return (reversed)
-	opPack                             // 70 - Yields and packs a value into the buffer
-	opPackRev                          // 71 - Yields and packs a value into the buffer (reversed)
-	opReduce                           // 72 - Reduces a scoped expansion buffer into a concrete result
-	opReduceRev                        // 73 - Reduces a scoped expansion buffer into a concrete result (reversed)
-	opLocPack                          // 74 - Annotates packed buffer elements with location metadata
+	opUnrollPack                      // 66 - Unrolls a value onto the stack for packed return
+	opUnrollPackRev                   // 67 - Unrolls a value onto the stack for packed return (reversed)
+	opPack                            // 68 - Yields and packs a value into the buffer
+	opPackRev                         // 69 - Yields and packs a value into the buffer (reversed)
+	opReduce                          // 70 - Reduces a scoped expansion buffer into a concrete result
+	opReduceRev                       // 71 - Reduces a scoped expansion buffer into a concrete result (reversed)
+	opLocPack                         // 72 - Annotates packed buffer elements with location metadata
 )
 
 const (
@@ -6036,8 +6034,8 @@ func (s *symstr) opUnroll(l int) {
 
 	case *loc:
 		if v.Value != nil {
-			s.ops = append(s.ops, opLoc, opUnroll)
-			s.operands = append(s.operands, v.pos, v.Value)
+			s.ops = append(s.ops, opUnroll)
+			s.operands = append(s.operands, v.Value)
 		}
 
 	case *auto:
@@ -6592,8 +6590,8 @@ func (s *symstr) opUnrollRev(l int) {
 		if v.Value == nil {
 			return // Ignore empty loc wrappers
 		} else {
-			s.ops = append(s.ops, opLoc, opUnrollRev)
-			s.operands = append(s.operands, v.pos, v.Value)
+			s.ops = append(s.ops, opUnrollRev)
+			s.operands = append(s.operands, v.Value)
 		}
 
 	case *auto:
@@ -9588,35 +9586,6 @@ _op_switch_:
 		r := s.operands[l-2].(*rule)
 		s.operands = s.operands[:l-2]
 		s.results = append(s.results, &rule{target, r.arged, r.program})
-
-	case opUnloc:
-		n := s.operands[l-1].(int)
-		s.operands = s.operands[:l-1]
-		for i := rl - n; i < rl; i++ {
-			if v, ok := s.results[i].(Value); ok && v != nil {
-				base := v
-				for {
-					if locNode, ok := base.(*loc); ok { base = locNode.Value } else { break }
-				}
-				if _, isList := base.(*list); isList { s.results[i] = base }
-			}
-		}
-
-	case opLoc:
-		pos := s.operands[l-1].(Pos)
-		s.operands = s.operands[:l-1]
-		if rl > 0 {
-			switch t := s.results[rl-1].(type) {
-			case Value:
-				if _, isLoc := t.(*loc); !isLoc { s.results[rl-1] = _loc(t, pos) }
-			case []Value:
-				for i, v := range t {
-					if _, isLoc := v.(*loc); !isLoc { t[i] = _loc(v, pos) }
-				}
-			default:
-				erro(pc(s.Context, pos), "unexpected %s", ts(t, s))
-			}
-		}
 
 	case opLocPack:
 		// You may also want to split this into opLocPackRev if `s.class&clsBackwards` is completely deleted.
