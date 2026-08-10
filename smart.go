@@ -5489,7 +5489,7 @@ func (s *symstr) opRegexMatchRev(l int) {
 	}
 }
 
-func (s *symstr) op_select(l int) {
+func (s *symstr) opSelect(l int) {
 	o_eval := s.operands[l-1].(Value)
 	s_eval := s.operands[l-2].(Value)
 	v := s.operands[l-3].(*arrow)
@@ -5586,7 +5586,7 @@ func (s *symstr) op_select(l int) {
 	s.results = append(s.results, res)
 }
 
-func (s *symstr) op_compose(l int) {
+func (s *symstr) opCompose(l int) {
 	cons := s.operands[l-1].([]any)
 	kind := s.operands[l-2].(Kind)
 	s.operands = s.operands[:l-2]
@@ -7064,7 +7064,7 @@ func (s *symstr) opUnrollRev(l int) {
 }
 
 func (s *symstr) opUnrollPack(l int) {
-	val := s.operands[l-1].(Value)
+	val := s.operands[l-1]
 	s.operands = s.operands[:l-1]
 
 	if val == nil { return }
@@ -7242,8 +7242,9 @@ func (s *symstr) opUnrollPack(l int) {
 		case LBRACE, STRING, STRCOMP: isRuleEnt = true
 		}
 
+		pos := v.(Value).Pos()
 		s.ops = append(s.ops, opPack, opSwap, opRestoreContext, opEvoke, opCons, opEase, opExpandArgs, opEase, opEval, opResolve, opSwap, opEval)
-		s.operands = append(s.operands, 1, s.Context, v, isClosure, 4, v.Pos(), len(d.a), d.a, v.Pos(), len(d.o), d.o, isRuleEnt, isClosure, 1, d.x)
+		s.operands = append(s.operands, 1, s.Context, v, isClosure, 4, pos, len(d.a), d.a, pos, len(d.o), d.o, isRuleEnt, isClosure, 1, d.x)
 
 		if isClosure {
 			s.Context = &closure_ctx{collapse_ctx{Context: s.Context, good_to_collapse: true}}
@@ -7451,7 +7452,7 @@ func (s *symstr) opUnrollPack(l int) {
 		}
 
 	default:
-		erro(pc(s.Context,val.Pos()), _f(`VM execution trap:
+		erro(pc(s.Context,val), _f(`VM execution trap:
   Unhandled AST node type %T in JIT; it's test-string is:
   %s`, val, ts(val,s)),
 			callstack{num:3})
@@ -7459,7 +7460,7 @@ func (s *symstr) opUnrollPack(l int) {
 }
 
 func (s *symstr) opUnrollPackRev(l int) {
-	val := s.operands[l-1].(Value)
+	val := s.operands[l-1]
 	s.operands = s.operands[:l-1]
 
 	if val == nil { return }
@@ -7637,8 +7638,9 @@ func (s *symstr) opUnrollPackRev(l int) {
 		case LBRACE, STRING, STRCOMP: isRuleEnt = true
 		}
 
+		pos := v.(Value).Pos()
 		s.ops = append(s.ops, opPackRev, opSwap, opRestoreContext, opEvoke, opCons, opEase, opExpandArgsRev, opEase, opEvalRev, opResolve, opSwap, opEvalRev)
-		s.operands = append(s.operands, 1, s.Context, v, isClosure, 4, v.Pos(), len(d.a), d.a, v.Pos(), len(d.o), d.o, isRuleEnt, isClosure, 1, d.x)
+		s.operands = append(s.operands, 1, s.Context, v, isClosure, 4, pos, len(d.a), d.a, pos, len(d.o), d.o, isRuleEnt, isClosure, 1, d.x)
 
 		if isClosure {
 			s.Context = &closure_ctx{collapse_ctx{Context: s.Context, good_to_collapse: true}}
@@ -7846,7 +7848,7 @@ func (s *symstr) opUnrollPackRev(l int) {
 		}
 
 	default:
-		erro(pc(s.Context,val.Pos()), _f(`VM execution trap:
+		erro(pc(s.Context,val), _f(`VM execution trap:
   Unhandled AST node type %T in JIT; it's test-string is:
   %s`, val, ts(val,s)),
 			callstack{num:3})
@@ -9368,23 +9370,19 @@ _op_switch_:
 			}
 			s.ops = append(s.ops, opEval)
 			s.operands = append(s.operands, val[0])
+		case *list:
+			// Delegate list execution back to the slice iterator
+			s.ops = append(s.ops, opEase)
+			s.operands = append(s.operands, val.Pos(), len(val.elems))
+			s.ops = append(s.ops, opEval)
+			s.operands = append(s.operands, val.elems)
 		case Value:
-			if lst, isList := val.(*list); isList {
-				// Delegate list execution back to the slice iterator
-				s.ops = append(s.ops, opEase)
-				s.operands = append(s.operands, lst.Pos(), len(lst.elems))
-				s.ops = append(s.ops, opEval)
-				s.operands = append(s.operands, lst.elems)
-			} else {
-				// Establish the Evaluation Frame
-				s.ops = append(s.ops, opReduce)
-				s.operands = append(s.operands, []any{s.vmpack, s.class, rl, val.Pos()})
-
-				s.vmpack = &vmpack{}
-
-				s.ops = append(s.ops, opUnrollPack)
-				s.operands = append(s.operands, val)
-			}
+			// Establish the Evaluation Frame
+			s.ops = append(s.ops, opReduce)
+			s.operands = append(s.operands, []any{s.vmpack, s.class, rl, val.Pos()})
+			s.ops = append(s.ops, opUnrollPack)
+			s.operands = append(s.operands, val)
+			s.vmpack = &vmpack{}
 		default:
 			erro(s, "VM execution trap: opEval received unexpected type %T", arg)
 		}
@@ -9404,28 +9402,24 @@ _op_switch_:
 			}
 			s.ops = append(s.ops, opEvalRev)
 			s.operands = append(s.operands, val[len(val)-1])
+		case *list:
+			// Delegate list execution back to the slice iterator
+			s.ops = append(s.ops, opEase)
+			s.operands = append(s.operands, val.Pos(), len(val.elems))
+			s.ops = append(s.ops, opEvalRev)
+			s.operands = append(s.operands, val.elems)
 		case Value:
-			if lst, isList := val.(*list); isList {
-				// Delegate list execution back to the slice iterator
-				s.ops = append(s.ops, opEase)
-				s.operands = append(s.operands, lst.Pos(), len(lst.elems))
-				s.ops = append(s.ops, opEvalRev)
-				s.operands = append(s.operands, lst.elems)
-			} else {
-				// Establish the Evaluation Frame
-				s.ops = append(s.ops, opReduceRev)
-				s.operands = append(s.operands, []any{s.vmpack, s.class, rl, val.Pos()})
-
-				s.vmpack = &vmpack{}
-
-				s.ops = append(s.ops, opUnrollPackRev)
-				s.operands = append(s.operands, val)
-			}
+			// Establish the Evaluation Frame
+			s.ops = append(s.ops, opReduceRev)
+			s.operands = append(s.operands, []any{s.vmpack, s.class, rl, val.Pos()})
+			s.ops = append(s.ops, opUnrollPackRev)
+			s.operands = append(s.operands, val)
+			s.vmpack = &vmpack{}
 		default:
 			erro(s, "VM execution trap: opEval received unexpected type %T", arg)
 		}
 
-	case opReduce, opReduceRev:
+	case opReduce:
 		top := s.operands[l-1]
 		s.operands = s.operands[:l-1]
 
@@ -9452,8 +9446,43 @@ _op_switch_:
 			subPack := s.vmpack
 			s.vmpack = snap_pack
 			if subPack != nil {
-				// FIX: Pass the boolean context directly to subPack.reduce!
-				res = subPack.reduce(snap_pos, op == opReduceRev)
+				res = subPack.reduce(snap_pos)
+			} else {
+				res = _null(snap_pos)
+			}
+		}
+
+		s.results = append(s.results, res)
+		s.class = snap_class
+
+	case opReduceRev:
+		top := s.operands[l-1]
+		s.operands = s.operands[:l-1]
+
+		// Safe stack cast. Short-circuited or corrupted unrolls leave raw Values here.
+		snap, isSnap := top.([]any)
+		if !isSnap {
+			if v, isVal := top.(Value); isVal && v != nil {
+				s.results = append(s.results, v)
+			}
+			break _op_switch_
+		}
+
+		snap_pack := snap[0].(*vmpack)
+		snap_class := snap[1].(int)
+		snap_reslen := snap[2].(int)
+		snap_pos := snap[3].(Pos)
+
+		var res Value
+		if rl > snap_reslen {
+			res = s.results[rl-1].(Value)
+			s.results = s.results[:snap_reslen]
+		} else {
+			// Reduce the isolated frame!
+			subPack := s.vmpack
+			s.vmpack = snap_pack
+			if subPack != nil {
+				res = subPack.reduceRev(snap_pos)
 			} else {
 				res = _null(snap_pos)
 			}
@@ -9635,8 +9664,8 @@ _op_switch_:
 		}
 		s.results = s.results[:rl-1]
 
-	case opCompose: s.op_compose(l)
-	case opSelect: s.op_select(l)
+	case opCompose: s.opCompose(l)
+	case opSelect: s.opSelect(l)
 
 	case opUnroll        : s.opUnroll(l)
 	case opUnrollRev     : s.opUnrollRev(l)
@@ -9659,8 +9688,7 @@ _op_switch_:
 			s.results = append(s.results, _null(pos))
 		}
 
-	case opPack, opPackRev:
-		reverse := op == opPackRev
+	case opPack:
 		switch t := s.operands[l-1].(type) {
 		case posym:
 			s.operands = s.operands[:l-1]
@@ -9671,43 +9699,85 @@ _op_switch_:
 				seq := vocab.sequences[t.Idx()]
 				vocab.seqmut.RUnlock()
 
-				if reverse {
-					for _, sym := range seq {
-						s.ops = append(s.ops, opPackRev)
-						s.operands = append(s.operands, posym{t.Pos, sym})
-					}
-				} else {
-					for i := len(seq)-1; i >= 0; i-- {
-						s.ops = append(s.ops, opPack)
-						s.operands = append(s.operands, posym{t.Pos, seq[i]})
-					}
+				for i := len(seq) - 1; i >= 0; i-- {
+					s.ops = append(s.ops, opPack)
+					s.operands = append(s.operands, posym{t.Pos, seq[i]})
 				}
 				break _op_switch_
 			} else {
 				if s.vmpack == nil { s.vmpack = &vmpack{} }
-				// FIX: Passed the boolean reverse flag strictly derived from Opcode!
-				s.pack(t, reverse)
+				s.pack(t)
 				if t.Symbol == symSlash { s.class &^= clsGlobChar | clsGlobAst }
 			}
 
 		case Value:
 			s.operands = s.operands[:l-1]
 			if s.vmpack == nil { s.vmpack = &vmpack{} }
-			s.shift(t, reverse)
+			s.vmpack.shift(t)
 
 		case []any:
 			s.operands = s.operands[:l-1]
 			switch len(t) {
 			case 0:
-				s.ops = append(s.ops, op)
+				s.ops = append(s.ops, opPack)
 				s.operands = append(s.operands, _null(0))
 			case 1:
-				s.ops = append(s.ops, op)
+				s.ops = append(s.ops, opPack)
 				s.operands = append(s.operands, t[0].(Value))
 			default:
 				lst := &list{}
 				for _, elem := range t { lst.append(elem.(Value)) }
-				s.ops = append(s.ops, op)
+				s.ops = append(s.ops, opPack)
+				s.operands = append(s.operands, lst)
+			}
+
+		case nil:
+			s.operands = s.operands[:l-1]
+
+		default:
+			erro(s, "unexpected return: %[1]T %[1]v", t)
+		}
+
+	case opPackRev:
+		switch t := s.operands[l-1].(type) {
+		case posym:
+			s.operands = s.operands[:l-1]
+			if t.Symbol == symEmpty {
+				// Discarded
+			} else if t.Kind() == SymSeq {
+				vocab.seqmut.RLock()
+				seq := vocab.sequences[t.Idx()]
+				vocab.seqmut.RUnlock()
+
+				for _, sym := range seq {
+					s.ops = append(s.ops, opPackRev)
+					s.operands = append(s.operands, posym{t.Pos, sym})
+				}
+				break _op_switch_
+			} else {
+				if s.vmpack == nil { s.vmpack = &vmpack{} }
+				s.packRev(t)
+				if t.Symbol == symSlash { s.class &^= clsGlobChar | clsGlobAst }
+			}
+
+		case Value:
+			s.operands = s.operands[:l-1]
+			if s.vmpack == nil { s.vmpack = &vmpack{} }
+			s.vmpack.shiftRev(t)
+
+		case []any:
+			s.operands = s.operands[:l-1]
+			switch len(t) {
+			case 0:
+				s.ops = append(s.ops, opPackRev)
+				s.operands = append(s.operands, _null(0))
+			case 1:
+				s.ops = append(s.ops, opPackRev)
+				s.operands = append(s.operands, t[0].(Value))
+			default:
+				lst := &list{}
+				for _, elem := range t { lst.append(elem.(Value)) }
+				s.ops = append(s.ops, opPackRev)
 				s.operands = append(s.operands, lst)
 			}
 
@@ -9979,11 +10049,11 @@ func (p *vmpack) clone() *vmpack {
 	}
 }
 
-func (p *vmpack) shift(val Value, reverse bool) {
-	if reverse { p.comp.prepend(val) } else { p.comp.append(val) }
+func (p *vmpack) shift(val Value) {
+	p.comp.append(val)
 }
 
-func (p *vmpack) reduceQual(pos Pos, reverse bool) {
+func (p *vmpack) reduceQual(pos Pos) {
 	var v Value
 
 	if p.comp.len() > 0 {
@@ -9996,22 +10066,14 @@ func (p *vmpack) reduceQual(pos Pos, reverse bool) {
 	}
 
 	if v == nil {
-		if reverse {
-			p.qual.prepend(valbase{pos})
-		} else {
-			p.qual.append(valbase{pos})
-		}
+		p.qual.append(valbase{pos})
 	} else {
-		if reverse {
-			p.qual.prepend(v)
-		} else {
-			p.qual.append(v)
-		}
+		p.qual.append(v)
 	}
 }
 
-func (p *vmpack) reducePath(pos Pos, reverse bool) {
-	p.reduceQual(pos, reverse)
+func (p *vmpack) reducePath(pos Pos) {
+	p.reduceQual(pos)
 
 	var res Value
 	if p.qual.len() == 1 {
@@ -10040,31 +10102,20 @@ func (p *vmpack) reducePath(pos Pos, reverse bool) {
 	if res != nil {
 		if _, isEmpty := res.(valbase); isEmpty {
 			if p.path.len() > 0 {
-				if reverse {
-					// In reverse, the "tail" of the path buffer is actually at index 0 because we prepend!
-					if pct, ok := p.path.elems[0].(*punct); ok && pct.s == symEmptyPrefix {
-						res = nil
-					}
-				} else {
-					if pct, ok := p.path.elems[p.path.len()-1].(*punct); ok && pct.s == symEmptySuffix {
-						res = nil
-					}
+				if pct, ok := p.path.elems[p.path.len()-1].(*punct); ok && pct.s == symEmptySuffix {
+					res = nil
 				}
 			}
 		}
 	}
 
 	if res != nil {
-		if reverse {
-			p.path.prepend(res)
-		} else {
-			p.path.append(res)
-		}
+		p.path.append(res)
 	}
 }
 
-func (p *vmpack) reduceList(pos Pos, reverse bool) {
-	p.reducePath(pos, reverse)
+func (p *vmpack) reduceList(pos Pos) {
+	p.reducePath(pos)
 
 	var res Value
 	if p.path.len() == 1 {
@@ -10083,17 +10134,13 @@ func (p *vmpack) reduceList(pos Pos, reverse bool) {
 	}
 
 	if res != nil {
-		if reverse {
-			p.list.prepend(res)
-		} else {
-			p.list.append(res)
-		}
+		p.list.append(res)
 	}
 }
 
 // reduce finalizes the current state (called on EOF or closing punctuation)
-func (p *vmpack) reduce(pos Pos, reverse bool) Value {
-	p.reduceList(pos, reverse) // Cascade all the way up
+func (p *vmpack) reduce(pos Pos) Value {
+	p.reduceList(pos) // Cascade all the way up
 
 	var res Value
 	if p.list.len() == 1 {
@@ -10109,27 +10156,13 @@ func (p *vmpack) reduce(pos Pos, reverse bool) Value {
 	return res
 }
 
-// reduce finalizes the packer stack at EOF
-func (s *symstr) reduce(pos Pos, reverse bool) Value {
-	if s.vmpack == nil { return nil }
-
-	// Flush any open flag or bracket states up to the root
-	for s.vmpack != nil && s.vmpack.parent != nil {
-		inner := s.vmpack.reduce(pos, reverse)
-		s.vmpack = s.vmpack.parent
-		s.vmpack.shift(inner, reverse)
-	}
-
-	return s.vmpack.reduce(pos, reverse)
-}
-
-// pack evaluates a single posym and shapes it into the AST state machine.
-func (s *symstr) pack(ps posym, reverse bool) {
+// pack evaluates a single posym and shapes it into the AST state machine (Forward).
+func (s *symstr) pack(ps posym) {
 	popFlags := func() {
 		for s.vmpack != nil && s.vmpack.parent != nil && s.vmpack.closer == 0 && s.vmpack.flag != 0 {
-			inner := s.vmpack.reduce(ps.Pos, reverse)
+			inner := s.vmpack.reduce(ps.Pos)
 			s.vmpack = s.vmpack.parent
-			s.vmpack.shift(inner, reverse)
+			s.vmpack.shift(inner)
 		}
 	}
 
@@ -10142,7 +10175,7 @@ func (s *symstr) pack(ps posym, reverse bool) {
 		return
 
 	case symDot:
-		s.vmpack.reduceQual(ps.Pos, reverse)
+		s.vmpack.reduceQual(ps.Pos)
 		return
 
 	case symSlash:
@@ -10150,51 +10183,29 @@ func (s *symstr) pack(ps posym, reverse bool) {
 
 		isLeading := s.vmpack.comp.len() == 0 && s.vmpack.qual.len() == 0 && s.vmpack.path.len() == 0
 
-		if reverse {
-			if isLeading {
-				// The first slash encountered in reverse with empty buffers is PTAIL!
-				s.vmpack.path.prepend(_punct(ps.Pos, symEmptySuffix))
-			} else {
-				s.vmpack.reducePath(ps.Pos, reverse)
-
-				// THE DOD FIX: If this is the LAST slash in the reversed string, it's PROOT!
-				// Without boundary math, we know it's the root if the evaluation tape is exhausted.
-				if len(s.ops) == 0 && len(s.syms) == 0 {
-					s.vmpack.path.prepend(_punct(ps.Pos, symEmptyPrefix))
-				}
-			}
+		if isLeading {
+			s.vmpack.path.append(_punct(ps.Pos, symEmptyPrefix))
 		} else {
-			if isLeading {
-				s.vmpack.path.append(_punct(ps.Pos, symEmptyPrefix))
-			} else {
-				s.vmpack.reducePath(ps.Pos, reverse)
-			}
+			s.vmpack.reducePath(ps.Pos)
 		}
 		return
 
 	case symEmpty:
-		if reverse {
-			if s.vmpack.path.len() > 0 && s.vmpack.comp.len() == 0 && s.vmpack.qual.len() == 0 {
-				s.vmpack.path.prepend(_punct(ps.Pos, symEmptyPrefix))
-				return
-			}
-		} else {
-			if s.vmpack.path.len() > 0 && s.vmpack.comp.len() == 0 && s.vmpack.qual.len() == 0 {
-				s.vmpack.path.append(_punct(ps.Pos, symEmptySuffix))
-				return
-			}
+		if s.vmpack.path.len() > 0 && s.vmpack.comp.len() == 0 && s.vmpack.qual.len() == 0 {
+			s.vmpack.path.append(_punct(ps.Pos, symEmptySuffix))
+			return
 		}
-		s.vmpack.shift(_word(ps.Pos, ps.Symbol), reverse)
+		s.vmpack.shift(_word(ps.Pos, ps.Symbol))
 		return
 
 	case symSpace:
 		popFlags()
-		s.vmpack.reduceList(ps.Pos, reverse)
+		s.vmpack.reduceList(ps.Pos)
 		return
 
 	case symEqualSign:
 		popFlags()
-		s.vmpack.reducePath(ps.Pos, reverse)
+		s.vmpack.reducePath(ps.Pos)
 
 		var key Value
 		if s.vmpack.path.len() == 1 {
@@ -10214,7 +10225,7 @@ func (s *symstr) pack(ps posym, reverse bool) {
 
 	case symArrow:
 		popFlags()
-		s.vmpack.reduceQual(ps.Pos, reverse)
+		s.vmpack.reduceQual(ps.Pos)
 
 		var obj Value
 		if s.vmpack.qual.len() == 1 {
@@ -10241,9 +10252,9 @@ func (s *symstr) pack(ps posym, reverse bool) {
 		if isClosing {
 			popFlags()
 			if s.vmpack.closer == symQuotation {
-				inner := s.vmpack.reduce(ps.Pos, reverse)
+				inner := s.vmpack.reduce(ps.Pos)
 				s.vmpack = s.vmpack.parent
-				s.vmpack.shift(&strcomp{elements{[]Value{inner}}}, reverse)
+				s.vmpack.shift(&strcomp{elements{[]Value{inner}}})
 			}
 		} else {
 			s.vmpack = &vmpack{parent: s.vmpack, closer: symQuotation}
@@ -10269,10 +10280,10 @@ func (s *symstr) pack(ps posym, reverse bool) {
 	case symRparen, symRbrace, symRbrack, symCornerTR, symCornerBR:
 		popFlags()
 		if s.vmpack.closer == ps.Symbol {
-			inner := s.vmpack.reduce(ps.Pos, reverse)
+			inner := s.vmpack.reduce(ps.Pos)
 			s.vmpack = s.vmpack.parent
 			if s.vmpack != nil {
-				s.vmpack.shift(inner, reverse)
+				s.vmpack.shift(inner)
 			} else {
 				s.operands = append(s.operands, inner)
 			}
@@ -10283,26 +10294,331 @@ func (s *symstr) pack(ps posym, reverse bool) {
 	// 2. Raw Symbol Shifting
 	switch ps.Kind() {
 	case SymRaw, SymInl, SymEph, SymSeq:
-		s.vmpack.shift(_word(ps.Pos, ps.Symbol), reverse)
+		s.vmpack.shift(_word(ps.Pos, ps.Symbol))
 	case SymInt:
 		vocab.nummut.RLock()
 		i := int64(vocab.numbers[ps.Idx()])
 		vocab.nummut.RUnlock()
-		s.vmpack.shift(_decimal(ps.Pos, i, ps.Symbol), reverse)
+		s.vmpack.shift(_decimal(ps.Pos, i, ps.Symbol))
 	case SymFlt:
 		vocab.nummut.RLock()
 		f := math.Float64frombits(vocab.numbers[ps.Idx()])
 		vocab.nummut.RUnlock()
-		s.vmpack.shift(_float(ps.Pos, f, ps.Symbol), reverse)
+		s.vmpack.shift(_float(ps.Pos, f, ps.Symbol))
 	case SymPct:
 		switch ps.Symbol {
 		case symQues, symAsterisk, symAsteriskAst, symAsteriskQues:
-			s.vmpack.shift(_globmeta(ps.Pos, ps.Symbol), reverse)
+			s.vmpack.shift(_globmeta(ps.Pos, ps.Symbol))
 		default:
 			// STRUCTURAL ISOLATION: Unhandled punctuation symbols (<, >, +, ,, etc.)
 			// must be shifted distinctly as *punct nodes, preventing the packer from
 			// collapsing them into adjacent *word constituents within compounds.
-			s.vmpack.shift(&punct{valbase{ps.Pos}, ps.Symbol}, reverse)
+			s.vmpack.shift(&punct{valbase{ps.Pos}, ps.Symbol})
+		}
+	}
+}
+
+func (p *vmpack) shiftRev(val Value) {
+	p.comp.prepend(val)
+}
+
+func (p *vmpack) reduceQualRev(pos Pos) {
+	var v Value
+
+	if p.comp.len() > 0 {
+		if p.comp.len() == 1 {
+			v = p.comp.elems[0]
+		} else {
+			v = &compound{p.comp.copy()}
+		}
+		p.comp.clear()
+	}
+
+	if v == nil {
+		p.qual.prepend(valbase{pos})
+	} else {
+		p.qual.prepend(v)
+	}
+}
+
+func (p *vmpack) reducePathRev(pos Pos) {
+	p.reduceQualRev(pos)
+
+	var res Value
+	if p.qual.len() == 1 {
+		res = p.qual.elems[0]
+	} else if p.qual.len() > 1 {
+		res = &qualword{p.qual.copy()}
+	}
+
+	p.qual.clear()
+
+	// Arrow Wrapping
+	if p.arrowObj != nil {
+		if res == nil { res = valbase{pos} }
+		res = &arrow{valbase: valbase{pos}, o: p.arrowObj, s: res}
+		p.arrowObj = nil
+	}
+
+	// Flag Wrapping
+	if p.flag != 0 {
+		if res == nil { res = valbase{p.flag} }
+		res = flag{res}
+		p.flag = 0
+	}
+
+	// Native Prepending PTAIL Validation
+	if res != nil {
+		if _, isEmpty := res.(valbase); isEmpty {
+			if p.path.len() > 0 {
+				// In reverse, the "tail" of the path buffer is actually at index 0 because we prepend!
+				if pct, ok := p.path.elems[0].(*punct); ok && pct.s == symEmptyPrefix {
+					res = nil
+				}
+			}
+		}
+	}
+
+	if res != nil {
+		p.path.prepend(res)
+	}
+}
+
+func (p *vmpack) reduceListRev(pos Pos) {
+	p.reducePathRev(pos)
+
+	var res Value
+	if p.path.len() == 1 {
+		res = p.path.elems[0]
+	} else if p.path.len() > 1 {
+		res = &path{p.path.copy()}
+	}
+
+	p.path.clear()
+
+	// Pair Wrapping
+	if p.pairKey != nil {
+		if res == nil { res = valbase{pos} }
+		res = &pair{key: p.pairKey, val: res}
+		p.pairKey = nil
+	}
+
+	if res != nil {
+		p.list.prepend(res)
+	}
+}
+
+// reduceRev finalizes the current state in reverse mode
+func (p *vmpack) reduceRev(pos Pos) Value {
+	p.reduceListRev(pos) // Cascade all the way up
+
+	var res Value
+	if p.list.len() == 1 {
+		res = p.list.elems[0]
+	} else if p.list.len() > 1 {
+		res = &list{p.list.copy()}
+	} else if pos != NoPos {
+		res = valbase{pos}
+	}
+
+	p.list.clear()
+
+	return res
+}
+
+// reduce finalizes the packer stack at EOF
+func (s *symstr) reduce(pos Pos) Value {
+	if s.vmpack == nil { return nil }
+
+	// Flush any open flag or bracket states up to the root
+	for s.vmpack != nil && s.vmpack.parent != nil {
+		inner := s.vmpack.reduce(pos)
+		s.vmpack = s.vmpack.parent
+		s.vmpack.shift(inner)
+	}
+
+	return s.vmpack.reduce(pos)
+}
+
+// reduceRev finalizes the packer stack at EOF in reverse
+func (s *symstr) reduceRev(pos Pos) Value {
+	if s.vmpack == nil { return nil }
+
+	// Flush any open flag or bracket states up to the root
+	for s.vmpack != nil && s.vmpack.parent != nil {
+		inner := s.vmpack.reduceRev(pos)
+		s.vmpack = s.vmpack.parent
+		s.vmpack.shiftRev(inner)
+	}
+
+	return s.vmpack.reduceRev(pos)
+}
+
+// packRev evaluates a single posym and shapes it into the AST state machine (Reverse).
+func (s *symstr) packRev(ps posym) {
+	popFlags := func() {
+		for s.vmpack != nil && s.vmpack.parent != nil && s.vmpack.closer == 0 && s.vmpack.flag != 0 {
+			inner := s.vmpack.reduceRev(ps.Pos)
+			s.vmpack = s.vmpack.parent
+			s.vmpack.shiftRev(inner)
+		}
+	}
+
+	switch ps.Symbol {
+	case symDash:
+		if ps.Pos == NoPos {
+			if true { warn(pc(s, ps.Pos), "NoPos `flag` forced @%d (synthesized node)", ps.Pos, callstack{num:5}) }
+		}
+		s.vmpack = &vmpack{parent: s.vmpack, flag: ps.Pos}
+		return
+
+	case symDot:
+		s.vmpack.reduceQualRev(ps.Pos)
+		return
+
+	case symSlash:
+		popFlags()
+
+		isLeading := s.vmpack.comp.len() == 0 && s.vmpack.qual.len() == 0 && s.vmpack.path.len() == 0
+
+		if isLeading {
+			// The first slash encountered in reverse with empty buffers is PTAIL!
+			s.vmpack.path.prepend(_punct(ps.Pos, symEmptySuffix))
+		} else {
+			s.vmpack.reducePathRev(ps.Pos)
+
+			// THE DOD FIX: If this is the LAST slash in the reversed string, it's PROOT!
+			// Without boundary math, we know it's the root if the evaluation tape is exhausted.
+			if len(s.ops) == 0 && len(s.syms) == 0 {
+				s.vmpack.path.prepend(_punct(ps.Pos, symEmptyPrefix))
+			}
+		}
+		return
+
+	case symEmpty:
+		if s.vmpack.path.len() > 0 && s.vmpack.comp.len() == 0 && s.vmpack.qual.len() == 0 {
+			s.vmpack.path.prepend(_punct(ps.Pos, symEmptyPrefix))
+			return
+		}
+		s.vmpack.shiftRev(_word(ps.Pos, ps.Symbol))
+		return
+
+	case symSpace:
+		popFlags()
+		s.vmpack.reduceListRev(ps.Pos)
+		return
+
+	case symEqualSign:
+		popFlags()
+		s.vmpack.reducePathRev(ps.Pos)
+
+		var key Value
+		if s.vmpack.path.len() == 1 {
+			key = s.vmpack.path.elems[0]
+		} else if s.vmpack.path.len() > 1 {
+			key = &path{s.vmpack.path.copy()}
+		} else {
+			key = valbase{ps.Pos}
+		}
+		s.vmpack.path.clear()
+
+		if s.vmpack.pairKey != nil {
+			key = &pair{key: s.vmpack.pairKey, val: key}
+		}
+		s.vmpack.pairKey = key
+		return
+
+	case symArrow:
+		popFlags()
+		s.vmpack.reduceQualRev(ps.Pos)
+
+		var obj Value
+		if s.vmpack.qual.len() == 1 {
+			obj = s.vmpack.qual.elems[0]
+		} else if s.vmpack.qual.len() > 1 {
+			obj = &qualword{s.vmpack.qual.copy()}
+		} else {
+			obj = valbase{ps.Pos}
+		}
+		s.vmpack.qual.clear()
+
+		if s.vmpack.arrowObj != nil {
+			obj = &arrow{valbase: valbase{ps.Pos}, o: s.vmpack.arrowObj, s: obj}
+		}
+		s.vmpack.arrowObj = obj
+		return
+
+	case symQuotation:
+		isClosing := false
+		for p := s.vmpack; p != nil; p = p.parent {
+			if p.closer == symQuotation { isClosing = true; break }
+		}
+
+		if isClosing {
+			popFlags()
+			if s.vmpack.closer == symQuotation {
+				inner := s.vmpack.reduceRev(ps.Pos)
+				s.vmpack = s.vmpack.parent
+				s.vmpack.shiftRev(&strcomp{elements{[]Value{inner}}})
+			}
+		} else {
+			s.vmpack = &vmpack{parent: s.vmpack, closer: symQuotation}
+		}
+		return
+
+	case symLparen:
+		s.vmpack = &vmpack{parent: s.vmpack, closer: symRparen}
+		return
+	case symLbrace:
+		s.vmpack = &vmpack{parent: s.vmpack, closer: symRbrace}
+		return
+	case symLbrack:
+		s.vmpack = &vmpack{parent: s.vmpack, closer: symRbrack}
+		return
+	case symCornerTL:
+		s.vmpack = &vmpack{parent: s.vmpack, closer: symCornerBR}
+		return
+	case symCornerBL:
+		s.vmpack = &vmpack{parent: s.vmpack, closer: symCornerTR}
+		return
+
+	case symRparen, symRbrace, symRbrack, symCornerTR, symCornerBR:
+		popFlags()
+		if s.vmpack.closer == ps.Symbol {
+			inner := s.vmpack.reduceRev(ps.Pos)
+			s.vmpack = s.vmpack.parent
+			if s.vmpack != nil {
+				s.vmpack.shiftRev(inner)
+			} else {
+				s.operands = append(s.operands, inner)
+			}
+		}
+		return
+	}
+
+	// 2. Raw Symbol Shifting
+	switch ps.Kind() {
+	case SymRaw, SymInl, SymEph, SymSeq:
+		s.vmpack.shiftRev(_word(ps.Pos, ps.Symbol))
+	case SymInt:
+		vocab.nummut.RLock()
+		i := int64(vocab.numbers[ps.Idx()])
+		vocab.nummut.RUnlock()
+		s.vmpack.shiftRev(_decimal(ps.Pos, i, ps.Symbol))
+	case SymFlt:
+		vocab.nummut.RLock()
+		f := math.Float64frombits(vocab.numbers[ps.Idx()])
+		vocab.nummut.RUnlock()
+		s.vmpack.shiftRev(_float(ps.Pos, f, ps.Symbol))
+	case SymPct:
+		switch ps.Symbol {
+		case symQues, symAsterisk, symAsteriskAst, symAsteriskQues:
+			s.vmpack.shiftRev(_globmeta(ps.Pos, ps.Symbol))
+		default:
+			// STRUCTURAL ISOLATION: Unhandled punctuation symbols (<, >, +, ,, etc.)
+			// must be shifted distinctly as *punct nodes, preventing the packer from
+			// collapsing them into adjacent *word constituents within compounds.
+			s.vmpack.shiftRev(&punct{valbase{ps.Pos}, ps.Symbol})
 		}
 	}
 }
@@ -10534,48 +10850,63 @@ func (s *symstr) builtin(t *builtin, o, a []Value) Value {
 type named_stem struct{ Value; name Symbol }
 func (p *named_stem) String() string { return p.Value.String() }
 
-func (s *symstr) match(val Value) (matched bool, res, rem Value, stems []Value) {
-	// Safely extract the original pattern for diagnostic warnings
-	var pat Value
-	if len(s.operands) > 0 { pat, _ = s.operands[len(s.operands)-1].(Value) }
-
+func (s *symstr) match(pat, val Value) (matched bool, res, rem Value, stems []Value) {
 	trail := truly(s.Context, propReversal)
 
-	var op evalop
-	if trail { op = opUnrollRev } else { op = opUnroll }
+	// LAYER 0: Bootstrap the Matcher (Unrolls the Pattern AST)
+	var matchOp evalop
+	if trail { matchOp = opUnrollMatchRev } else { matchOp = opUnrollMatch }
+	s.ops = append(s.ops, opEnd, matchOp) // CRITICAL: Bootstrap with opEnd to guarantee io.EOF
+	s.operands = append(s.operands, pat)
 
 	// LAYER 1: The Generator (Unrolls the Target AST)
+	var genOp evalop
+	if trail { genOp = opUnrollRev } else { genOp = opUnroll }
+
 	gen := &symstr{Context: s.Context}
-	gen.ops = append(gen.ops, opEnd, op)
+	gen.ops = append(gen.ops, opEnd, genOp)
 	gen.operands = append(gen.operands, val)
 
 	// LAYER 2: Configure this symstr instance as the Matcher
 	s.tie = gen
 
-	// Execute the Matcher! (It packs its own 'res' AST internally via opPack)
+	// Execute the Matcher! (It packs its own 'res' AST internally via opPack/opPackRev)
 	for len(s.ops) > 0 && s.err == nil { s.step() }
 
 	matched = s.err == io.EOF && s.exhausted()
 
 	// 1. Extract `res` directly from the Matcher's internal packer
 	if s.vmpack != nil {
-		res = s.reduce(NoPos, trail)
+		if trail {
+			res = s.reduceRev(NoPos)
+		} else {
+			res = s.reduce(NoPos)
+		}
 	}
 
 	// 2. Extract `rem` by natively flushing whatever is left in the Generator!
 	var remPopped bool
 	gen.vmpack = &vmpack{}
 
+	var pack func(posym)
+	if trail { pack = gen.packRev } else { pack = gen.pack }
+
 	// ALWAYS drain leftover symbols so gen.pack() can dynamically reshape the AST
 	for gen.ensured_syms() {
 		for _, ps := range gen.syms {
-			gen.pack(ps, trail) // Pass directional flag to pack!
+			pack(ps)
 			remPopped = true
 		}
 		gen.syms = nil
 	}
 
-	if remPopped { rem = gen.reduce(NoPos, trail) } // Pass directional flag to reduce!
+	if remPopped {
+		if trail {
+			rem = gen.reduceRev(NoPos)
+		} else {
+			rem = gen.reduce(NoPos)
+		}
+	}
 
 	// Stream Termination Symmetry Checks
 	if force_full_match_anchor { matched = matched && gen.exhausted() }
@@ -10593,11 +10924,20 @@ func (s *symstr) match(val Value) (matched bool, res, rem Value, stems []Value) 
 
 				for _, ps := range capture.syms {
 					// Perfectly feed the captured posym structs back into the AST packer
-					gen.pack(ps, trail)
+					if trail {
+						gen.packRev(ps)
+					} else {
+						gen.pack(ps)
+					}
 				}
 
 				// ALWAYS call reduce to capture fractional/reshaped regex substrings!
-				stem = gen.reduce(NoPos, trail)
+				if trail {
+					stem = gen.reduceRev(NoPos)
+				} else {
+					stem = gen.reduce(NoPos)
+				}
+
 				if capture.name.Symbol != symEmpty && stem != nil {
 					stem = &named_stem{stem, capture.name.Symbol}
 				}
@@ -10644,10 +10984,7 @@ func match(ctx Context, pat, val Value) (matched bool, res, rem Value, stems []V
 	}
 
 	matcher := &symstr{Context: ctx}
-	matcher.ops = append(matcher.ops, opEnd, opUnrollMatch) // CRITICAL: Bootstrap with opEnd to guarantee io.EOF
-	matcher.operands = append(matcher.operands, pat)
-
-	return matcher.match(val)
+	return matcher.match(pat, val)
 }
 
 // eval fully leverages the Virtual Machine's single-stream Generator Mode
@@ -18279,8 +18616,6 @@ func (p *compiler) calling() (result Value) {
 func (c *compiler) expr() (x Value) {
 	if l_traverse.enabled { defer un(l_trace(l_traverse, "expr")) }
 
-	reverse := truly(c.Context, propReversal)
-
 	// 1. Atomic Transaction Start
 	bt := c.checkpoint(undoOwn | undoCtx | undoStack | undoHead | undoPack)
 
@@ -18296,15 +18631,31 @@ func (c *compiler) expr() (x Value) {
 	}
 
 	startOps := len(c.ops)
+	reverse := truly(c.Context, propReversal)
+
+	// Dynamically bind the unswitched packer pipelines via closures so
+	// they always evaluate against the *current* c.vmpack pointer.
+	var shift func(Value)
+	var reduce func(Pos) Value
+	var packOp evalop
+	if reverse {
+		packOp = opPackRev
+		shift = func(v Value) { c.vmpack.shiftRev(v) }
+		reduce = func(pos Pos) Value { return c.vmpack.reduceRev(pos) }
+	} else {
+		packOp = opPack
+		shift = func(v Value) { c.vmpack.shift(v) }
+		reduce = func(pos Pos) Value { return c.vmpack.reduce(pos) }
+	}
 
 	// Safe PDA Lookbehind Helpers
 	peekLHS := func() Value {
 		if c.vmpack == nil { return nil }
-		return c.vmpack.reduce(c.pos, reverse)
+		return reduce(c.pos)
 	}
 	restoreLHS := func(v Value) {
 		c.vmpack = &vmpack{}
-		if v != nil && !isEmpty(v) { c.shift(v, reverse) }
+		if v != nil && !isEmpty(v) { shift(v) }
 	}
 
 	isUrlCtx := truly(c.Context, is_url_parser{})
@@ -18456,14 +18807,11 @@ expr_loop:
 
 	push_val:
 		// 3. Drive the State Machine
-		retOp := opPack
-		if reverse { retOp = opPackRev }
-
 		if val != nil {
-			c.ops = append(c.ops, retOp)
+			c.ops = append(c.ops, packOp)
 			c.operands = append(c.operands, val)
 		} else if sym != 0 {
-			c.ops = append(c.ops, retOp)
+			c.ops = append(c.ops, packOp)
 			c.operands = append(c.operands, posym{pos, sym})
 		}
 
@@ -18474,13 +18822,13 @@ expr_loop:
 
 	// 4. Finalize the AST and Commit Transaction
 	for c.vmpack != nil && c.vmpack.parent != nil {
-		inner := c.vmpack.reduce(c.pos, reverse)
+		inner := reduce(c.pos)
 		c.vmpack = c.vmpack.parent
-		c.vmpack.shift(inner, reverse)
+		shift(inner)
 	}
 
 	if c.vmpack != nil {
-		x = c.vmpack.reduce(c.pos, reverse)
+		x = reduce(c.pos)
 	}
 
 	if x == nil { x = _null(c.pos) }
