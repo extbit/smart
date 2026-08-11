@@ -3659,7 +3659,7 @@ func (s *symstr) opFallbackGlobSeg(l int) {
 	if s.tie.err != nil { return } // Safe to return, fg is already popped
 
 	// Symmetry: Ensure string literal matches from primary tape
-	if s.ensured_syms() { // 2. Safe to call step() internally now!
+	if s.ensure_match_syms(opMatchLiteral) { // 2. Safe to call step() internally now!
 		s.shatter_syms(g.lookahead.Symbol, true) // NEW: Shatter last index
 
 		if s.is_wildcard(s.syms[0], opFallbackGlobSeg) { return }
@@ -3780,7 +3780,7 @@ func (s *symstr) opFallbackGlobSegRev(l int) {
 
 	if s.tie.err != nil { return }
 
-	if s.ensured_syms() {
+	if s.ensure_match_syms(opMatchLiteralRev) {
 		s.shatter_syms(g.lookahead.Symbol, false) // NEW: Shatter first index
 
 		if s.is_wildcard(s.syms[len(s.syms)-1], opFallbackGlobSegRev) { return }
@@ -4106,7 +4106,7 @@ func (s *symstr) opFallbackGlobCross(l int) {
 
 	if s.tie.err != nil { return }
 
-	if s.ensured_syms() {
+	if s.ensure_match_syms(opMatchLiteral) {
 		s.shatter_syms(g.lookahead.Symbol, false) // NEW: Shatter first index
 
 		if s.is_wildcard(s.syms[0], opConseqAstCross) { return }
@@ -4203,7 +4203,7 @@ func (s *symstr) opFallbackGlobCrossRev(l int) {
 
 	if s.tie.err != nil { return }
 
-	if s.ensured_syms() {
+	if s.ensure_match_syms(opMatchLiteralRev) {
 		s.shatter_syms(g.lookahead.Symbol, true) // NEW: Shatter last index
 
 		if s.is_wildcard(s.syms[len(s.syms)-1], opConseqAstCrossRev) { return }
