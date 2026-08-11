@@ -10760,14 +10760,35 @@ func (s *symstr) ensure_match_syms(matchOp evalop) bool {
 	if s.err != nil { return false }
 
 	for len(s.ops) > 0 && s.err == nil && len(s.syms) == 0 {
-		op := s.ops[len(s.ops)-1]
-		if op == matchOp {
+		var sym Symbol
+
+		switch s.ops[len(s.ops)-1] {
+		case matchOp:
 			lit := s.operands[len(s.operands)-1].(match_lit)
 			s.ops = s.ops[:len(s.ops)-1]
 			s.operands = s.operands[:len(s.operands)-1]
 			s.syms = append(s.syms, lit.posym)
 			return true
+
+		case opGlobQues, opGlobQuesRev: sym = symQues
+		case opGlobAsterisk, opGlobAsteriskRev: sym = symAsterisk
+		case opGlobAstGreed, opGlobAstGreedRev: sym = symAsteriskAst
+		case opGlobAstCross, opGlobAstCrossRev: sym = symAsteriskQues
 		}
+
+		if sym != 0 {
+			var pos Pos // NoPos
+			switch v := s.operands[len(s.operands)-1].(type) {
+			case Value:	pos = v.Pos()
+			case posym: pos = v.Pos
+			case Pos: pos = v
+			}
+			s.ops = s.ops[:len(s.ops)-1]
+			s.operands = s.operands[:len(s.operands)-1]
+			s.syms = append(s.syms, posym{pos, sym})
+			return true
+		}
+
 		s.step()
 	}
 	return len(s.syms) > 0
