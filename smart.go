@@ -3894,19 +3894,19 @@ func (s *symstr) opFallbackGlobGreed(l int) {
 
 	// Symmetry: Pull lookahead from tie tape
 	if g.lookahead.Symbol == symEmpty && s.tie.err != io.EOF {
-		g.lookahead = s.tie.next_lit_no_match() // NOTE: s.tie works via opUnroll (no match)
+		g.lookahead = s.tie.next_lit_no_match()
 	}
 
-	if s.tie.err != nil { return }
+	if s.tie.err != nil { return } // Safe to return, fg is already popped
 
 	// Symmetry: Ensure string literal matches from primary tape
-	if s.ensured_syms() {
+	if s.ensure_match_syms(opMatchLiteral) { // 2. Safe interceptor bypasses trapped literals!
 		if s.is_wildcard(s.syms[0], opFallbackGlobGreed) { return }
 
 		if g.lookahead.Symbol == symEmpty {
 			g.stem = append(g.stem, s.syms...)
 			s.ops = append(s.ops, opFallbackGlobGreed)
-			s.operands = append(s.operands, g) // Re-push
+			s.operands = append(s.operands, g) // 3. Re-push state for the next loop!
 			s.syms = nil
 			return
 		}
@@ -3917,11 +3917,13 @@ func (s *symstr) opFallbackGlobGreed(l int) {
 		if g.idx = __posymSeqLastIndex(s.syms, totalBytes-1, g.lookahead.Symbol); g.idx == -1 {
 			g.stem = append(g.stem, s.syms...)
 			s.ops = append(s.ops, opFallbackGlobGreed)
-			s.operands = append(s.operands, g) // Re-push
+			s.operands = append(s.operands, g) // Re-push state for the next loop!
 			s.syms = nil
 		} else {
 			s.ops = append(s.ops, opTryGlobGreed)
-			s.operands = append(s.operands, g) // Re-push strictly for checkpoint
+
+			// Re-push state strictly for the checkpoint snapshot!
+			s.operands = append(s.operands, g)
 			g.bt = s.checkpoint(undoBranch)
 
 			// CRITICAL: Pop from active path to prevent downstream panics!
@@ -3994,9 +3996,9 @@ func (s *symstr) opFallbackGlobGreedRev(l int) {
 		g.lookahead = s.tie.next_lit_no_match()
 	}
 
-	if s.tie.err != nil { return }
+	if s.tie.err != nil { return } // Safe to return, fg is already popped
 
-	if s.ensured_syms() {
+	if s.ensure_match_syms(opMatchLiteralRev) { // 2. Safe interceptor bypasses trapped literals!
 		if s.is_wildcard(s.syms[len(s.syms)-1], opConseqAstGreedRev) { return }
 
 		if g.lookahead.Symbol == symEmpty {
@@ -4017,7 +4019,9 @@ func (s *symstr) opFallbackGlobGreedRev(l int) {
 			s.syms = nil
 		} else {
 			s.ops = append(s.ops, opTryGlobGreedRev)
-			s.operands = append(s.operands, g) // Re-push for checkpoint
+
+			// Re-push state strictly for the checkpoint snapshot!
+			s.operands = append(s.operands, g)
 			g.bt = s.checkpoint(undoBranch)
 
 			s.ops = s.ops[:len(s.ops)-1]
@@ -9940,6 +9944,27 @@ func (s *symstr) ensured_syms() bool {
 	// Safely assert tape exhaustion without masking real VM errors!
 	if s.err == nil { s.err = io.EOF }
 	return false
+}
+
+// ensure_match_syms securely extracts raw symbols from the target tape during
+// active NFA glob fallbacks, intercepting and downgrading any trapped
+// opMatchLiteral instructions to prevent premature match failures.
+func (s *symstr) ensure_match_syms(matchOp evalop) bool {
+	if len(s.syms) > 0 { return true }
+	if s.err != nil { return false }
+
+	for len(s.ops) > 0 && s.err == nil && len(s.syms) == 0 {
+		op := s.ops[len(s.ops)-1]
+		if op == matchOp {
+			lit := s.operands[len(s.operands)-1].(match_lit)
+			s.ops = s.ops[:len(s.ops)-1]
+			s.operands = s.operands[:len(s.operands)-1]
+			s.syms = append(s.syms, lit.posym)
+			return true
+		}
+		s.step()
+	}
+	return len(s.syms) > 0
 }
 
 // pump delegates to step in a controlled evaluation loop.
