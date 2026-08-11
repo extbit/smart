@@ -11737,16 +11737,17 @@ func (s *symstr) builtin(t *builtin, o, a []Value) Value {
 type named_stem struct{ Value; name Symbol }
 func (p *named_stem) String() string { return p.Value.String() }
 
+// match matches pattern against target value.
 func (s *symstr) match(pattern, target Value) (matched bool, res, rem Value, stems []Value) {
 	trail := truly(s.Context, propReversal)
 
-	// LAYER 0: Bootstrap the Matcher (Unrolls the Pattern AST)
+	// LAYER 0: Bootstrap the Matcher (Unrolls the PATTERN AST into execution instructions)
 	var matchOp evalop
 	if trail { matchOp = opUnrollMatchRev } else { matchOp = opUnrollMatch }
 	s.ops = append(s.ops, opEnd, matchOp) // CRITICAL: Bootstrap with opEnd to guarantee io.EOF
 	s.operands = append(s.operands, pattern)
 
-	// LAYER 1: The Generator (Unrolls the Target AST)
+	// LAYER 1: The Generator (Unrolls the TARGET AST onto the passive tie tape)
 	var genOp evalop
 	if trail { genOp = opUnrollRev } else { genOp = opUnroll }
 
@@ -11757,7 +11758,7 @@ func (s *symstr) match(pattern, target Value) (matched bool, res, rem Value, ste
 	// LAYER 2: Configure this symstr instance as the Matcher
 	s.tie = gen
 
-	// Execute the Matcher! (It packs its own 'res' AST internally via opPack/opPackRev)
+	// Execute the Matcher!
 	for len(s.ops) > 0 && s.err == nil { s.step() }
 
 	matched = s.err == io.EOF && s.exhausted()
@@ -11771,14 +11772,19 @@ func (s *symstr) match(pattern, target Value) (matched bool, res, rem Value, ste
 		}
 	}
 
-	// 2. Extract `rem` by natively flushing whatever is left in the Generator!
+	// 2. Extract `rem` by natively flushing whatever is left on the Generator tape!
 	var remPopped bool
 	gen.vmpack = &vmpack{}
 
 	var pack func(posym)
-	if trail { pack = gen.packRev } else { pack = gen.pack }
+	var reduce func(Pos) Value
+	if trail {
+		pack, reduce = gen.packRev, gen.reduceRev
+	} else {
+		pack, reduce = gen.pack, gen.reduce
+	}
 
-	// ALWAYS drain leftover symbols so gen.pack() can dynamically reshape the AST
+	// ALWAYS drain leftover target symbols so gen.pack() can dynamically reshape the AST
 	for gen.ensured_syms() {
 		for _, ps := range gen.syms {
 			pack(ps)
@@ -11787,13 +11793,7 @@ func (s *symstr) match(pattern, target Value) (matched bool, res, rem Value, ste
 		gen.syms = nil
 	}
 
-	if remPopped {
-		if trail {
-			rem = gen.reduceRev(NoPos)
-		} else {
-			rem = gen.reduce(NoPos)
-		}
-	}
+	if remPopped { rem = reduce(NoPos) }
 
 	// Stream Termination Symmetry Checks
 	if force_full_match_anchor { matched = matched && gen.exhausted() }
@@ -11810,19 +11810,11 @@ func (s *symstr) match(pattern, target Value) (matched bool, res, rem Value, ste
 
 				for _, ps := range capture.syms {
 					// Perfectly feed the captured posym structs back into the AST packer
-					if trail {
-						gen.packRev(ps)
-					} else {
-						gen.pack(ps)
-					}
+					pack(ps)
 				}
 
 				// ALWAYS call reduce to capture fractional/reshaped regex substrings!
-				if trail {
-					stem = gen.reduceRev(NoPos)
-				} else {
-					stem = gen.reduce(NoPos)
-				}
+				stem = reduce(NoPos)
 
 				if capture.name.Symbol != symEmpty && stem != nil {
 					stem = &named_stem{stem, capture.name.Symbol}
@@ -11858,7 +11850,7 @@ func (s *symstr) match(pattern, target Value) (matched bool, res, rem Value, ste
 	return
 }
 
-// match matches pattern `pat` against value `val`.
+// match matches pattern against target value.
 func match(ctx Context, pattern, target Value) (matched bool, res, rem Value, stems []Value) {
 	if target == nil || pattern == nil { return false, nil, target, nil }
 
