@@ -3660,6 +3660,8 @@ func (s *symstr) opFallbackGlobSeg(l int) {
 
 	// Symmetry: Ensure string literal matches from primary tape
 	if s.ensured_syms() { // 2. Safe to call step() internally now!
+		s.shatter_syms(g.lookahead.Symbol, true) // NEW: Shatter last index
+
 		if s.is_wildcard(s.syms[0], opFallbackGlobSeg) { return }
 
 		var totalBytes int
@@ -3779,6 +3781,8 @@ func (s *symstr) opFallbackGlobSegRev(l int) {
 	if s.tie.err != nil { return }
 
 	if s.ensured_syms() {
+		s.shatter_syms(g.lookahead.Symbol, false) // NEW: Shatter first index
+
 		if s.is_wildcard(s.syms[len(s.syms)-1], opFallbackGlobSegRev) { return }
 
 		var totalBytes int
@@ -3901,6 +3905,8 @@ func (s *symstr) opFallbackGlobGreed(l int) {
 
 	// Symmetry: Ensure string literal matches from primary tape
 	if s.ensure_match_syms(opMatchLiteral) { // 2. Safe interceptor bypasses trapped literals!
+		s.shatter_syms(g.lookahead.Symbol, true) // NEW: Shatter last index
+
 		if s.is_wildcard(s.syms[0], opFallbackGlobGreed) { return }
 
 		if g.lookahead.Symbol == symEmpty {
@@ -3999,6 +4005,8 @@ func (s *symstr) opFallbackGlobGreedRev(l int) {
 	if s.tie.err != nil { return } // Safe to return, fg is already popped
 
 	if s.ensure_match_syms(opMatchLiteralRev) { // 2. Safe interceptor bypasses trapped literals!
+		s.shatter_syms(g.lookahead.Symbol, false) // NEW: Shatter first index
+
 		if s.is_wildcard(s.syms[len(s.syms)-1], opConseqAstGreedRev) { return }
 
 		if g.lookahead.Symbol == symEmpty {
@@ -4099,6 +4107,8 @@ func (s *symstr) opFallbackGlobCross(l int) {
 	if s.tie.err != nil { return }
 
 	if s.ensured_syms() {
+		s.shatter_syms(g.lookahead.Symbol, false) // NEW: Shatter first index
+
 		if s.is_wildcard(s.syms[0], opConseqAstCross) { return }
 
 		if g.lookahead.Symbol == symEmpty {
@@ -4194,6 +4204,8 @@ func (s *symstr) opFallbackGlobCrossRev(l int) {
 	if s.tie.err != nil { return }
 
 	if s.ensured_syms() {
+		s.shatter_syms(g.lookahead.Symbol, true) // NEW: Shatter last index
+
 		if s.is_wildcard(s.syms[len(s.syms)-1], opConseqAstCrossRev) { return }
 
 		if g.lookahead.Symbol == symEmpty {
@@ -9965,6 +9977,42 @@ func (s *symstr) ensure_match_syms(matchOp evalop) bool {
 		s.step()
 	}
 	return len(s.syms) > 0
+}
+
+// shatter_syms dynamically splits the most recently pulled tape symbol if it
+// contains the NFA lookahead natively within its string payload.
+func (s *symstr) shatter_syms(lookahead Symbol, last bool) {
+	if len(s.syms) == 0 || lookahead == symEmpty { return }
+
+	idx := len(s.syms) - 1
+	ps := s.syms[idx]
+
+	if ps.Symbol == lookahead { return }
+
+	var strIdx int
+	if last {
+		strIdx = ps.last_index(lookahead)
+	} else {
+		strIdx = ps.index(lookahead)
+	}
+
+	if strIdx != -1 && ps.len() >= lookahead.len() {
+		str := ps.String()
+		ll := lookahead.len()
+
+		var newSyms []posym
+		if strIdx > 0 {
+			newSyms = append(newSyms, posym{ps.Pos, intern(str[:strIdx])})
+		}
+
+		newSyms = append(newSyms, posym{ps.Pos + Pos(strIdx), lookahead})
+
+		if strIdx+ll < len(str) {
+			newSyms = append(newSyms, posym{ps.Pos + Pos(strIdx+ll), intern(str[strIdx+ll:])})
+		}
+
+		s.syms = append(s.syms[:idx], newSyms...)
+	}
 }
 
 // pump delegates to step in a controlled evaluation loop.
