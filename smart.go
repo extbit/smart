@@ -3245,6 +3245,25 @@ func (s *symstr) nfa_emit_rev(captured []posym, origCount, origLen int) {
 	}
 }
 
+// HELPER 5: Tape Restoration (Right side of split for native tie tape)
+func (s *symstr) nfa_push_unconsumed(rightValid bool, right posym, targetIdx int, stem, origTieSyms []posym) {
+	if rightValid || (targetIdx != -1 && targetIdx+1 < len(stem)) {
+		var unconsumed []posym
+		if rightValid { unconsumed = append(unconsumed, right) }
+		if targetIdx != -1 && targetIdx+1 < len(stem) {
+			unconsumed = append(unconsumed, stem[targetIdx+1:]...)
+		}
+		if len(unconsumed) > 0 {
+			safeQueue := make([]posym, 0, len(unconsumed)+len(origTieSyms))
+			safeQueue = append(safeQueue, unconsumed...)
+			safeQueue = append(safeQueue, origTieSyms...)
+			s.tie.syms = safeQueue
+			return
+		}
+	}
+	s.tie.syms = origTieSyms
+}
+
 const bidirectional_fallback_ret_literal = false
 
 type match_lit struct { posym }
