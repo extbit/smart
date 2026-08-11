@@ -3184,18 +3184,35 @@ func (s *symstr) do(ctx Context, op any) any { // Optional!
 
 // HELPER 1: Handle initial wildcard metadata
 func (s *symstr) is_wildcard(target posym, op evalop) bool {
-	if !isWildcardMeta(target.Symbol) { return false }
+	if len(s.syms) == 0 || !isWildcardMeta(target.Symbol) { return false }
 
-	if target.Symbol == symPercent && len(s.tie.syms) > 1 && s.tie.syms[1].Symbol == symPercent {
-		s.ops = append(s.ops, op, opPack, opPack)
-		s.operands = append(s.operands, posym{target.Pos, symPercent}, posym{target.Pos, symPercent})
-		s.tie.pop_head()
-		s.tie.pop_head()
+	// Safely infer execution direction based on where the target sits in the syms slice
+	var rev bool
+	if s.syms[0] == target {
+		rev = false
+	} else if s.syms[len(s.syms)-1] == target {
+		rev = true
 	} else {
-		s.ops = append(s.ops, op, opPack)
-		s.operands = append(s.operands, posym{target.Pos, target.Symbol})
-		s.tie.pop_head()
+		return false
 	}
+
+	// Directionally pop the wildcard from the intercepted tape (NOT s.tie!)
+	if rev {
+		s.syms = s.syms[:len(s.syms)-1]
+		s.ops = append(s.ops, op, opPackRev)
+		s.operands = append(s.operands, posym{target.Pos, target.Symbol})
+	} else {
+		s.syms = s.syms[1:]
+		if target.Symbol == symPercent && len(s.syms) > 0 && s.syms[0].Symbol == symPercent {
+			s.syms = s.syms[1:]
+			s.ops = append(s.ops, op, opPack, opPack)
+			s.operands = append(s.operands, posym{target.Pos, symPercent}, posym{target.Pos, symPercent})
+		} else {
+			s.ops = append(s.ops, op, opPack)
+			s.operands = append(s.operands, posym{target.Pos, target.Symbol})
+		}
+	}
+
 	if len(s.stems) > 0 {
 		p := &s.stems[len(s.stems)-1]
 		p.syms = append(p.syms, target)
@@ -3208,49 +3225,23 @@ func (s *symstr) nfa_emit(captured []posym, origCount, origLen int) {
 	s.stems = s.stems[:origCount]
 	if origCount > 0 {
 		p := &s.stems[origCount-1]
-		p.syms = p.syms[:origLen]
-		p.syms = append(p.syms, captured...)
+		p.syms = append(p.syms[:origLen], captured...) // Optimized slice append
 	}
-	if len(captured) > 0 {
-		for i := len(captured) - 1; i >= 0; i-- {
-			s.ops = append(s.ops, opPack)
-			s.operands = append(s.operands, captured[i])
-		}
+	for i := len(captured) - 1; i >= 0; i-- {
+		s.ops = append(s.ops, opPack)
+		s.operands = append(s.operands, captured[i])
 	}
 }
+
 func (s *symstr) nfa_emit_rev(captured []posym, origCount, origLen int) {
 	s.stems = s.stems[:origCount]
 	if origCount > 0 {
 		p := &s.stems[origCount-1]
-		p.syms = p.syms[:origLen]
-		p.syms = append(p.syms, captured...)
+		p.syms = append(p.syms[:origLen], captured...) // Optimized slice append
 	}
-	if len(captured) > 0 {
-		for _, ps := range captured {
-			s.ops = append(s.ops, opPack)
-			s.operands = append(s.operands, ps)
-		}
-	}
-}
-
-// HELPER 5: Tape Restoration (Right side of split)
-func (s *symstr) nfa_push_unconsumed(rightValid bool, right posym, targetIdx int, stem, origTieSyms []posym) {
-	if rightValid || (targetIdx != -1 && targetIdx+1 < len(stem)) {
-		var unconsumed []posym
-		if rightValid { unconsumed = append(unconsumed, right) }
-		if targetIdx != -1 && targetIdx+1 < len(stem) {
-			unconsumed = append(unconsumed, stem[targetIdx+1:]...)
-		}
-		if len(unconsumed) > 0 {
-			safeQueue := make([]posym, 0, len(unconsumed)+len(origTieSyms))
-			safeQueue = append(safeQueue, unconsumed...)
-			safeQueue = append(safeQueue, origTieSyms...)
-			s.tie.syms = safeQueue
-		} else {
-			s.tie.syms = origTieSyms
-		}
-	} else {
-		s.tie.syms = origTieSyms
+	for _, ps := range captured {
+		s.ops = append(s.ops, opPackRev) // CRITICAL FIX: Push opPackRev!
+		s.operands = append(s.operands, ps)
 	}
 }
 
