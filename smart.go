@@ -3367,10 +3367,11 @@ func (s *symstr) opMatchLiteral(l int) {
 			s.operands = append(s.operands, fg)
 
 			// Inject the string fragment back into the tape so the fallback handler
-			// can consume it character-by-character natively!
+			// can consume it character-by-character!
 			s.syms = append([]posym{origLit}, s.syms...)
 
-			// NO s.err = errMatchFailed! Let the VM naturally transition to the fallback state.
+			// NATIVE TRANSITION: Removed s.err = errMatchFailed here so the VM loop
+			// continues naturally to fallbackOp!
 			return
 		}
 
@@ -3536,7 +3537,7 @@ func (s *symstr) opMatchLiteralRev(l int) {
 			// Reverse injection pushes to the END of the tape
 			s.syms = append(s.syms, origLit)
 
-			// NO s.err = errMatchFailed!
+			// NATIVE TRANSITION: Removed s.err = errMatchFailed here.
 			return
 		}
 
@@ -3648,11 +3649,17 @@ _ops_loop_:
 
 func (s *symstr) opFallbackGlobSeg(l int) {
 	g := s.operands[l-1].(*fallback_glob)
+	s.operands = s.operands[:l-1] // 1. CRITICAL: Pop immediately to clear the operand stack!
 
-	if s.err != nil { return }
+	// Symmetry: Pull lookahead from tie tape
+	if g.lookahead.Symbol == symEmpty && s.tie.err != io.EOF {
+		g.lookahead = s.tie.next_lit_no_match()
+	}
+
+	if s.tie.err != nil { return } // Safe to return, fg is already popped
 
 	// Symmetry: Ensure string literal matches from primary tape
-	if s.ensured_syms() {
+	if s.ensured_syms() { // 2. Safe to call step() internally now!
 		if s.is_wildcard(s.syms[0], opFallbackGlobSeg) { return }
 
 		var totalBytes int
@@ -3661,12 +3668,12 @@ func (s *symstr) opFallbackGlobSeg(l int) {
 		if g.lookahead.Symbol == symEmpty {
 			slashIdx := __posymSeqIndex(s.syms, 0, symSlash)
 			if slashIdx != -1 {
-				s.operands = s.operands[:l-1]
 				s.err = errMatchFailed
 				return
 			}
 			g.stem = append(g.stem, s.syms...)
 			s.ops = append(s.ops, opFallbackGlobSeg)
+			s.operands = append(s.operands, g) // 3. Re-push state for the next loop!
 			s.syms = nil
 			return
 		}
@@ -3684,17 +3691,19 @@ func (s *symstr) opFallbackGlobSeg(l int) {
 		if g.idx == -1 {
 			slashIdx := __posymSeqIndex(s.syms, 0, symSlash)
 			if slashIdx != -1 {
-				s.operands = s.operands[:l-1]
 				s.err = errMatchFailed
 				return
 			}
 
 			g.stem = append(g.stem, s.syms...)
 			s.ops = append(s.ops, opFallbackGlobSeg)
+			s.operands = append(s.operands, g) // Re-push state for the next loop!
 			s.syms = nil
 		} else {
 			s.ops = append(s.ops, opTryGlobGreed)
 
+			// Re-push state strictly for the checkpoint snapshot!
+			s.operands = append(s.operands, g)
 			g.bt = s.checkpoint(undoBranch)
 
 			// CRITICAL: Pop from active path to prevent downstream panics!
@@ -3727,8 +3736,6 @@ func (s *symstr) opFallbackGlobSeg(l int) {
 			}
 		}
 	} else {
-		s.operands = s.operands[:l-1]
-
 		if g.lookahead.Symbol == symEmpty {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
@@ -3763,11 +3770,10 @@ func (s *symstr) opFallbackGlobSeg(l int) {
 
 func (s *symstr) opFallbackGlobSegRev(l int) {
 	g := s.operands[l-1].(*fallback_glob)
+	s.operands = s.operands[:l-1] // 1. CRITICAL: Pop immediately!
 
 	if g.lookahead.Symbol == symEmpty && s.tie.err != io.EOF {
-		s.operands = s.operands[:l-1]
 		g.lookahead = s.tie.next_lit_no_match()
-		s.operands = append(s.operands, g)
 	}
 
 	if s.tie.err != nil { return }
@@ -3781,12 +3787,12 @@ func (s *symstr) opFallbackGlobSegRev(l int) {
 		if g.lookahead.Symbol == symEmpty {
 			slashIdx := __posymSeqLastIndex(s.syms, totalBytes-1, symSlash)
 			if slashIdx != -1 {
-				s.operands = s.operands[:l-1]
 				s.err = errMatchFailed
 				return
 			}
 			g.stem = append(g.stem, s.syms...)
 			s.ops = append(s.ops, opFallbackGlobSegRev)
+			s.operands = append(s.operands, g) // Re-push
 			s.syms = nil
 			return
 		}
@@ -3804,16 +3810,18 @@ func (s *symstr) opFallbackGlobSegRev(l int) {
 		if g.idx == -1 {
 			slashIdx := __posymSeqLastIndex(s.syms, totalBytes-1, symSlash)
 			if slashIdx != -1 {
-				s.operands = s.operands[:l-1]
 				s.err = errMatchFailed
 				return
 			}
 
 			g.stem = append(g.stem, s.syms...)
 			s.ops = append(s.ops, opFallbackGlobSegRev)
+			s.operands = append(s.operands, g) // Re-push
 			s.syms = nil
 		} else {
 			s.ops = append(s.ops, opTryGlobGreedRev)
+
+			s.operands = append(s.operands, g) // Re-push for checkpoint
 			g.bt = s.checkpoint(undoBranch)
 
 			s.ops = s.ops[:len(s.ops)-1]
@@ -3848,8 +3856,6 @@ func (s *symstr) opFallbackGlobSegRev(l int) {
 			}
 		}
 	} else {
-		s.operands = s.operands[:l-1]
-
 		if g.lookahead.Symbol == symEmpty {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
@@ -3884,12 +3890,11 @@ func (s *symstr) opFallbackGlobSegRev(l int) {
 
 func (s *symstr) opFallbackGlobGreed(l int) {
 	g := s.operands[l-1].(*fallback_glob)
+	s.operands = s.operands[:l-1] // 1. CRITICAL: Pop immediately!
 
 	// Symmetry: Pull lookahead from tie tape
 	if g.lookahead.Symbol == symEmpty && s.tie.err != io.EOF {
-		s.operands = s.operands[:l-1]
 		g.lookahead = s.tie.next_lit_no_match() // NOTE: s.tie works via opUnroll (no match)
-		s.operands = append(s.operands, g)
 	}
 
 	if s.tie.err != nil { return }
@@ -3901,6 +3906,7 @@ func (s *symstr) opFallbackGlobGreed(l int) {
 		if g.lookahead.Symbol == symEmpty {
 			g.stem = append(g.stem, s.syms...)
 			s.ops = append(s.ops, opFallbackGlobGreed)
+			s.operands = append(s.operands, g) // Re-push
 			s.syms = nil
 			return
 		}
@@ -3911,10 +3917,11 @@ func (s *symstr) opFallbackGlobGreed(l int) {
 		if g.idx = __posymSeqLastIndex(s.syms, totalBytes-1, g.lookahead.Symbol); g.idx == -1 {
 			g.stem = append(g.stem, s.syms...)
 			s.ops = append(s.ops, opFallbackGlobGreed)
+			s.operands = append(s.operands, g) // Re-push
 			s.syms = nil
 		} else {
 			s.ops = append(s.ops, opTryGlobGreed)
-
+			s.operands = append(s.operands, g) // Re-push strictly for checkpoint
 			g.bt = s.checkpoint(undoBranch)
 
 			// CRITICAL: Pop from active path to prevent downstream panics!
@@ -3937,16 +3944,27 @@ func (s *symstr) opFallbackGlobGreed(l int) {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
 			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit(finalStem, origStemsCount, origStemsLen)
+
+			if bidirectional_fallback_ret_literal {
+				s.nfa_emit(finalStem, origStemsCount, origStemsLen)
+			} else {
+				if origStemsCount > 0 {
+					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], finalStem...)
+				}
+			}
 		}
 	} else {
-		s.operands = s.operands[:l-1]
-
 		if g.lookahead.Symbol == symEmpty {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
 			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit(g.stem, origStemsCount, origStemsLen)
+			if bidirectional_fallback_ret_literal {
+				s.nfa_emit(g.stem, origStemsCount, origStemsLen)
+			} else {
+				if origStemsCount > 0 {
+					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
+				}
+			}
 			return
 		}
 
@@ -3954,7 +3972,13 @@ func (s *symstr) opFallbackGlobGreed(l int) {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
 			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit(g.stem, origStemsCount, origStemsLen)
+			if bidirectional_fallback_ret_literal {
+				s.nfa_emit(g.stem, origStemsCount, origStemsLen)
+			} else {
+				if origStemsCount > 0 {
+					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
+				}
+			}
 		}
 
 		s.syms = g.stem
@@ -3964,11 +3988,10 @@ func (s *symstr) opFallbackGlobGreed(l int) {
 
 func (s *symstr) opFallbackGlobGreedRev(l int) {
 	g := s.operands[l-1].(*fallback_glob)
+	s.operands = s.operands[:l-1] // 1. CRITICAL: Pop immediately!
 
 	if g.lookahead.Symbol == symEmpty && s.tie.err != io.EOF {
-		s.operands = s.operands[:l-1]
 		g.lookahead = s.tie.next_lit_no_match()
-		s.operands = append(s.operands, g)
 	}
 
 	if s.tie.err != nil { return }
@@ -3979,6 +4002,7 @@ func (s *symstr) opFallbackGlobGreedRev(l int) {
 		if g.lookahead.Symbol == symEmpty {
 			g.stem = append(g.stem, s.syms...)
 			s.ops = append(s.ops, opFallbackGlobGreedRev)
+			s.operands = append(s.operands, g) // Re-push
 			s.syms = nil
 			return
 		}
@@ -3989,9 +4013,11 @@ func (s *symstr) opFallbackGlobGreedRev(l int) {
 		if g.idx = __posymSeqIndex(s.syms, 0, g.lookahead.Symbol); g.idx == -1 {
 			g.stem = append(g.stem, s.syms...)
 			s.ops = append(s.ops, opFallbackGlobGreedRev)
+			s.operands = append(s.operands, g) // Re-push
 			s.syms = nil
 		} else {
 			s.ops = append(s.ops, opTryGlobGreedRev)
+			s.operands = append(s.operands, g) // Re-push for checkpoint
 			g.bt = s.checkpoint(undoBranch)
 
 			s.ops = s.ops[:len(s.ops)-1]
@@ -4017,16 +4043,26 @@ func (s *symstr) opFallbackGlobGreedRev(l int) {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
 			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit_rev(finalStem, origStemsCount, origStemsLen)
+			if bidirectional_fallback_ret_literal {
+				s.nfa_emit_rev(finalStem, origStemsCount, origStemsLen)
+			} else {
+				if origStemsCount > 0 {
+					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], finalStem...)
+				}
+			}
 		}
 	} else {
-		s.operands = s.operands[:l-1]
-
 		if g.lookahead.Symbol == symEmpty {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
 			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
+			if bidirectional_fallback_ret_literal {
+				s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
+			} else {
+				if origStemsCount > 0 {
+					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
+				}
+			}
 			return
 		}
 
@@ -4034,7 +4070,13 @@ func (s *symstr) opFallbackGlobGreedRev(l int) {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
 			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
+			if bidirectional_fallback_ret_literal {
+				s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
+			} else {
+				if origStemsCount > 0 {
+					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
+				}
+			}
 		}
 
 		s.syms = g.stem
@@ -4044,11 +4086,10 @@ func (s *symstr) opFallbackGlobGreedRev(l int) {
 
 func (s *symstr) opFallbackGlobCross(l int) {
 	g := s.operands[l-1].(*fallback_glob)
+	s.operands = s.operands[:l-1] // 1. CRITICAL: Pop immediately!
 
 	if g.lookahead.Symbol == symEmpty && s.tie.err != io.EOF {
-		s.operands = s.operands[:l-1]
 		g.lookahead = s.tie.next_lit_no_match()
-		s.operands = append(s.operands, g)
 	}
 
 	if s.tie.err != nil { return }
@@ -4059,6 +4100,7 @@ func (s *symstr) opFallbackGlobCross(l int) {
 		if g.lookahead.Symbol == symEmpty {
 			g.stem = append(g.stem, s.syms...)
 			s.ops = append(s.ops, opFallbackGlobCross)
+			s.operands = append(s.operands, g) // Re-push
 			s.syms = nil
 			return
 		}
@@ -4069,9 +4111,11 @@ func (s *symstr) opFallbackGlobCross(l int) {
 		if g.idx = __posymSeqIndex(s.syms, 0, g.lookahead.Symbol); g.idx == -1 {
 			g.stem = append(g.stem, s.syms...)
 			s.ops = append(s.ops, opFallbackGlobCross)
+			s.operands = append(s.operands, g) // Re-push
 			s.syms = nil
 		} else {
 			s.ops = append(s.ops, opTryGlobGreed)
+			s.operands = append(s.operands, g) // Re-push strictly for checkpoint
 			g.bt = s.checkpoint(undoBranch)
 
 			s.ops = s.ops[:len(s.ops)-1]
@@ -4093,16 +4137,27 @@ func (s *symstr) opFallbackGlobCross(l int) {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
 			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit(finalStem, origStemsCount, origStemsLen)
+
+			if bidirectional_fallback_ret_literal {
+				s.nfa_emit(finalStem, origStemsCount, origStemsLen)
+			} else {
+				if origStemsCount > 0 {
+					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], finalStem...)
+				}
+			}
 		}
 	} else {
-		s.operands = s.operands[:l-1]
-
 		if g.lookahead.Symbol == symEmpty {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
 			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit(g.stem, origStemsCount, origStemsLen)
+			if bidirectional_fallback_ret_literal {
+				s.nfa_emit(g.stem, origStemsCount, origStemsLen)
+			} else {
+				if origStemsCount > 0 {
+					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
+				}
+			}
 			return
 		}
 
@@ -4110,7 +4165,13 @@ func (s *symstr) opFallbackGlobCross(l int) {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
 			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit(g.stem, origStemsCount, origStemsLen)
+			if bidirectional_fallback_ret_literal {
+				s.nfa_emit(g.stem, origStemsCount, origStemsLen)
+			} else {
+				if origStemsCount > 0 {
+					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
+				}
+			}
 		}
 
 		s.syms = g.stem
@@ -4120,11 +4181,10 @@ func (s *symstr) opFallbackGlobCross(l int) {
 
 func (s *symstr) opFallbackGlobCrossRev(l int) {
 	g := s.operands[l-1].(*fallback_glob)
+	s.operands = s.operands[:l-1] // 1. CRITICAL: Pop immediately!
 
 	if g.lookahead.Symbol == symEmpty && s.tie.err != io.EOF {
-		s.operands = s.operands[:l-1]
 		g.lookahead = s.tie.next_lit_no_match()
-		s.operands = append(s.operands, g)
 	}
 
 	if s.tie.err != nil { return }
@@ -4135,6 +4195,7 @@ func (s *symstr) opFallbackGlobCrossRev(l int) {
 		if g.lookahead.Symbol == symEmpty {
 			g.stem = append(g.stem, s.syms...)
 			s.ops = append(s.ops, opFallbackGlobCrossRev)
+			s.operands = append(s.operands, g) // Re-push
 			s.syms = nil
 			return
 		}
@@ -4145,9 +4206,11 @@ func (s *symstr) opFallbackGlobCrossRev(l int) {
 		if g.idx = __posymSeqLastIndex(s.syms, totalBytes-1, g.lookahead.Symbol); g.idx == -1 {
 			g.stem = append(g.stem, s.syms...)
 			s.ops = append(s.ops, opFallbackGlobCrossRev)
+			s.operands = append(s.operands, g) // Re-push
 			s.syms = nil
 		} else {
 			s.ops = append(s.ops, opTryGlobGreedRev)
+			s.operands = append(s.operands, g) // Re-push for checkpoint
 			g.bt = s.checkpoint(undoBranch)
 
 			s.ops = s.ops[:len(s.ops)-1]
@@ -4173,16 +4236,26 @@ func (s *symstr) opFallbackGlobCrossRev(l int) {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
 			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit_rev(finalStem, origStemsCount, origStemsLen)
+			if bidirectional_fallback_ret_literal {
+				s.nfa_emit_rev(finalStem, origStemsCount, origStemsLen)
+			} else {
+				if origStemsCount > 0 {
+					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], finalStem...)
+				}
+			}
 		}
 	} else {
-		s.operands = s.operands[:l-1]
-
 		if g.lookahead.Symbol == symEmpty {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
 			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
+			if bidirectional_fallback_ret_literal {
+				s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
+			} else {
+				if origStemsCount > 0 {
+					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
+				}
+			}
 			return
 		}
 
@@ -4190,7 +4263,13 @@ func (s *symstr) opFallbackGlobCrossRev(l int) {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
 			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
+			if bidirectional_fallback_ret_literal {
+				s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
+			} else {
+				if origStemsCount > 0 {
+					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
+				}
+			}
 		}
 
 		s.syms = g.stem
@@ -10918,7 +10997,8 @@ func match(ctx Context, pattern, target Value) (matched bool, res, rem Value, st
 
 	if checkpoints {
 		switch sf("%v %v", pattern, target) {
-		case "foo/bar/xx/yy/zz.h *.h", "foo/bar/xx/yy/zz.h **.h", "*.h foo/bar/xx/yy/zz.h", "**.h foo/bar/xx/yy/zz.h":
+		// "foo/bar/xx/yy/zz.h *.h", "*.h foo/bar/xx/yy/zz.h",
+		case "foo/bar/xx/yy/zz.h **.h", "**.h foo/bar/xx/yy/zz.h":
 			debug(ctx, "match: %v %v", pattern, target)
 			d_step = true; defer func() { d_step = false } ()
 		}
