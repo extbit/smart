@@ -3099,12 +3099,6 @@ type vmstack struct {
 	opsDone  int      // Counter of executed ops (Instruction Retired Counter - IRC)
 }
 
-type removed_high_water_telemetry_tracking struct {
-	bestStems       []capture // High-water mark for stems
-	bestPack        *vmpack   // High-water mark for the AST!
-	bestOpsDone     int       // High-water mark for Instruction Retired Counter
-}
-
 // vmpack is a cascading state machine mirrors the structural hierarchy.
 type vmpack struct {
 	parent *vmpack // Links to the outer scope (for nested brackets!)
@@ -3250,8 +3244,6 @@ func (s *symstr) nfa_push_unconsumed(rightValid bool, right posym, targetIdx int
 const bidirectional_fallback_ret_literal = false
 
 type match_lit struct { posym }
-type pack_sym struct { posym }
-type pack_val struct { v Value }
 
 func (s *symstr) next_lit() posym {
 	// 1. Sandbox the lookahead to prevent side effects
@@ -3297,8 +3289,8 @@ func (f *fallback_glob) String() string {
 }
 
 func (s *symstr) opMatchLiteral(l int) {
-	lit := s.operands[len(s.operands)-1].(match_lit)
-	s.operands = s.operands[:len(s.operands)-1]
+	lit := s.operands[l-1].(match_lit)
+	s.operands = s.operands[:l-1]
 
 	if s.tie.ensured_syms() {
 		if lit.Symbol == symEmpty {
@@ -3360,36 +3352,6 @@ func (s *symstr) opMatchLiteral(l int) {
 
 			s.tie.syms = s.tie.syms[1:]
 
-			var nextTarget posym
-			if s.tie.ensured_syms() { nextTarget = s.tie.syms[0] }
-
-			var idx int
-			if nextTarget.Symbol != symEmpty {
-				if target.Symbol == symAsteriskQues {
-					idx = lit.index(nextTarget.Symbol)
-				} else {
-					idx = lit.last_index(nextTarget.Symbol)
-				}
-			} else {
-				idx = -1
-			}
-
-			if idx != -1 {
-				if target.Symbol == symAsterisk {
-					slashIdx := lit.index(symSlash)
-					if slashIdx != -1 && slashIdx < idx {
-						idx = -1
-					}
-				}
-			}
-
-			if idx == -1 && target.Symbol == symAsterisk {
-				if lit.index(symSlash) != -1 {
-					s.err = errMatchFailedCrossSeg
-					return
-				}
-			}
-
 			var fallbackOp evalop
 			switch target.Symbol {
 			case symAsterisk: fallbackOp = opFallbackGlobSeg
@@ -3397,21 +3359,18 @@ func (s *symstr) opMatchLiteral(l int) {
 			case symAsteriskQues: fallbackOp = opFallbackGlobCross
 			}
 
-			fg := &fallback_glob{op_glob{idx: idx, lookahead: origLit}}
+			// Safely pull the next lookahead from the tie generator
+			lookahead := s.tie.next_lit_no_match()
+
+			fg := &fallback_glob{op_glob{idx: -1, lookahead: lookahead}}
 			s.ops = append(s.ops, fallbackOp)
 			s.operands = append(s.operands, fg)
 
-			fg.bt = s.checkpoint(undoBranch)
+			// Inject the string fragment back into the tape so the fallback handler
+			// can consume it character-by-character natively!
+			s.syms = append([]posym{origLit}, s.syms...)
 
-			if idx != -1 {
-				leftover := intern(lit.String()[idx:])
-				s.ops = append(s.ops, opMatchLiteral)
-				s.operands = append(s.operands, match_lit{posym{lit.Pos, leftover}})
-			} else {
-				// Inject the original literal back so the handler can naturally loop and consume the chunk!
-				s.syms = append([]posym{origLit}, s.syms...)
-				s.err = errMatchFailed
-			}
+			// NO s.err = errMatchFailed! Let the VM naturally transition to the fallback state.
 			return
 		}
 
@@ -3498,26 +3457,26 @@ func (s *symstr) opMatchLiteral(l int) {
 }
 
 func (s *symstr) opMatchLiteralRev(l int) {
-	lit := s.operands[len(s.operands)-1].(match_lit)
-	s.operands = s.operands[:len(s.operands)-1]
+	lit := s.operands[l-1].(match_lit)
+	s.operands = s.operands[:l-1]
 
 	if s.tie.ensured_syms() {
 		if lit.Symbol == symEmpty {
-			switch s.tie.syms[0].Symbol {
+			switch s.tie.syms[len(s.tie.syms)-1].Symbol {
 			case symEmpty:
-				s.tie.syms = s.tie.syms[1:]
+				s.tie.syms = s.tie.syms[:len(s.tie.syms)-1]
 			case symQues, symAsterisk, symAsteriskAst, symAsteriskQues:
 				s.err = errMatchFailedCrossSeg
 			}
 			return
 		}
 
-		target := s.tie.syms[0]
+		target := s.tie.syms[len(s.tie.syms)-1]
 
 		switch target.Symbol {
 		case lit.Symbol:
 			lit.Symbol = target.Symbol
-			s.tie.syms = s.tie.syms[1:]
+			s.tie.syms = s.tie.syms[:len(s.tie.syms)-1]
 			s.ops = append(s.ops, opPackRev)
 			s.operands = append(s.operands, lit.posym)
 			return
@@ -3528,7 +3487,7 @@ func (s *symstr) opMatchLiteralRev(l int) {
 				return
 			}
 
-			s.tie.syms = s.tie.syms[1:]
+			s.tie.syms = s.tie.syms[:len(s.tie.syms)-1]
 
 			s.loc = lit.Pos
 			s.str = lit.Symbol.String()
@@ -3559,37 +3518,7 @@ func (s *symstr) opMatchLiteralRev(l int) {
 			s.ops = append(s.ops, opPackRev)
 			s.operands = append(s.operands, lit.posym)
 
-			s.tie.syms = s.tie.syms[1:]
-
-			var nextTarget posym
-			if s.tie.ensured_syms() { nextTarget = s.tie.syms[0] }
-
-			var idx int
-			if nextTarget.Symbol != symEmpty {
-				if target.Symbol == symAsteriskQues {
-					idx = lit.last_index(nextTarget.Symbol)
-				} else {
-					idx = lit.index(nextTarget.Symbol)
-				}
-			} else {
-				idx = -1
-			}
-
-			if idx != -1 {
-				if target.Symbol == symAsterisk {
-					slashIdx := lit.last_index(symSlash)
-					if slashIdx != -1 && slashIdx > idx {
-						idx = -1
-					}
-				}
-			}
-
-			if idx == -1 && target.Symbol == symAsterisk {
-				if lit.index(symSlash) != -1 {
-					s.err = errMatchFailedCrossSeg
-					return
-				}
-			}
+			s.tie.syms = s.tie.syms[:len(s.tie.syms)-1]
 
 			var fallbackOp evalop
 			switch target.Symbol {
@@ -3598,20 +3527,16 @@ func (s *symstr) opMatchLiteralRev(l int) {
 			case symAsteriskQues: fallbackOp = opFallbackGlobCrossRev
 			}
 
-			fg := &fallback_glob{op_glob{idx: idx, lookahead: origLit}}
+			lookahead := s.tie.next_lit_no_match()
+			fg := &fallback_glob{op_glob{idx: -1, lookahead: lookahead}}
+
 			s.ops = append(s.ops, fallbackOp)
 			s.operands = append(s.operands, fg)
 
-			fg.bt = s.checkpoint(undoBranch)
+			// Reverse injection pushes to the END of the tape
+			s.syms = append(s.syms, origLit)
 
-			if idx != -1 {
-				leftover := intern(lit.String()[:idx+nextTarget.len()])
-				s.ops = append(s.ops, opMatchLiteralRev)
-				s.operands = append(s.operands, match_lit{posym{lit.Pos, leftover}})
-			} else {
-				s.syms = append([]posym{origLit}, s.syms...)
-				s.err = errMatchFailed
-			}
+			// NO s.err = errMatchFailed!
 			return
 		}
 
@@ -3621,15 +3546,9 @@ func (s *symstr) opMatchLiteralRev(l int) {
 		}
 
 		if target.has_suffix(lit.Symbol) {
-			s.tie.pop_head()
+			s.tie.pop_tail()
 
 			ll := lit.len()
-			if target.Pos != NoPos {
-				s.tie.loc = target.Pos
-			} else {
-				s.tie.loc = NoPos
-			}
-
 			s.tie.str = target.String()[:target.len()-ll]
 
 			s.ops = append(s.ops, opPackRev)
@@ -3638,7 +3557,7 @@ func (s *symstr) opMatchLiteralRev(l int) {
 		}
 
 		if lit.has_suffix(target.Symbol) {
-			s.tie.pop_head()
+			s.tie.pop_tail()
 
 			sym := intern(lit.String()[:lit.len()-target.len()])
 
@@ -3653,10 +3572,8 @@ func (s *symstr) opMatchLiteralRev(l int) {
 		}
 
 		str := lit.String()
-		tpos := target.Pos
-		s.tie.loc = tpos
 		s.tie.str = target.String()
-		s.tie.pop_head()
+		s.tie.pop_tail()
 
 		n := len(str)
 		if len(s.tie.str) < n { n = len(s.tie.str) }
@@ -3664,8 +3581,7 @@ func (s *symstr) opMatchLiteralRev(l int) {
 		frag := s.tie.str[len(s.tie.str)-n:]
 		if str[len(str)-n:] != frag {
 			if len(s.tie.str) > 0 {
-				s.tie.syms = append([]posym{{tpos, intern(s.tie.str)}}, s.tie.syms...)
-				s.tie.loc = NoPos
+				s.tie.syms = append(s.tie.syms, posym{NoPos, intern(s.tie.str)})
 				s.tie.str = ""
 			}
 			s.err = errMatchFailed
@@ -3675,16 +3591,11 @@ func (s *symstr) opMatchLiteralRev(l int) {
 		str = str[:len(str)-n]
 		s.tie.str = s.tie.str[:len(s.tie.str)-n]
 
-		if tpos != NoPos {
-			s.tie.loc = tpos
-		}
-
 		lit.Symbol = intern(frag)
 		s.ops = append(s.ops, opPackRev)
 		s.operands = append(s.operands, lit.posym)
 
 		if len(str) > 0 {
-			if lit.Pos != NoPos { lit.Pos -= Pos(n) }
 			lit.Symbol = intern(str)
 			s.ops = append(s.ops, opMatchLiteralRev)
 			s.operands = append(s.operands, lit)
@@ -3738,14 +3649,7 @@ _ops_loop_:
 func (s *symstr) opFallbackGlobSeg(l int) {
 	g := s.operands[l-1].(*fallback_glob)
 
-	// Symmetry: Pull lookahead from tie tape
-	if g.lookahead.Symbol == symEmpty && s.tie.err != io.EOF {
-		s.operands = s.operands[:l-1]
-		g.lookahead = s.tie.next_lit_no_match() // NOTE: s.tie works via opUnroll (no match)
-		s.operands = append(s.operands, g)
-	}
-
-	if s.tie.err != nil { return }
+	if s.err != nil { return }
 
 	// Symmetry: Ensure string literal matches from primary tape
 	if s.ensured_syms() {
@@ -3813,7 +3717,14 @@ func (s *symstr) opFallbackGlobSeg(l int) {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
 			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit(finalStem, origStemsCount, origStemsLen)
+
+			if bidirectional_fallback_ret_literal {
+				s.nfa_emit(finalStem, origStemsCount, origStemsLen)
+			} else {
+				if origStemsCount > 0 {
+					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], finalStem...)
+				}
+			}
 		}
 	} else {
 		s.operands = s.operands[:l-1]
@@ -3822,7 +3733,13 @@ func (s *symstr) opFallbackGlobSeg(l int) {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
 			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit(g.stem, origStemsCount, origStemsLen)
+			if bidirectional_fallback_ret_literal {
+				s.nfa_emit(g.stem, origStemsCount, origStemsLen)
+			} else {
+				if origStemsCount > 0 {
+					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
+				}
+			}
 			return
 		}
 
@@ -3830,7 +3747,13 @@ func (s *symstr) opFallbackGlobSeg(l int) {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
 			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit(g.stem, origStemsCount, origStemsLen)
+			if bidirectional_fallback_ret_literal {
+				s.nfa_emit(g.stem, origStemsCount, origStemsLen)
+			} else {
+				if origStemsCount > 0 {
+					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
+				}
+			}
 		}
 
 		s.syms = g.stem
@@ -3916,7 +3839,13 @@ func (s *symstr) opFallbackGlobSegRev(l int) {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
 			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit_rev(finalStem, origStemsCount, origStemsLen)
+			if bidirectional_fallback_ret_literal {
+				s.nfa_emit_rev(finalStem, origStemsCount, origStemsLen)
+			} else {
+				if origStemsCount > 0 {
+					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], finalStem...)
+				}
+			}
 		}
 	} else {
 		s.operands = s.operands[:l-1]
@@ -3925,7 +3854,13 @@ func (s *symstr) opFallbackGlobSegRev(l int) {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
 			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
+			if bidirectional_fallback_ret_literal {
+				s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
+			} else {
+				if origStemsCount > 0 {
+					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
+				}
+			}
 			return
 		}
 
@@ -3933,7 +3868,13 @@ func (s *symstr) opFallbackGlobSegRev(l int) {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
 			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
+			if bidirectional_fallback_ret_literal {
+				s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
+			} else {
+				if origStemsCount > 0 {
+					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
+				}
+			}
 		}
 
 		s.syms = g.stem
@@ -8937,7 +8878,7 @@ var d_step bool
 
 func (s *symstr) step() {
 	if checkpoints && d_step {
-		debug(s, "pc=%v %v %v %v %v", s.opsDone, s.ops, s.operands, s.results, s.syms) }
+		debug(s, "pc=%v %v %v %v, syms=%v stems=%v", s.opsDone, s.ops, s.operands, s.results, s.syms, s.stems) }
 
 	op := s.ops[len(s.ops)-1]
 	s.ops = s.ops[:len(s.ops)-1]
@@ -9735,7 +9676,7 @@ _op_switch_:
 			s.operands = s.operands[:l-1]
 
 		default:
-			erro(s, "unexpected return: %[1]T %[1]v", t)
+			erro(s, "opPack: unexpected %[1]T %[1]v", t)
 		}
 
 	case opPackRev:
@@ -9785,7 +9726,7 @@ _op_switch_:
 			s.operands = s.operands[:l-1]
 
 		default:
-			erro(s, "unexpected return: %[1]T %[1]v", t)
+			erro(s, "opPackRev: unexpected %[1]T %[1]v", t)
 		}
 
 	case opEnd:
