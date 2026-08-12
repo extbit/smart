@@ -3182,44 +3182,6 @@ func (s *symstr) do(ctx Context, op any) any { // Optional!
     return s.Context.do(ctx, op)
 }
 
-// HELPER 1: Handle initial wildcard metadata
-func (s *symstr) is_wildcard(target posym, op evalop) bool {
-	if len(s.syms) == 0 || !isWildcardMeta(target.Symbol) { return false }
-
-	// Safely infer execution direction based on where the target sits in the syms slice
-	var rev bool
-	if s.syms[0] == target {
-		rev = false
-	} else if s.syms[len(s.syms)-1] == target {
-		rev = true
-	} else {
-		return false
-	}
-
-	// Directionally pop the wildcard from the intercepted tape (NOT s.tie!)
-	if rev {
-		s.syms = s.syms[:len(s.syms)-1]
-		s.ops = append(s.ops, op, opPackRev)
-		s.operands = append(s.operands, posym{target.Pos, target.Symbol})
-	} else {
-		s.syms = s.syms[1:]
-		if target.Symbol == symPercent && len(s.syms) > 0 && s.syms[0].Symbol == symPercent {
-			s.syms = s.syms[1:]
-			s.ops = append(s.ops, op, opPack, opPack)
-			s.operands = append(s.operands, posym{target.Pos, symPercent}, posym{target.Pos, symPercent})
-		} else {
-			s.ops = append(s.ops, op, opPack)
-			s.operands = append(s.operands, posym{target.Pos, target.Symbol})
-		}
-	}
-
-	if len(s.stems) > 0 {
-		p := &s.stems[len(s.stems)-1]
-		p.syms = append(p.syms, target)
-	}
-	return true
-}
-
 // HELPER 4: Branch Emission (Left side of split)
 func (s *symstr) nfa_emit(captured []posym, origCount, origLen int) {
 	s.stems = s.stems[:origCount]
@@ -3688,7 +3650,10 @@ func (s *symstr) opFallbackGlobSeg(l int) {
 		s.shatter_syms(g.lookahead.Symbol, true)
 
 		if len(s.syms) == 0 { return }
-		if s.is_wildcard(s.syms[0], opFallbackGlobSeg) { return }
+		if t := s.syms[0]; isWildcardMeta(t.Symbol) && symAsterisk.Rank() < t.Rank() {
+			s.err = errMatchFailed
+			return
+		}
 
 		var totalBytes int
 		for _, ps := range s.syms { totalBytes += ps.len() }
@@ -3809,7 +3774,10 @@ func (s *symstr) opFallbackGlobSegRev(l int) {
 		s.shatter_syms(g.lookahead.Symbol, false)
 
 		if len(s.syms) == 0 { return }
-		if s.is_wildcard(s.syms[len(s.syms)-1], opFallbackGlobSegRev) { return }
+		if t := s.syms[len(s.syms)-1]; isWildcardMeta(t.Symbol) && symAsterisk.Rank() < t.Symbol.Rank() {
+			s.err = errMatchFailed
+			return
+		}
 
 		var totalBytes int
 		for _, ps := range s.syms { totalBytes += ps.len() }
@@ -3933,7 +3901,10 @@ func (s *symstr) opFallbackGlobGreed(l int) {
 		s.shatter_syms(g.lookahead.Symbol, true)
 
 		if len(s.syms) == 0 { return }
-		if s.is_wildcard(s.syms[0], opFallbackGlobGreed) { return }
+		if t := s.syms[0]; isWildcardMeta(t.Symbol) && symAsteriskAst.Rank() < t.Symbol.Rank() {
+			s.err = errMatchFailed
+			return
+		}
 
 		if g.lookahead.Symbol == symEmpty {
 			g.stem = append(g.stem, s.syms...)
@@ -4034,7 +4005,10 @@ func (s *symstr) opFallbackGlobGreedRev(l int) {
 		s.shatter_syms(g.lookahead.Symbol, false)
 
 		if len(s.syms) == 0 { return }
-		if s.is_wildcard(s.syms[len(s.syms)-1], opConseqAstGreedRev) { return }
+		if t := s.syms[len(s.syms)-1]; isWildcardMeta(t.Symbol) && symAsteriskAst.Rank() < t.Symbol.Rank() {
+			s.err = errMatchFailed
+			return
+		}
 
 		if g.lookahead.Symbol == symEmpty {
 			g.stem = append(g.stem, s.syms...)
@@ -4138,7 +4112,10 @@ func (s *symstr) opFallbackGlobCross(l int) {
 		s.shatter_syms(g.lookahead.Symbol, false)
 
 		if len(s.syms) == 0 { return }
-		if s.is_wildcard(s.syms[0], opConseqAstCross) { return }
+		if t := s.syms[0]; isWildcardMeta(t.Symbol) && symAsteriskQues.Rank() < t.Symbol.Rank() {
+			s.err = errMatchFailed
+			return
+		}
 
 		if g.lookahead.Symbol == symEmpty {
 			g.stem = append(g.stem, s.syms...)
@@ -4239,7 +4216,10 @@ func (s *symstr) opFallbackGlobCrossRev(l int) {
 		s.shatter_syms(g.lookahead.Symbol, true)
 
 		if len(s.syms) == 0 { return }
-		if s.is_wildcard(s.syms[len(s.syms)-1], opConseqAstCrossRev) { return }
+		if t := s.syms[len(s.syms)-1]; isWildcardMeta(t.Symbol) && symAsteriskQues.Rank() < t.Symbol.Rank() {
+			s.err = errMatchFailed
+			return
+		}
 
 		if g.lookahead.Symbol == symEmpty {
 			g.stem = append(g.stem, s.syms...)
@@ -4638,7 +4618,10 @@ func (s *symstr) opConseqAsterisk(l int) {
 
 	target := s.tie.syms[0]
 	if target.Symbol == symSlash { return }
-	if s.is_wildcard(target, opConseqAsterisk) { return }
+	if isWildcardMeta(target.Symbol) && symAsterisk.Rank() < target.Symbol.Rank() {
+		s.err = errMatchFailed
+		return
+	}
 
 	nextLit := s.next_lit()
 
@@ -4739,8 +4722,10 @@ func (s *symstr) opConseqAsteriskRev(l int) {
 
 	target := s.tie.syms[0]
 	if target.Symbol == symSlash { return }
-	// Assumes you created opConseqAsteriskRev
-	if s.is_wildcard(target, opConseqAsterisk) { return }
+	if isWildcardMeta(target.Symbol) && symAsterisk.Rank() < target.Symbol.Rank() {
+		s.err = errMatchFailed
+		return
+	}
 
 	nextLit := s.next_lit()
 
@@ -4907,7 +4892,10 @@ func (s *symstr) opConseqAstGreed(l int) {
 	if s.err != nil { return }
 
 	if s.tie.ensured_syms() {
-		if s.is_wildcard(s.tie.syms[0], opConseqAstGreed) { return }
+		if t := s.tie.syms[0]; isWildcardMeta(t.Symbol) && symAsteriskAst.Rank() < t.Rank() {
+			s.err = errMatchFailed
+			return
+		}
 
 		if g.lookahead.Symbol == symEmpty {
 			g.stem = append(g.stem, s.tie.syms...)
@@ -4985,7 +4973,10 @@ func (s *symstr) opConseqAstGreedRev(l int) {
 	if s.err != nil { return }
 
 	if s.tie.ensured_syms() {
-		if s.is_wildcard(s.tie.syms[len(s.tie.syms)-1], opConseqAstGreedRev) { return }
+		if t := s.tie.syms[len(s.tie.syms)-1]; isWildcardMeta(t.Symbol) && symAsteriskAst.Rank() < t.Rank() {
+			s.err = errMatchFailed
+			return
+		}
 
 		if g.lookahead.Symbol == symEmpty {
 			g.stem = append(g.stem, s.tie.syms...)
@@ -5054,8 +5045,10 @@ func (s *symstr) opConseqAstGreedRev(l int) {
 func (s *symstr) opConseqAstCross(l int) {
 	if !s.tie.ensured_syms() { return }
 
-	target := s.tie.syms[0]
-	if s.is_wildcard(target, opConseqAstCross) { return }
+	if t := s.tie.syms[0]; isWildcardMeta(t.Symbol) && symAsteriskQues.Rank() < t.Rank() {
+		s.err = errMatchFailed
+		return
+	}
 
 	nextLit := s.next_lit()
 
@@ -5139,9 +5132,10 @@ func (s *symstr) opConseqAstCross(l int) {
 func (s *symstr) opConseqAstCrossRev(l int) {
 	if !s.tie.ensured_syms() { return }
 
-	target := s.tie.syms[0]
-	// Assumes you created opConseqAstCrossRev
-	if s.is_wildcard(target, opConseqAstCross) { return }
+	if t := s.tie.syms[len(s.tie.syms)-1]; isWildcardMeta(t.Symbol) && symAsteriskQues.Rank() < t.Rank() {
+		s.err = errMatchFailed
+		return
+	}
 
 	nextLit := s.next_lit()
 
@@ -10803,7 +10797,7 @@ func (s *symstr) ensure_match_syms(matchOp evalop) bool {
 
 		if sym != 0 {
 			// CRITICAL FIX: Wildcard execution instructions do not push operands!
-			// Attempting to read or pop from s.operands here steals the operand 
+			// Attempting to read or pop from s.operands here steals the operand
 			// belonging to the underlying instruction, causing a TypeAssertionError.
 			s.ops = s.ops[:len(s.ops)-1]
 			s.syms = append(s.syms, posym{NoPos, sym})
