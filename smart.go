@@ -3270,7 +3270,7 @@ type match_lit struct { posym }
 
 func (s *symstr) next_lit() posym {
 	// 1. Sandbox the lookahead to prevent side effects
-	bt := s.checkpoint(undoOwn | undoTie |undoStack | undoErr)
+	bt := s.checkpoint(undoOwn | undoTie | undoStack | undoErr)
 
 	syms := s.syms
 	s.syms = nil
@@ -3280,20 +3280,24 @@ _ops_loop_:
 	for len(s.ops) > 0 && s.err == nil {
 		switch s.ops[len(s.ops)-1] {
 		case opMatchLiteral, opMatchLiteralRev:
+			// Strictly type-asserts to match_lit
 			lit = s.operands[len(s.operands)-1].(match_lit).posym
 			break _ops_loop_
-		case opGlobQues, opGlobQuesRev, opGlobRange, opGlobRangeRev, opGlobAsterisk, opGlobAsteriskRev, opGlobAstGreed, opGlobAstGreedRev, opGlobAstCross, opGlobAstCrossRev:
-			erro(s, "FIXME: undetermined: %v", s.ops[len(s.ops)-1])
+		case opGlobQues, opGlobQuesRev, opGlobRange, opGlobRangeRev,
+			opGlobAsterisk, opGlobAsteriskRev, opGlobAstGreed,
+			opGlobAstGreedRev, opGlobAstCross, opGlobAstCrossRev,
+			opConseqAsterisk, opConseqAsteriskRev, opConseqAstGreed,
+			opConseqAstGreedRev, opConseqAstCross, opConseqAstCrossRev:
+			break _ops_loop_
 		}
 
-		// Safely unroll the AST (e.g., *word -> match_lit)
 		if s.step(); s.syms != nil {
 			syms = append(syms, s.syms...)
 			s.syms = nil
 		}
 	}
 
-	// 2. Erase the unroll execution and rewind the VM
+	// 2. Rewind the VM
 	s.unwind(&bt)
 	s.syms = syms
 
@@ -3672,17 +3676,18 @@ _ops_loop_:
 
 func (s *symstr) opFallbackGlobSeg(l int) {
 	g := s.operands[l-1].(*fallback_glob)
-	s.operands = s.operands[:l-1] // 1. CRITICAL: Pop immediately!
+	s.operands = s.operands[:l-1]
 
 	if g.lookahead.Symbol == symEmpty && s.tie.err != io.EOF {
 		g.lookahead = s.tie.next_lit_no_match()
 	}
 
-	if s.tie.err != nil { return } // Safe to return, fg is already popped
+	if s.tie.err != nil { return }
 
-	if s.ensure_match_syms(opMatchLiteral) { // 2. Safe interceptor
+	if s.ensure_match_syms(opMatchLiteral) {
 		s.shatter_syms(g.lookahead.Symbol, true)
 
+		if len(s.syms) == 0 { return }
 		if s.is_wildcard(s.syms[0], opFallbackGlobSeg) { return }
 
 		var totalBytes int
@@ -3696,7 +3701,7 @@ func (s *symstr) opFallbackGlobSeg(l int) {
 			}
 			g.stem = append(g.stem, s.syms...)
 			s.ops = append(s.ops, opFallbackGlobSeg)
-			s.operands = append(s.operands, g) // 3. Re-push state
+			s.operands = append(s.operands, g)
 			s.syms = nil
 			return
 		}
@@ -3723,7 +3728,7 @@ func (s *symstr) opFallbackGlobSeg(l int) {
 			s.syms = nil
 		} else {
 			s.ops = append(s.ops, opTryFallbackGlobSeg)
-			s.operands = append(s.operands, g) // Re-push strictly for checkpoint
+			s.operands = append(s.operands, g)
 			g.bt = s.checkpoint(undoBranch)
 
 			s.ops = s.ops[:len(s.ops)-1]
@@ -3739,7 +3744,6 @@ func (s *symstr) opFallbackGlobSeg(l int) {
 				restore = append(restore, s.syms[targetIdx+1:]...)
 			}
 
-			// RE-WEAPONIZE: Push restored fragments as active Match instructions!
 			s.syms = nil
 			for i := len(restore) - 1; i >= 0; i-- {
 				s.ops = append(s.ops, opMatchLiteral)
@@ -3751,6 +3755,7 @@ func (s *symstr) opFallbackGlobSeg(l int) {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
 			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
+
 			if bidirectional_fallback_ret_literal {
 				s.nfa_emit(finalStem, origStemsCount, origStemsLen)
 			} else {
@@ -3792,7 +3797,7 @@ func (s *symstr) opFallbackGlobSeg(l int) {
 
 func (s *symstr) opFallbackGlobSegRev(l int) {
 	g := s.operands[l-1].(*fallback_glob)
-	s.operands = s.operands[:l-1] // 1. CRITICAL: Pop immediately!
+	s.operands = s.operands[:l-1]
 
 	if g.lookahead.Symbol == symEmpty && s.tie.err != io.EOF {
 		g.lookahead = s.tie.next_lit_no_match()
@@ -3803,6 +3808,7 @@ func (s *symstr) opFallbackGlobSegRev(l int) {
 	if s.ensure_match_syms(opMatchLiteralRev) {
 		s.shatter_syms(g.lookahead.Symbol, false)
 
+		if len(s.syms) == 0 { return }
 		if s.is_wildcard(s.syms[len(s.syms)-1], opFallbackGlobSegRev) { return }
 
 		var totalBytes int
@@ -3843,7 +3849,7 @@ func (s *symstr) opFallbackGlobSegRev(l int) {
 			s.syms = nil
 		} else {
 			s.ops = append(s.ops, opTryFallbackGlobSegRev)
-			s.operands = append(s.operands, g) // Re-push for checkpoint
+			s.operands = append(s.operands, g)
 			g.bt = s.checkpoint(undoBranch)
 
 			s.ops = s.ops[:len(s.ops)-1]
@@ -3851,23 +3857,25 @@ func (s *symstr) opFallbackGlobSegRev(l int) {
 
 			left, right, targetIdx := __posymSeqSplitAt(s.syms, g.idx)
 
-			// REVERSE FIX: right and rest are restored, left is consumed!
 			var restore []posym
-			if right.Symbol != symEmpty || right.len() > 0 {
-				restore = append(restore, right)
-			}
-			if targetIdx != -1 && targetIdx+1 < len(s.syms) {
-				restore = append(restore, s.syms[targetIdx+1:]...)
+			if len(left) > 0 {
+				restore = append([]posym(nil), left...)
 			}
 
-			// RE-WEAPONIZE
 			s.syms = nil
 			for i := len(restore) - 1; i >= 0; i-- {
 				s.ops = append(s.ops, opMatchLiteralRev)
 				s.operands = append(s.operands, match_lit{restore[i]})
 			}
 
-			finalStem := append(append([]posym(nil), left...), g.stem...)
+			var finalStem []posym
+			if right.Symbol != symEmpty || right.len() > 0 {
+				finalStem = append(finalStem, right)
+			}
+			if targetIdx != -1 && targetIdx+1 < len(s.syms) {
+				finalStem = append(finalStem, s.syms[targetIdx+1:]...)
+			}
+			finalStem = append(finalStem, g.stem...)
 
 			origStemsCount := len(s.stems)
 			var origStemsLen int
@@ -3913,7 +3921,7 @@ func (s *symstr) opFallbackGlobSegRev(l int) {
 
 func (s *symstr) opFallbackGlobGreed(l int) {
 	g := s.operands[l-1].(*fallback_glob)
-	s.operands = s.operands[:l-1] // 1. CRITICAL: Pop immediately!
+	s.operands = s.operands[:l-1]
 
 	if g.lookahead.Symbol == symEmpty && s.tie.err != io.EOF {
 		g.lookahead = s.tie.next_lit_no_match()
@@ -3924,6 +3932,7 @@ func (s *symstr) opFallbackGlobGreed(l int) {
 	if s.ensure_match_syms(opMatchLiteral) {
 		s.shatter_syms(g.lookahead.Symbol, true)
 
+		if len(s.syms) == 0 { return }
 		if s.is_wildcard(s.syms[0], opFallbackGlobGreed) { return }
 
 		if g.lookahead.Symbol == symEmpty {
@@ -3944,7 +3953,7 @@ func (s *symstr) opFallbackGlobGreed(l int) {
 			s.syms = nil
 		} else {
 			s.ops = append(s.ops, opTryFallbackGlobGreed)
-			s.operands = append(s.operands, g) // Re-push strictly for checkpoint
+			s.operands = append(s.operands, g)
 			g.bt = s.checkpoint(undoBranch)
 
 			s.ops = s.ops[:len(s.ops)-1]
@@ -3960,7 +3969,6 @@ func (s *symstr) opFallbackGlobGreed(l int) {
 				restore = append(restore, s.syms[targetIdx+1:]...)
 			}
 
-			// RE-WEAPONIZE
 			s.syms = nil
 			for i := len(restore) - 1; i >= 0; i-- {
 				s.ops = append(s.ops, opMatchLiteral)
@@ -3972,6 +3980,7 @@ func (s *symstr) opFallbackGlobGreed(l int) {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
 			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
+
 			if bidirectional_fallback_ret_literal {
 				s.nfa_emit(finalStem, origStemsCount, origStemsLen)
 			} else {
@@ -4013,7 +4022,7 @@ func (s *symstr) opFallbackGlobGreed(l int) {
 
 func (s *symstr) opFallbackGlobGreedRev(l int) {
 	g := s.operands[l-1].(*fallback_glob)
-	s.operands = s.operands[:l-1] // 1. CRITICAL: Pop immediately!
+	s.operands = s.operands[:l-1]
 
 	if g.lookahead.Symbol == symEmpty && s.tie.err != io.EOF {
 		g.lookahead = s.tie.next_lit_no_match()
@@ -4024,6 +4033,7 @@ func (s *symstr) opFallbackGlobGreedRev(l int) {
 	if s.ensure_match_syms(opMatchLiteralRev) {
 		s.shatter_syms(g.lookahead.Symbol, false)
 
+		if len(s.syms) == 0 { return }
 		if s.is_wildcard(s.syms[len(s.syms)-1], opConseqAstGreedRev) { return }
 
 		if g.lookahead.Symbol == symEmpty {
@@ -4044,7 +4054,7 @@ func (s *symstr) opFallbackGlobGreedRev(l int) {
 			s.syms = nil
 		} else {
 			s.ops = append(s.ops, opTryFallbackGlobGreedRev)
-			s.operands = append(s.operands, g) // Re-push for checkpoint
+			s.operands = append(s.operands, g)
 			g.bt = s.checkpoint(undoBranch)
 
 			s.ops = s.ops[:len(s.ops)-1]
@@ -4052,23 +4062,25 @@ func (s *symstr) opFallbackGlobGreedRev(l int) {
 
 			left, right, targetIdx := __posymSeqSplitAt(s.syms, g.idx)
 
-			// REVERSE FIX: right and rest are restored, left is consumed!
 			var restore []posym
-			if right.Symbol != symEmpty || right.len() > 0 {
-				restore = append(restore, right)
-			}
-			if targetIdx != -1 && targetIdx+1 < len(s.syms) {
-				restore = append(restore, s.syms[targetIdx+1:]...)
+			if len(left) > 0 {
+				restore = append([]posym(nil), left...)
 			}
 
-			// RE-WEAPONIZE
 			s.syms = nil
 			for i := len(restore) - 1; i >= 0; i-- {
 				s.ops = append(s.ops, opMatchLiteralRev)
 				s.operands = append(s.operands, match_lit{restore[i]})
 			}
 
-			finalStem := append(append([]posym(nil), left...), g.stem...)
+			var finalStem []posym
+			if right.Symbol != symEmpty || right.len() > 0 {
+				finalStem = append(finalStem, right)
+			}
+			if targetIdx != -1 && targetIdx+1 < len(s.syms) {
+				finalStem = append(finalStem, s.syms[targetIdx+1:]...)
+			}
+			finalStem = append(finalStem, g.stem...)
 
 			origStemsCount := len(s.stems)
 			var origStemsLen int
@@ -4114,7 +4126,7 @@ func (s *symstr) opFallbackGlobGreedRev(l int) {
 
 func (s *symstr) opFallbackGlobCross(l int) {
 	g := s.operands[l-1].(*fallback_glob)
-	s.operands = s.operands[:l-1] // 1. CRITICAL: Pop immediately!
+	s.operands = s.operands[:l-1]
 
 	if g.lookahead.Symbol == symEmpty && s.tie.err != io.EOF {
 		g.lookahead = s.tie.next_lit_no_match()
@@ -4125,6 +4137,7 @@ func (s *symstr) opFallbackGlobCross(l int) {
 	if s.ensure_match_syms(opMatchLiteral) {
 		s.shatter_syms(g.lookahead.Symbol, false)
 
+		if len(s.syms) == 0 { return }
 		if s.is_wildcard(s.syms[0], opConseqAstCross) { return }
 
 		if g.lookahead.Symbol == symEmpty {
@@ -4145,7 +4158,7 @@ func (s *symstr) opFallbackGlobCross(l int) {
 			s.syms = nil
 		} else {
 			s.ops = append(s.ops, opTryFallbackGlobCross)
-			s.operands = append(s.operands, g) // Re-push strictly for checkpoint
+			s.operands = append(s.operands, g)
 			g.bt = s.checkpoint(undoBranch)
 
 			s.ops = s.ops[:len(s.ops)-1]
@@ -4161,7 +4174,6 @@ func (s *symstr) opFallbackGlobCross(l int) {
 				restore = append(restore, s.syms[targetIdx+1:]...)
 			}
 
-			// RE-WEAPONIZE
 			s.syms = nil
 			for i := len(restore) - 1; i >= 0; i-- {
 				s.ops = append(s.ops, opMatchLiteral)
@@ -4173,6 +4185,7 @@ func (s *symstr) opFallbackGlobCross(l int) {
 			origStemsCount := len(s.stems)
 			var origStemsLen int
 			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
+
 			if bidirectional_fallback_ret_literal {
 				s.nfa_emit(finalStem, origStemsCount, origStemsLen)
 			} else {
@@ -4214,7 +4227,7 @@ func (s *symstr) opFallbackGlobCross(l int) {
 
 func (s *symstr) opFallbackGlobCrossRev(l int) {
 	g := s.operands[l-1].(*fallback_glob)
-	s.operands = s.operands[:l-1] // 1. CRITICAL: Pop immediately!
+	s.operands = s.operands[:l-1]
 
 	if g.lookahead.Symbol == symEmpty && s.tie.err != io.EOF {
 		g.lookahead = s.tie.next_lit_no_match()
@@ -4225,6 +4238,7 @@ func (s *symstr) opFallbackGlobCrossRev(l int) {
 	if s.ensure_match_syms(opMatchLiteralRev) {
 		s.shatter_syms(g.lookahead.Symbol, true)
 
+		if len(s.syms) == 0 { return }
 		if s.is_wildcard(s.syms[len(s.syms)-1], opConseqAstCrossRev) { return }
 
 		if g.lookahead.Symbol == symEmpty {
@@ -4245,7 +4259,7 @@ func (s *symstr) opFallbackGlobCrossRev(l int) {
 			s.syms = nil
 		} else {
 			s.ops = append(s.ops, opTryFallbackGlobCrossRev)
-			s.operands = append(s.operands, g) // Re-push for checkpoint
+			s.operands = append(s.operands, g)
 			g.bt = s.checkpoint(undoBranch)
 
 			s.ops = s.ops[:len(s.ops)-1]
@@ -4253,23 +4267,25 @@ func (s *symstr) opFallbackGlobCrossRev(l int) {
 
 			left, right, targetIdx := __posymSeqSplitAt(s.syms, g.idx)
 
-			// REVERSE FIX: right and rest are restored, left is consumed!
 			var restore []posym
-			if right.Symbol != symEmpty || right.len() > 0 {
-				restore = append(restore, right)
-			}
-			if targetIdx != -1 && targetIdx+1 < len(s.syms) {
-				restore = append(restore, s.syms[targetIdx+1:]...)
+			if len(left) > 0 {
+				restore = append([]posym(nil), left...)
 			}
 
-			// RE-WEAPONIZE
 			s.syms = nil
 			for i := len(restore) - 1; i >= 0; i-- {
 				s.ops = append(s.ops, opMatchLiteralRev)
 				s.operands = append(s.operands, match_lit{restore[i]})
 			}
 
-			finalStem := append(append([]posym(nil), left...), g.stem...)
+			var finalStem []posym
+			if right.Symbol != symEmpty || right.len() > 0 {
+				finalStem = append(finalStem, right)
+			}
+			if targetIdx != -1 && targetIdx+1 < len(s.syms) {
+				finalStem = append(finalStem, s.syms[targetIdx+1:]...)
+			}
+			finalStem = append(finalStem, g.stem...)
 
 			origStemsCount := len(s.stems)
 			var origStemsLen int
@@ -5674,7 +5690,7 @@ func (s *symstr) opTryFallbackGlobSeg(l int) {
 	l = len(s.operands)
 
 	nextIdx := -1
-	searchStart := g.idx - 1 // Seg searches backwards
+	searchStart := g.idx - 1
 	if searchStart >= 0 {
 		if g.lookahead.Symbol != symEmpty {
 			nextIdx = __posymSeqLastIndex(s.syms, searchStart, g.lookahead.Symbol)
@@ -5684,7 +5700,6 @@ func (s *symstr) opTryFallbackGlobSeg(l int) {
 		}
 	}
 
-	// Strictly enforce Cross-Segment constraints!
 	if nextIdx != -1 {
 		slashIdx := __posymSeqIndex(s.syms, 0, symSlash)
 		if slashIdx != -1 && slashIdx < nextIdx {
@@ -5754,7 +5769,7 @@ func (s *symstr) opTryFallbackGlobSegRev(l int) {
 	for _, ps := range s.syms { totalBytes += ps.len() }
 
 	nextIdx := -1
-	searchStart := g.idx + g.lookahead.len() // SegRev searches forwards
+	searchStart := g.idx + g.lookahead.len()
 
 	if searchStart <= totalBytes {
 		if g.lookahead.Symbol != symEmpty {
@@ -5832,10 +5847,10 @@ func (s *symstr) opTryFallbackGlobGreed(l int) {
 
 	s.unwind(&g.bt)
 	s.err = nil
-	l = len(s.operands) // CRITICAL: Refresh length post-unwind!
+	l = len(s.operands)
 
 	nextIdx := -1
-	searchStart := g.idx - 1 // Greed searches backwards
+	searchStart := g.idx - 1
 	if searchStart >= 0 {
 		if g.lookahead.Symbol != symEmpty {
 			nextIdx = __posymSeqLastIndex(s.syms, searchStart, g.lookahead.Symbol)
@@ -5907,7 +5922,7 @@ func (s *symstr) opTryFallbackGlobGreedRev(l int) {
 	for _, ps := range s.syms { totalBytes += ps.len() }
 
 	nextIdx := -1
-	searchStart := g.idx + g.lookahead.len() // GreedRev searches forwards
+	searchStart := g.idx + g.lookahead.len()
 
 	if searchStart <= totalBytes {
 		if g.lookahead.Symbol != symEmpty {
@@ -5984,7 +5999,7 @@ func (s *symstr) opTryFallbackGlobCross(l int) {
 	for _, ps := range s.syms { totalBytes += ps.len() }
 
 	nextIdx := -1
-	searchStart := g.idx + g.lookahead.len() // Cross (reluctant) searches forwards
+	searchStart := g.idx + g.lookahead.len()
 
 	if searchStart <= totalBytes {
 		if g.lookahead.Symbol != symEmpty {
@@ -6054,7 +6069,7 @@ func (s *symstr) opTryFallbackGlobCrossRev(l int) {
 	l = len(s.operands)
 
 	nextIdx := -1
-	searchStart := g.idx - 1 // CrossRev searches backwards
+	searchStart := g.idx - 1
 
 	if searchStart >= 0 {
 		if g.lookahead.Symbol != symEmpty {
@@ -10787,15 +10802,11 @@ func (s *symstr) ensure_match_syms(matchOp evalop) bool {
 		}
 
 		if sym != 0 {
-			var pos Pos // NoPos
-			switch v := s.operands[len(s.operands)-1].(type) {
-			case Value:	pos = v.Pos()
-			case posym: pos = v.Pos
-			case Pos: pos = v
-			}
+			// CRITICAL FIX: Wildcard execution instructions do not push operands!
+			// Attempting to read or pop from s.operands here steals the operand 
+			// belonging to the underlying instruction, causing a TypeAssertionError.
 			s.ops = s.ops[:len(s.ops)-1]
-			s.operands = s.operands[:len(s.operands)-1]
-			s.syms = append(s.syms, posym{pos, sym})
+			s.syms = append(s.syms, posym{NoPos, sym})
 			return true
 		}
 
