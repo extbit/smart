@@ -3184,28 +3184,32 @@ func (s *symstr) do(ctx Context, op any) any { // Optional!
     return s.Context.do(ctx, op)
 }
 
-// HELPER 4: Branch Emission (Left side of split)
-func (s *symstr) nfa_emit(captured []posym, origCount, origLen int) {
-	s.stems = s.stems[:origCount]
-	if origCount > 0 {
-		p := &s.stems[origCount-1]
-		p.syms = append(p.syms[:origLen], captured...) // Optimized slice append
+// HELPER 4: Branch Capture (Left side of split)
+func (s *symstr) capture(captured []posym) {
+	if len(s.stems) > 0 {
+		p := &s.stems[len(s.stems)-1]
+		p.syms = append(p.syms, captured...) // Safely append directly to the current capture stem
 	}
-	for i := len(captured) - 1; i >= 0; i-- {
-		s.ops = append(s.ops, opPack)
-		s.operands = append(s.operands, captured[i])
+
+	if bidirectional_fallback_ret_literal {
+		for i := len(captured) - 1; i >= 0; i-- {
+			s.ops = append(s.ops, opPack)
+			s.operands = append(s.operands, captured[i])
+		}
 	}
 }
 
-func (s *symstr) nfa_emit_rev(captured []posym, origCount, origLen int) {
-	s.stems = s.stems[:origCount]
-	if origCount > 0 {
-		p := &s.stems[origCount-1]
-		p.syms = append(p.syms[:origLen], captured...) // Optimized slice append
+func (s *symstr) capture_rev(captured []posym) {
+	if len(s.stems) > 0 {
+		p := &s.stems[len(s.stems)-1]
+		p.syms = append(p.syms, captured...) // Safely append directly to the current capture stem
 	}
-	for _, ps := range captured {
-		s.ops = append(s.ops, opPackRev) // CRITICAL FIX: Push opPackRev!
-		s.operands = append(s.operands, ps)
+
+	if bidirectional_fallback_ret_literal {
+		for _, ps := range captured {
+			s.ops = append(s.ops, opPackRev)
+			s.operands = append(s.operands, ps)
+		}
 	}
 }
 
@@ -3266,6 +3270,21 @@ _ops_loop_:
 	s.syms = syms
 
 	return lit
+}
+
+type op_glob struct {
+	idx       int
+	lookahead posym
+	stem      []posym
+	bt        backtrack
+}
+
+func (g *op_glob) String() string {
+	var b compactbuilds
+	b.write("op_glob{lookahead:")
+	g.lookahead.build(&b)
+	b.write("}")
+	return b.shared()
 }
 
 // NOTE: stem enabled only if bidirectional_fallback_ret_literal
@@ -3730,26 +3749,15 @@ func (s *symstr) opFallbackGlobSeg(l int) {
 		if len(s.syms) == 0 { return }
 		if t := s.syms[0]; isWildcardMeta(t.Symbol) {
 			if symAsterisk.Rank() < t.Rank() {
-				origStemsCount := len(s.stems)
-				var origStemsLen int
-				if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-				if bidirectional_fallback_ret_literal {
-					s.nfa_emit(g.stem, origStemsCount, origStemsLen)
-				} else if origStemsCount > 0 {
-					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
-				}
+				s.capture(g.stem)
 				s.err = errMatchFailed
 				return
 			} else {
-				// Eaten wildcard compensation: ensure a capture slot exists to preserve arity
 				if len(s.stems) == 0 {
 					s.stems = append(s.stems, capture{start: -1})
 				}
 				if !bidirectional_fallback_ret_literal {
-					g.stem = nil // clear accumulated literals
-
-					// Consume the passive wildcard and immediately yield back to the VM loop.
-					// This strictly prevents the wildcard from being accumulated into finalStem.
+					g.stem = nil
 					s.syms = s.syms[1:]
 					s.ops = append(s.ops, opFallbackGlobSeg)
 					s.operands = append(s.operands, g)
@@ -3819,39 +3827,15 @@ func (s *symstr) opFallbackGlobSeg(l int) {
 			}
 
 			finalStem := append(append([]posym(nil), g.stem...), left...)
-
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			if bidirectional_fallback_ret_literal {
-				s.nfa_emit(finalStem, origStemsCount, origStemsLen)
-			} else if origStemsCount > 0 {
-				s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], finalStem...)
-			}
+			s.capture(finalStem)
 		}
 	} else {
 		if g.lookahead.Symbol == symEmpty {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			if bidirectional_fallback_ret_literal {
-				s.nfa_emit(g.stem, origStemsCount, origStemsLen)
-			} else if origStemsCount > 0 {
-				s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
-			}
+			s.capture(g.stem)
 			return
 		}
 		if len(g.stem) > 0 {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			if bidirectional_fallback_ret_literal {
-				s.nfa_emit(g.stem, origStemsCount, origStemsLen)
-			} else {
-				if origStemsCount > 0 {
-					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
-				}
-			}
+			s.capture(g.stem)
 		}
 		s.syms = g.stem
 		s.err = errMatchFailed
@@ -3874,26 +3858,15 @@ func (s *symstr) opFallbackGlobSegRev(l int) {
 		if len(s.syms) == 0 { return }
 		if t := s.syms[len(s.syms)-1]; isWildcardMeta(t.Symbol) {
 			if symAsterisk.Rank() < t.Rank() {
-				origStemsCount := len(s.stems)
-				var origStemsLen int
-				if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-				if bidirectional_fallback_ret_literal {
-					s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
-				} else if origStemsCount > 0 {
-					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
-				}
+				s.capture_rev(g.stem)
 				s.err = errMatchFailed
 				return
 			} else {
-				// Eaten wildcard compensation: ensure a capture slot exists to preserve arity
 				if len(s.stems) == 0 {
 					s.stems = append(s.stems, capture{start: -1})
 				}
 				if !bidirectional_fallback_ret_literal {
-					g.stem = nil // clear accumulated literals
-
-					// Consume the passive wildcard and immediately yield back to the VM loop.
-					// This strictly prevents the wildcard from being accumulated into finalStem.
+					g.stem = nil 
 					s.syms = s.syms[1:]
 					s.ops = append(s.ops, opFallbackGlobSegRev)
 					s.operands = append(s.operands, g)
@@ -3967,37 +3940,15 @@ func (s *symstr) opFallbackGlobSegRev(l int) {
 				finalStem = append(finalStem, s.syms[targetIdx+1:]...)
 			}
 			finalStem = append(finalStem, g.stem...)
-
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			if bidirectional_fallback_ret_literal {
-				s.nfa_emit_rev(finalStem, origStemsCount, origStemsLen)
-			} else if origStemsCount > 0 {
-				s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], finalStem...)
-			}
+			s.capture_rev(finalStem)
 		}
 	} else {
 		if g.lookahead.Symbol == symEmpty {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			if bidirectional_fallback_ret_literal {
-				s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
-			} else if origStemsCount > 0 {
-				s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
-			}
+			s.capture_rev(g.stem)
 			return
 		}
 		if len(g.stem) > 0 {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			if bidirectional_fallback_ret_literal {
-				s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
-			} else if origStemsCount > 0 {
-				s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
-			}
+			s.capture_rev(g.stem)
 		}
 		s.syms = g.stem
 		s.err = errMatchFailed
@@ -4020,14 +3971,7 @@ func (s *symstr) opFallbackGlobGreed(l int) {
 		if len(s.syms) == 0 { return }
 		if t := s.syms[0]; isWildcardMeta(t.Symbol) {
 			if symAsteriskAst.Rank() < t.Rank() {
-				origStemsCount := len(s.stems)
-				var origStemsLen int
-				if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-				if bidirectional_fallback_ret_literal {
-					s.nfa_emit(g.stem, origStemsCount, origStemsLen)
-				} else if origStemsCount > 0 {
-					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
-				}
+				s.capture(g.stem)
 				s.err = errMatchFailed
 				return
 			} else {
@@ -4089,37 +4033,15 @@ func (s *symstr) opFallbackGlobGreed(l int) {
 			}
 
 			finalStem := append(append([]posym(nil), g.stem...), left...)
-
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			if bidirectional_fallback_ret_literal {
-				s.nfa_emit(finalStem, origStemsCount, origStemsLen)
-			} else if origStemsCount > 0 {
-				s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], finalStem...)
-			}
+			s.capture(finalStem)
 		}
 	} else {
 		if g.lookahead.Symbol == symEmpty {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			if bidirectional_fallback_ret_literal {
-				s.nfa_emit(g.stem, origStemsCount, origStemsLen)
-			} else if origStemsCount > 0 {
-				s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
-			}
+			s.capture(g.stem)
 			return
 		}
 		if len(g.stem) > 0 {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			if bidirectional_fallback_ret_literal {
-				s.nfa_emit(g.stem, origStemsCount, origStemsLen)
-			} else if origStemsCount > 0 {
-				s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
-			}
+			s.capture(g.stem)
 		}
 		s.syms = g.stem
 		s.err = errMatchFailed
@@ -4142,14 +4064,7 @@ func (s *symstr) opFallbackGlobGreedRev(l int) {
 		if len(s.syms) == 0 { return }
 		if t := s.syms[len(s.syms)-1]; isWildcardMeta(t.Symbol) {
 			if symAsteriskAst.Rank() < t.Rank() {
-				origStemsCount := len(s.stems)
-				var origStemsLen int
-				if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-				if bidirectional_fallback_ret_literal {
-					s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
-				} else if origStemsCount > 0 {
-					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
-				}
+				s.capture_rev(g.stem)
 				s.err = errMatchFailed
 				return
 			} else {
@@ -4215,37 +4130,15 @@ func (s *symstr) opFallbackGlobGreedRev(l int) {
 				finalStem = append(finalStem, s.syms[targetIdx+1:]...)
 			}
 			finalStem = append(finalStem, g.stem...)
-
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			if bidirectional_fallback_ret_literal {
-				s.nfa_emit_rev(finalStem, origStemsCount, origStemsLen)
-			} else if origStemsCount > 0 {
-				s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], finalStem...)
-			}
+			s.capture_rev(finalStem)
 		}
 	} else {
 		if g.lookahead.Symbol == symEmpty {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			if bidirectional_fallback_ret_literal {
-				s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
-			} else if origStemsCount > 0 {
-				s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
-			}
+			s.capture_rev(g.stem)
 			return
 		}
 		if len(g.stem) > 0 {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			if bidirectional_fallback_ret_literal {
-				s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
-			} else if origStemsCount > 0 {
-				s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
-			}
+			s.capture_rev(g.stem)
 		}
 		s.syms = g.stem
 		s.err = errMatchFailed
@@ -4268,14 +4161,7 @@ func (s *symstr) opFallbackGlobCross(l int) {
 		if len(s.syms) == 0 { return }
 		if t := s.syms[0]; isWildcardMeta(t.Symbol) {
 			if symAsteriskQues.Rank() < t.Rank() {
-				origStemsCount := len(s.stems)
-				var origStemsLen int
-				if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-				if bidirectional_fallback_ret_literal {
-					s.nfa_emit(g.stem, origStemsCount, origStemsLen)
-				} else if origStemsCount > 0 {
-					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
-				}
+				s.capture(g.stem)
 				s.err = errMatchFailed
 				return
 			} else {
@@ -4289,7 +4175,7 @@ func (s *symstr) opFallbackGlobCross(l int) {
 					// Consume the passive wildcard and immediately yield back to the VM loop.
 					// This strictly prevents the wildcard from being accumulated into finalStem.
 					s.syms = s.syms[1:]
-					s.ops = append(s.ops, opFallbackGlobCross) // NOTE: Use the specific handler's opcode
+					s.ops = append(s.ops, opFallbackGlobCross)
 					s.operands = append(s.operands, g)
 					return
 				}
@@ -4337,37 +4223,15 @@ func (s *symstr) opFallbackGlobCross(l int) {
 			}
 
 			finalStem := append(append([]posym(nil), g.stem...), left...)
-
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			if bidirectional_fallback_ret_literal {
-				s.nfa_emit(finalStem, origStemsCount, origStemsLen)
-			} else if origStemsCount > 0 {
-				s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], finalStem...)
-			}
+			s.capture(finalStem)
 		}
 	} else {
 		if g.lookahead.Symbol == symEmpty {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			if bidirectional_fallback_ret_literal {
-				s.nfa_emit(g.stem, origStemsCount, origStemsLen)
-			} else if origStemsCount > 0 {
-				s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
-			}
+			s.capture(g.stem)
 			return
 		}
 		if len(g.stem) > 0 {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			if bidirectional_fallback_ret_literal {
-				s.nfa_emit(g.stem, origStemsCount, origStemsLen)
-			} else if origStemsCount > 0 {
-				s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
-			}
+			s.capture(g.stem)
 		}
 		s.syms = g.stem
 		s.err = errMatchFailed
@@ -4390,14 +4254,7 @@ func (s *symstr) opFallbackGlobCrossRev(l int) {
 		if len(s.syms) == 0 { return }
 		if t := s.syms[len(s.syms)-1]; isWildcardMeta(t.Symbol) {
 			if symAsteriskQues.Rank() < t.Rank() {
-				origStemsCount := len(s.stems)
-				var origStemsLen int
-				if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-				if bidirectional_fallback_ret_literal {
-					s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
-				} else if origStemsCount > 0 {
-					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
-				}
+				s.capture_rev(g.stem)
 				s.err = errMatchFailed
 				return
 			} else {
@@ -4463,37 +4320,15 @@ func (s *symstr) opFallbackGlobCrossRev(l int) {
 				finalStem = append(finalStem, s.syms[targetIdx+1:]...)
 			}
 			finalStem = append(finalStem, g.stem...)
-
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			if bidirectional_fallback_ret_literal {
-				s.nfa_emit_rev(finalStem, origStemsCount, origStemsLen)
-			} else if origStemsCount > 0 {
-				s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], finalStem...)
-			}
+			s.capture_rev(finalStem)
 		}
 	} else {
 		if g.lookahead.Symbol == symEmpty {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			if bidirectional_fallback_ret_literal {
-				s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
-			} else if origStemsCount > 0 {
-				s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
-			}
+			s.capture_rev(g.stem)
 			return
 		}
 		if len(g.stem) > 0 {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			if bidirectional_fallback_ret_literal {
-				s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
-			} else if origStemsCount > 0 {
-				s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
-			}
+			s.capture_rev(g.stem)
 		}
 		s.syms = g.stem
 		s.err = errMatchFailed
@@ -4818,40 +4653,18 @@ func (s *symstr) opConseqGlobSeg(l int) {
 	if s.tie.ensure_syms() {
 		target := s.tie.syms[0]
 		if target.Symbol == symSlash {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-
-			if len(g.stem) > 0 {
-				s.nfa_emit(g.stem, origStemsCount, origStemsLen)
-			} else {
-				if bidirectional_fallback_ret_literal {
-					s.nfa_emit(nil, origStemsCount, origStemsLen)
-				} else if origStemsCount > 0 {
-					s.stems[origStemsCount-1].syms = s.stems[origStemsCount-1].syms[:origStemsLen]
-				}
-			}
-
+			s.capture(g.stem)
 			s.operands = s.operands[:l-1]
-			s.ops = append(s.ops, opConseqGlobSeg) // CRITICAL FIX: Trap for fallback AST
+			s.ops = append(s.ops, opConseqGlobSeg)
 			s.err = errMatchFailed
 			return
 		}
 
 		if t := s.tie.syms[0]; isWildcardMeta(t.Symbol) {
 			if symAsterisk.Rank() < t.Symbol.Rank() {
-				origStemsCount := len(s.stems)
-				var origStemsLen int
-				if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-
-				if bidirectional_fallback_ret_literal {
-					s.nfa_emit(nil, origStemsCount, origStemsLen)
-				} else if origStemsCount > 0 {
-					s.stems[origStemsCount-1].syms = s.stems[origStemsCount-1].syms[:origStemsLen]
-				}
-
+				s.capture(nil)
 				s.operands = s.operands[:l-1]
-				s.ops = append(s.ops, opConseqGlobSeg) // CRITICAL FIX: Trap for fallback AST
+				s.ops = append(s.ops, opConseqGlobSeg)
 				s.err = errMatchFailed
 				return
 			} else {
@@ -4886,23 +4699,9 @@ func (s *symstr) opConseqGlobSeg(l int) {
 
 			if slashIdx != -1 {
 				s.operands = s.operands[:l-1]
-
-				origStemsCount := len(s.stems)
-				var origStemsLen int
-				if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-
-				if len(g.stem) > 0 {
-					s.nfa_emit(g.stem, origStemsCount, origStemsLen)
-				} else {
-					if bidirectional_fallback_ret_literal {
-						s.nfa_emit(nil, origStemsCount, origStemsLen)
-					} else if origStemsCount > 0 {
-						s.stems[origStemsCount-1].syms = s.stems[origStemsCount-1].syms[:origStemsLen]
-					}
-				}
-
+				s.capture(g.stem)
 				s.tie.syms = s.tie.syms[slashIdx:]
-				s.ops = append(s.ops, opConseqGlobSeg) // CRITICAL FIX: Trap for fallback AST
+				s.ops = append(s.ops, opConseqGlobSeg)
 				s.err = errMatchFailed
 			} else {
 				s.ops = append(s.ops, opConseqGlobSeg)
@@ -4928,32 +4727,22 @@ func (s *symstr) opConseqGlobSeg(l int) {
 			s.tie.syms = restore
 
 			finalStem := append(append([]posym(nil), g.stem...), left...)
-
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit(finalStem, origStemsCount, origStemsLen)
+			s.capture(finalStem)
 		}
 	} else {
 		s.operands = s.operands[:l-1]
 
 		if g.lookahead.Symbol == symEmpty {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit(g.stem, origStemsCount, origStemsLen)
+			s.capture(g.stem)
 			return
 		}
 
 		if len(g.stem) > 0 {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit(g.stem, origStemsCount, origStemsLen)
+			s.capture(g.stem)
 		}
 
 		s.tie.syms = g.stem
-		s.ops = append(s.ops, opConseqGlobSeg) // CRITICAL FIX: Trap for fallback AST
+		s.ops = append(s.ops, opConseqGlobSeg)
 		s.err = errMatchFailed
 	}
 }
@@ -4972,40 +4761,18 @@ func (s *symstr) opConseqGlobSegRev(l int) {
 	if s.tie.ensure_syms() {
 		target := s.tie.syms[len(s.tie.syms)-1]
 		if target.Symbol == symSlash {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-
-			if len(g.stem) > 0 {
-				s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
-			} else {
-				if bidirectional_fallback_ret_literal {
-					s.nfa_emit_rev(nil, origStemsCount, origStemsLen)
-				} else if origStemsCount > 0 {
-					s.stems[origStemsCount-1].syms = s.stems[origStemsCount-1].syms[:origStemsLen]
-				}
-			}
-
+			s.capture_rev(g.stem)
 			s.operands = s.operands[:l-1]
-			s.ops = append(s.ops, opConseqGlobSegRev) // CRITICAL FIX: Trap for fallback AST
+			s.ops = append(s.ops, opConseqGlobSegRev)
 			s.err = errMatchFailed
 			return
 		}
 
 		if t := s.tie.syms[len(s.tie.syms)-1]; isWildcardMeta(t.Symbol) {
 			if symAsterisk.Rank() < t.Symbol.Rank() {
-				origStemsCount := len(s.stems)
-				var origStemsLen int
-				if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-
-				if bidirectional_fallback_ret_literal {
-					s.nfa_emit_rev(nil, origStemsCount, origStemsLen)
-				} else if origStemsCount > 0 {
-					s.stems[origStemsCount-1].syms = s.stems[origStemsCount-1].syms[:origStemsLen]
-				}
-
+				s.capture_rev(nil)
 				s.operands = s.operands[:l-1]
-				s.ops = append(s.ops, opConseqGlobSegRev) // CRITICAL FIX: Trap for fallback AST
+				s.ops = append(s.ops, opConseqGlobSegRev)
 				s.err = errMatchFailed
 				return
 			} else {
@@ -5037,23 +4804,9 @@ func (s *symstr) opConseqGlobSegRev(l int) {
 
 			if slashIdx != -1 {
 				s.operands = s.operands[:l-1]
-
-				origStemsCount := len(s.stems)
-				var origStemsLen int
-				if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-
-				if len(g.stem) > 0 {
-					s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
-				} else {
-					if bidirectional_fallback_ret_literal {
-						s.nfa_emit_rev(nil, origStemsCount, origStemsLen)
-					} else if origStemsCount > 0 {
-						s.stems[origStemsCount-1].syms = s.stems[origStemsCount-1].syms[:origStemsLen]
-					}
-				}
-
+				s.capture_rev(g.stem)
 				s.tie.syms = s.tie.syms[:slashIdx+1]
-				s.ops = append(s.ops, opConseqGlobSegRev) // CRITICAL FIX: Trap for fallback AST
+				s.ops = append(s.ops, opConseqGlobSegRev)
 				s.err = errMatchFailed
 			} else {
 				s.ops = append(s.ops, opConseqGlobSegRev)
@@ -5088,49 +4841,24 @@ func (s *symstr) opConseqGlobSegRev(l int) {
 				finalStem = append(finalStem, s.tie.syms[targetIdx+1:]...)
 			}
 			finalStem = append(finalStem, g.stem...)
-
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit_rev(finalStem, origStemsCount, origStemsLen)
+			s.capture_rev(finalStem)
 		}
 	} else {
 		s.operands = s.operands[:l-1]
 
 		if g.lookahead.Symbol == symEmpty {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
+			s.capture_rev(g.stem)
 			return
 		}
 
 		if len(g.stem) > 0 {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
+			s.capture_rev(g.stem)
 		}
 
 		s.tie.syms = g.stem
-		s.ops = append(s.ops, opConseqGlobSegRev) // CRITICAL FIX: Trap for fallback AST
+		s.ops = append(s.ops, opConseqGlobSegRev)
 		s.err = errMatchFailed
 	}
-}
-
-type op_glob struct {
-	idx       int
-	lookahead posym
-	stem      []posym
-	bt        backtrack
-}
-
-func (g *op_glob) String() string {
-	var b compactbuilds
-	b.write("op_glob{lookahead:")
-	g.lookahead.build(&b)
-	b.write("}")
-	return b.shared()
 }
 
 func (s *symstr) opConseqGlobGreed(l int) {
@@ -5146,15 +4874,10 @@ func (s *symstr) opConseqGlobGreed(l int) {
 
 	if s.tie.ensure_syms() {
 		if t := s.tie.syms[0]; isWildcardMeta(t.Symbol) {
-			if symAsteriskAst.Rank() < t.Rank() {
-				origStemsCount := len(s.stems)
-				var origStemsLen int
-				if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-				if bidirectional_fallback_ret_literal {
-					s.nfa_emit(g.stem, origStemsCount, origStemsLen)
-				} else if origStemsCount > 0 {
-					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
-				}
+			if symAsteriskAst.Rank() < t.Symbol.Rank() {
+				s.capture(g.stem)
+				s.operands = s.operands[:l-1]
+				s.ops = append(s.ops, opConseqGlobGreed) // CRITICAL FIX: Trap for fallback AST
 				s.err = errMatchFailed
 				return
 			} else {
@@ -5200,31 +4923,22 @@ func (s *symstr) opConseqGlobGreed(l int) {
 			s.tie.syms = restore
 
 			finalStem := append(append([]posym(nil), g.stem...), left...)
-
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit(finalStem, origStemsCount, origStemsLen)
+			s.capture(finalStem)
 		}
 	} else {
 		s.operands = s.operands[:l-1]
 
 		if g.lookahead.Symbol == symEmpty {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit(g.stem, origStemsCount, origStemsLen)
+			s.capture(g.stem)
 			return
 		}
 
 		if len(g.stem) > 0 {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit(g.stem, origStemsCount, origStemsLen)
+			s.capture(g.stem)
 		}
 
 		s.tie.syms = g.stem
+		s.ops = append(s.ops, opConseqGlobGreed) // CRITICAL FIX: Trap for fallback AST
 		s.err = errMatchFailed
 	}
 }
@@ -5242,15 +4956,10 @@ func (s *symstr) opConseqGlobGreedRev(l int) {
 
 	if s.tie.ensure_syms() {
 		if t := s.tie.syms[len(s.tie.syms)-1]; isWildcardMeta(t.Symbol) {
-			if symAsteriskAst.Rank() < t.Rank() {
-				origStemsCount := len(s.stems)
-				var origStemsLen int
-				if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-				if bidirectional_fallback_ret_literal {
-					s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
-				} else if origStemsCount > 0 {
-					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
-				}
+			if symAsteriskAst.Rank() < t.Symbol.Rank() {
+				s.capture_rev(g.stem)
+				s.operands = s.operands[:l-1]
+				s.ops = append(s.ops, opConseqGlobGreedRev) // CRITICAL FIX: Trap for fallback AST
 				s.err = errMatchFailed
 				return
 			} else {
@@ -5296,31 +5005,22 @@ func (s *symstr) opConseqGlobGreedRev(l int) {
 				finalStem = append(finalStem, s.tie.syms[targetIdx+1:]...)
 			}
 			finalStem = append(finalStem, g.stem...)
-
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit_rev(finalStem, origStemsCount, origStemsLen)
+			s.capture_rev(finalStem)
 		}
 	} else {
 		s.operands = s.operands[:l-1]
 
 		if g.lookahead.Symbol == symEmpty {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
+			s.capture_rev(g.stem)
 			return
 		}
 
 		if len(g.stem) > 0 {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
+			s.capture_rev(g.stem)
 		}
 
 		s.tie.syms = g.stem
+		s.ops = append(s.ops, opConseqGlobGreedRev) // CRITICAL FIX: Trap for fallback AST
 		s.err = errMatchFailed
 	}
 }
@@ -5337,17 +5037,11 @@ func (s *symstr) opConseqGlobCross(l int) {
 	if s.err != nil { return }
 
 	if s.tie.ensure_syms() {
-		// Note: Corrected t.Rank() to t.Symbol.Rank() to prevent compilation errors
 		if t := s.tie.syms[0]; isWildcardMeta(t.Symbol) {
 			if symAsteriskQues.Rank() < t.Symbol.Rank() {
-				origStemsCount := len(s.stems)
-				var origStemsLen int
-				if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-				if bidirectional_fallback_ret_literal {
-					s.nfa_emit(g.stem, origStemsCount, origStemsLen)
-				} else if origStemsCount > 0 {
-					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
-				}
+				s.capture(g.stem)
+				s.operands = s.operands[:l-1]
+				s.ops = append(s.ops, opConseqGlobCross) // CRITICAL FIX: Trap for fallback AST
 				s.err = errMatchFailed
 				return
 			} else {
@@ -5391,31 +5085,22 @@ func (s *symstr) opConseqGlobCross(l int) {
 			s.tie.syms = restore
 
 			finalStem := append(append([]posym(nil), g.stem...), left...)
-
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit(finalStem, origStemsCount, origStemsLen)
+			s.capture(finalStem)
 		}
 	} else {
 		s.operands = s.operands[:l-1]
 
 		if g.lookahead.Symbol == symEmpty {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit(g.stem, origStemsCount, origStemsLen)
+			s.capture(g.stem)
 			return
 		}
 
 		if len(g.stem) > 0 {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit(g.stem, origStemsCount, origStemsLen)
+			s.capture(g.stem)
 		}
 
 		s.tie.syms = g.stem
+		s.ops = append(s.ops, opConseqGlobCross) // CRITICAL FIX: Trap for fallback AST
 		s.err = errMatchFailed
 	}
 }
@@ -5432,17 +5117,11 @@ func (s *symstr) opConseqGlobCrossRev(l int) {
 	if s.err != nil { return }
 
 	if s.tie.ensure_syms() {
-		// Note: Corrected t.Rank() to t.Symbol.Rank()
 		if t := s.tie.syms[len(s.tie.syms)-1]; isWildcardMeta(t.Symbol) {
 			if symAsteriskQues.Rank() < t.Symbol.Rank() {
-				origStemsCount := len(s.stems)
-				var origStemsLen int
-				if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-				if bidirectional_fallback_ret_literal {
-					s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
-				} else if origStemsCount > 0 {
-					s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], g.stem...)
-				}
+				s.capture_rev(g.stem)
+				s.operands = s.operands[:l-1]
+				s.ops = append(s.ops, opConseqGlobCrossRev) // CRITICAL FIX: Trap for fallback AST
 				s.err = errMatchFailed
 				return
 			} else {
@@ -5492,31 +5171,22 @@ func (s *symstr) opConseqGlobCrossRev(l int) {
 				finalStem = append(finalStem, s.tie.syms[targetIdx+1:]...)
 			}
 			finalStem = append(finalStem, g.stem...)
-
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit_rev(finalStem, origStemsCount, origStemsLen)
+			s.capture_rev(finalStem)
 		}
 	} else {
 		s.operands = s.operands[:l-1]
 
 		if g.lookahead.Symbol == symEmpty {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
+			s.capture_rev(g.stem)
 			return
 		}
 
 		if len(g.stem) > 0 {
-			origStemsCount := len(s.stems)
-			var origStemsLen int
-			if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-			s.nfa_emit_rev(g.stem, origStemsCount, origStemsLen)
+			s.capture_rev(g.stem)
 		}
 
 		s.tie.syms = g.stem
+		s.ops = append(s.ops, opConseqGlobCrossRev) // CRITICAL FIX: Trap for fallback AST
 		s.err = errMatchFailed
 	}
 }
@@ -5552,14 +5222,7 @@ func (s *symstr) opTryGlobSeg(l int) {
 			s.ops = append(s.ops, opConseqGlobSeg)
 			return
 		}
-		origStemsCount := len(s.stems)
-		var origStemsLen int
-		if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-		if bidirectional_fallback_ret_literal {
-			s.nfa_emit(nil, origStemsCount, origStemsLen)
-		} else if origStemsCount > 0 {
-			s.stems[origStemsCount-1].syms = s.stems[origStemsCount-1].syms[:origStemsLen]
-		}
+		s.capture(nil)
 		s.operands = s.operands[:l-1]
 		s.ops = append(s.ops, opConseqGlobSeg) // CRITICAL FIX: Trap for fallback AST
 		s.err = errMatchFailed
@@ -5578,11 +5241,7 @@ func (s *symstr) opTryGlobSeg(l int) {
 	s.tie.syms = restore
 
 	finalStem := append(append([]posym(nil), g.stem...), left...)
-
-	origStemsCount := len(s.stems)
-	var origStemsLen int
-	if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-	s.nfa_emit(finalStem, origStemsCount, origStemsLen)
+	s.capture(finalStem)
 }
 
 func (s *symstr) opTryGlobSegRev(l int) {
@@ -5620,14 +5279,7 @@ func (s *symstr) opTryGlobSegRev(l int) {
 			s.ops = append(s.ops, opConseqGlobSegRev)
 			return
 		}
-		origStemsCount := len(s.stems)
-		var origStemsLen int
-		if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-		if bidirectional_fallback_ret_literal {
-			s.nfa_emit_rev(nil, origStemsCount, origStemsLen)
-		} else if origStemsCount > 0 {
-			s.stems[origStemsCount-1].syms = s.stems[origStemsCount-1].syms[:origStemsLen]
-		}
+		s.capture_rev(nil)
 		s.operands = s.operands[:l-1]
 		s.ops = append(s.ops, opConseqGlobSegRev) // CRITICAL FIX: Trap for fallback AST
 		s.err = errMatchFailed
@@ -5648,11 +5300,7 @@ func (s *symstr) opTryGlobSegRev(l int) {
 	if right.Symbol != symEmpty || right.len() > 0 { finalStem = append(finalStem, right) }
 	if targetIdx != -1 && targetIdx+1 < len(s.tie.syms) { finalStem = append(finalStem, s.tie.syms[targetIdx+1:]...) }
 	finalStem = append(finalStem, g.stem...)
-
-	origStemsCount := len(s.stems)
-	var origStemsLen int
-	if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-	s.nfa_emit_rev(finalStem, origStemsCount, origStemsLen)
+	s.capture_rev(finalStem)
 }
 
 func (s *symstr) opTryGlobGreed(l int) {
@@ -5671,7 +5319,7 @@ func (s *symstr) opTryGlobGreed(l int) {
 	searchStart := g.idx - 1 // Greed searches backwards
 	if searchStart >= 0 {
 		if g.lookahead.Symbol != symEmpty {
-			nextIdx = __posymSeqLastIndex(s.syms, searchStart, g.lookahead.Symbol)
+			nextIdx = __posymSeqLastIndex(s.tie.syms, searchStart, g.lookahead.Symbol)
 		}
 		if nextIdx == -1 {
 			nextIdx = searchStart
@@ -5683,16 +5331,9 @@ func (s *symstr) opTryGlobGreed(l int) {
 			s.ops = append(s.ops, opConseqGlobGreed)
 			return
 		}
-		// Truncate stem to emit <nil>
-		origStemsCount := len(s.stems)
-		var origStemsLen int
-		if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-		if bidirectional_fallback_ret_literal {
-			s.nfa_emit(nil, origStemsCount, origStemsLen)
-		} else if origStemsCount > 0 {
-			s.stems[origStemsCount-1].syms = s.stems[origStemsCount-1].syms[:origStemsLen]
-		}
+		s.capture(nil)
 		s.operands = s.operands[:l-1]
+		s.ops = append(s.ops, opConseqGlobGreed) // CRITICAL FIX: Trap for fallback AST
 		s.err = errMatchFailed
 		return
 	}
@@ -5702,35 +5343,20 @@ func (s *symstr) opTryGlobGreed(l int) {
 
 	s.operands = s.operands[:l-1]
 
-	left, right, targetIdx := __posymSeqSplitAt(s.syms, nextIdx)
+	left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, nextIdx)
 
 	var restore []posym
 	if right.Symbol != symEmpty || right.len() > 0 {
 		restore = append(restore, right)
 	}
-	if targetIdx != -1 && targetIdx+1 < len(s.syms) {
-		restore = append(restore, s.syms[targetIdx+1:]...)
+	if targetIdx != -1 && targetIdx+1 < len(s.tie.syms) {
+		restore = append(restore, s.tie.syms[targetIdx+1:]...)
 	}
 
-	s.syms = nil
-	for i := len(restore) - 1; i >= 0; i-- {
-		s.ops = append(s.ops, opMatchLiteral)
-		s.operands = append(s.operands, match_lit{restore[i]})
-	}
+	s.tie.syms = restore
 
 	finalStem := append(append([]posym(nil), g.stem...), left...)
-
-	origStemsCount := len(s.stems)
-	var origStemsLen int
-	if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-
-	if bidirectional_fallback_ret_literal {
-		s.nfa_emit(finalStem, origStemsCount, origStemsLen)
-	} else {
-		if origStemsCount > 0 {
-			s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], finalStem...)
-		}
-	}
+	s.capture(finalStem)
 }
 
 func (s *symstr) opTryGlobGreedRev(l int) {
@@ -5746,14 +5372,14 @@ func (s *symstr) opTryGlobGreedRev(l int) {
 	l = len(s.operands)
 
 	var totalBytes int
-	for _, ps := range s.syms { totalBytes += ps.len() }
+	for _, ps := range s.tie.syms { totalBytes += ps.len() }
 
 	nextIdx := -1
 	searchStart := g.idx + g.lookahead.len() // GreedRev searches forwards
 
 	if searchStart <= totalBytes {
 		if g.lookahead.Symbol != symEmpty {
-			nextIdx = __posymSeqIndex(s.syms, searchStart, g.lookahead.Symbol)
+			nextIdx = __posymSeqIndex(s.tie.syms, searchStart, g.lookahead.Symbol)
 		}
 		if nextIdx == -1 {
 			nextIdx = searchStart
@@ -5765,16 +5391,9 @@ func (s *symstr) opTryGlobGreedRev(l int) {
 			s.ops = append(s.ops, opConseqGlobGreedRev)
 			return
 		}
-		// Truncate stem to emit <nil>
-		origStemsCount := len(s.stems)
-		var origStemsLen int
-		if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-		if bidirectional_fallback_ret_literal {
-			s.nfa_emit_rev(nil, origStemsCount, origStemsLen)
-		} else if origStemsCount > 0 {
-			s.stems[origStemsCount-1].syms = s.stems[origStemsCount-1].syms[:origStemsLen]
-		}
+		s.capture_rev(nil)
 		s.operands = s.operands[:l-1]
+		s.ops = append(s.ops, opConseqGlobGreedRev) // CRITICAL FIX: Trap for fallback AST
 		s.err = errMatchFailed
 		return
 	}
@@ -5784,39 +5403,24 @@ func (s *symstr) opTryGlobGreedRev(l int) {
 
 	s.operands = s.operands[:l-1]
 
-	left, right, targetIdx := __posymSeqSplitAt(s.syms, nextIdx)
+	left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, nextIdx)
 
 	var restore []posym
 	if len(left) > 0 {
 		restore = append([]posym(nil), left...)
 	}
 
-	s.syms = nil
-	for i := len(restore) - 1; i >= 0; i-- {
-		s.ops = append(s.ops, opMatchLiteralRev)
-		s.operands = append(s.operands, match_lit{restore[i]})
-	}
+	s.tie.syms = restore
 
 	var finalStem []posym
 	if right.Symbol != symEmpty || right.len() > 0 {
 		finalStem = append(finalStem, right)
 	}
-	if targetIdx != -1 && targetIdx+1 < len(s.syms) {
-		finalStem = append(finalStem, s.syms[targetIdx+1:]...)
+	if targetIdx != -1 && targetIdx+1 < len(s.tie.syms) {
+		finalStem = append(finalStem, s.tie.syms[targetIdx+1:]...)
 	}
 	finalStem = append(finalStem, g.stem...)
-
-	origStemsCount := len(s.stems)
-	var origStemsLen int
-	if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-
-	if bidirectional_fallback_ret_literal {
-		s.nfa_emit_rev(finalStem, origStemsCount, origStemsLen)
-	} else {
-		if origStemsCount > 0 {
-			s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], finalStem...)
-		}
-	}
+	s.capture_rev(finalStem)
 }
 
 func (s *symstr) opTryGlobCross(l int) {
@@ -5832,14 +5436,14 @@ func (s *symstr) opTryGlobCross(l int) {
 	l = len(s.operands)
 
 	var totalBytes int
-	for _, ps := range s.syms { totalBytes += ps.len() }
+	for _, ps := range s.tie.syms { totalBytes += ps.len() }
 
 	nextIdx := -1
 	searchStart := g.idx + g.lookahead.len() // Cross (reluctant) searches forwards
 
 	if searchStart <= totalBytes {
 		if g.lookahead.Symbol != symEmpty {
-			nextIdx = __posymSeqIndex(s.syms, searchStart, g.lookahead.Symbol)
+			nextIdx = __posymSeqIndex(s.tie.syms, searchStart, g.lookahead.Symbol)
 		}
 		if nextIdx == -1 {
 			nextIdx = searchStart
@@ -5851,16 +5455,9 @@ func (s *symstr) opTryGlobCross(l int) {
 			s.ops = append(s.ops, opConseqGlobCross)
 			return
 		}
-		// Truncate stem to emit <nil>
-		origStemsCount := len(s.stems)
-		var origStemsLen int
-		if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-		if bidirectional_fallback_ret_literal {
-			s.nfa_emit(nil, origStemsCount, origStemsLen)
-		} else if origStemsCount > 0 {
-			s.stems[origStemsCount-1].syms = s.stems[origStemsCount-1].syms[:origStemsLen]
-		}
+		s.capture(nil)
 		s.operands = s.operands[:l-1]
+		s.ops = append(s.ops, opConseqGlobCross) // CRITICAL FIX: Trap for fallback AST
 		s.err = errMatchFailed
 		return
 	}
@@ -5870,35 +5467,20 @@ func (s *symstr) opTryGlobCross(l int) {
 
 	s.operands = s.operands[:l-1]
 
-	left, right, targetIdx := __posymSeqSplitAt(s.syms, nextIdx)
+	left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, nextIdx)
 
 	var restore []posym
 	if right.Symbol != symEmpty || right.len() > 0 {
 		restore = append(restore, right)
 	}
-	if targetIdx != -1 && targetIdx+1 < len(s.syms) {
-		restore = append(restore, s.syms[targetIdx+1:]...)
+	if targetIdx != -1 && targetIdx+1 < len(s.tie.syms) {
+		restore = append(restore, s.tie.syms[targetIdx+1:]...)
 	}
 
-	s.syms = nil
-	for i := len(restore) - 1; i >= 0; i-- {
-		s.ops = append(s.ops, opMatchLiteral)
-		s.operands = append(s.operands, match_lit{restore[i]})
-	}
+	s.tie.syms = restore
 
 	finalStem := append(append([]posym(nil), g.stem...), left...)
-
-	origStemsCount := len(s.stems)
-	var origStemsLen int
-	if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-
-	if bidirectional_fallback_ret_literal {
-		s.nfa_emit(finalStem, origStemsCount, origStemsLen)
-	} else {
-		if origStemsCount > 0 {
-			s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], finalStem...)
-		}
-	}
+	s.capture(finalStem)
 }
 
 func (s *symstr) opTryGlobCrossRev(l int) {
@@ -5918,7 +5500,7 @@ func (s *symstr) opTryGlobCrossRev(l int) {
 
 	if searchStart >= 0 {
 		if g.lookahead.Symbol != symEmpty {
-			nextIdx = __posymSeqLastIndex(s.syms, searchStart, g.lookahead.Symbol)
+			nextIdx = __posymSeqLastIndex(s.tie.syms, searchStart, g.lookahead.Symbol)
 		}
 		if nextIdx == -1 {
 			nextIdx = searchStart
@@ -5930,16 +5512,9 @@ func (s *symstr) opTryGlobCrossRev(l int) {
 			s.ops = append(s.ops, opConseqGlobCrossRev)
 			return
 		}
-		// Truncate stem to emit <nil>
-		origStemsCount := len(s.stems)
-		var origStemsLen int
-		if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-		if bidirectional_fallback_ret_literal {
-			s.nfa_emit_rev(nil, origStemsCount, origStemsLen)
-		} else if origStemsCount > 0 {
-			s.stems[origStemsCount-1].syms = s.stems[origStemsCount-1].syms[:origStemsLen]
-		}
+		s.capture_rev(nil)
 		s.operands = s.operands[:l-1]
+		s.ops = append(s.ops, opConseqGlobCrossRev) // CRITICAL FIX: Trap for fallback AST
 		s.err = errMatchFailed
 		return
 	}
@@ -5949,39 +5524,24 @@ func (s *symstr) opTryGlobCrossRev(l int) {
 
 	s.operands = s.operands[:l-1]
 
-	left, right, targetIdx := __posymSeqSplitAt(s.syms, nextIdx)
+	left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, nextIdx)
 
 	var restore []posym
 	if len(left) > 0 {
 		restore = append([]posym(nil), left...)
 	}
 
-	s.syms = nil
-	for i := len(restore) - 1; i >= 0; i-- {
-		s.ops = append(s.ops, opMatchLiteralRev)
-		s.operands = append(s.operands, match_lit{restore[i]})
-	}
+	s.tie.syms = restore
 
 	var finalStem []posym
 	if right.Symbol != symEmpty || right.len() > 0 {
 		finalStem = append(finalStem, right)
 	}
-	if targetIdx != -1 && targetIdx+1 < len(s.syms) {
-		finalStem = append(finalStem, s.syms[targetIdx+1:]...)
+	if targetIdx != -1 && targetIdx+1 < len(s.tie.syms) {
+		finalStem = append(finalStem, s.tie.syms[targetIdx+1:]...)
 	}
 	finalStem = append(finalStem, g.stem...)
-
-	origStemsCount := len(s.stems)
-	var origStemsLen int
-	if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-
-	if bidirectional_fallback_ret_literal {
-		s.nfa_emit_rev(finalStem, origStemsCount, origStemsLen)
-	} else {
-		if origStemsCount > 0 {
-			s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], finalStem...)
-		}
-	}
+	s.capture_rev(finalStem)
 }
 
 func (s *symstr) opTryFallbackGlobSeg(l int) {
@@ -6000,6 +5560,7 @@ func (s *symstr) opTryFallbackGlobSeg(l int) {
 	searchStart := g.idx - 1
 	if searchStart >= 0 {
 		if g.lookahead.Symbol != symEmpty {
+			// CRITICAL: Fallback must search s.syms!
 			nextIdx = __posymSeqLastIndex(s.syms, searchStart, g.lookahead.Symbol)
 		}
 		if nextIdx == -1 {
@@ -6019,16 +5580,9 @@ func (s *symstr) opTryFallbackGlobSeg(l int) {
 			s.ops = append(s.ops, opConseqGlobSeg)
 			return
 		}
-		// Truncate stem to emit <nil>
-		origStemsCount := len(s.stems)
-		var origStemsLen int
-		if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-		if bidirectional_fallback_ret_literal {
-			s.nfa_emit(nil, origStemsCount, origStemsLen)
-		} else if origStemsCount > 0 {
-			s.stems[origStemsCount-1].syms = s.stems[origStemsCount-1].syms[:origStemsLen]
-		}
+		s.capture(nil)
 		s.operands = s.operands[:l-1]
+		s.ops = append(s.ops, opFallbackGlobSeg) // CRITICAL FIX: Trap for fallback AST
 		s.err = errMatchFailed
 		return
 	}
@@ -6055,18 +5609,7 @@ func (s *symstr) opTryFallbackGlobSeg(l int) {
 	}
 
 	finalStem := append(append([]posym(nil), g.stem...), left...)
-
-	origStemsCount := len(s.stems)
-	var origStemsLen int
-	if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-
-	if bidirectional_fallback_ret_literal {
-		s.nfa_emit(finalStem, origStemsCount, origStemsLen)
-	} else {
-		if origStemsCount > 0 {
-			s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], finalStem...)
-		}
-	}
+	s.capture(finalStem)
 }
 
 func (s *symstr) opTryFallbackGlobSegRev(l int) {
@@ -6107,16 +5650,10 @@ func (s *symstr) opTryFallbackGlobSegRev(l int) {
 		if s.tie.ensure_syms() {
 			s.ops = append(s.ops, opConseqGlobSegRev)
 			return
-		}// Truncate stem to emit <nil>
-		origStemsCount := len(s.stems)
-		var origStemsLen int
-		if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-		if bidirectional_fallback_ret_literal {
-			s.nfa_emit(nil, origStemsCount, origStemsLen)
-		} else if origStemsCount > 0 {
-			s.stems[origStemsCount-1].syms = s.stems[origStemsCount-1].syms[:origStemsLen]
 		}
+		s.capture_rev(nil)
 		s.operands = s.operands[:l-1]
+		s.ops = append(s.ops, opFallbackGlobSegRev) // CRITICAL FIX: Trap for fallback AST
 		s.err = errMatchFailed
 		return
 	}
@@ -6147,18 +5684,7 @@ func (s *symstr) opTryFallbackGlobSegRev(l int) {
 		finalStem = append(finalStem, s.syms[targetIdx+1:]...)
 	}
 	finalStem = append(finalStem, g.stem...)
-
-	origStemsCount := len(s.stems)
-	var origStemsLen int
-	if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-
-	if bidirectional_fallback_ret_literal {
-		s.nfa_emit_rev(finalStem, origStemsCount, origStemsLen)
-	} else {
-		if origStemsCount > 0 {
-			s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], finalStem...)
-		}
-	}
+	s.capture_rev(finalStem)
 }
 
 func (s *symstr) opTryFallbackGlobGreed(l int) {
@@ -6189,16 +5715,9 @@ func (s *symstr) opTryFallbackGlobGreed(l int) {
 			s.ops = append(s.ops, opConseqGlobGreed)
 			return
 		}
-		// Truncate stem to emit <nil>
-		origStemsCount := len(s.stems)
-		var origStemsLen int
-		if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-		if bidirectional_fallback_ret_literal {
-			s.nfa_emit(nil, origStemsCount, origStemsLen)
-		} else if origStemsCount > 0 {
-			s.stems[origStemsCount-1].syms = s.stems[origStemsCount-1].syms[:origStemsLen]
-		}
+		s.capture(nil)
 		s.operands = s.operands[:l-1]
+		s.ops = append(s.ops, opFallbackGlobGreed) // CRITICAL FIX: Trap for fallback AST
 		s.err = errMatchFailed
 		return
 	}
@@ -6225,18 +5744,7 @@ func (s *symstr) opTryFallbackGlobGreed(l int) {
 	}
 
 	finalStem := append(append([]posym(nil), g.stem...), left...)
-
-	origStemsCount := len(s.stems)
-	var origStemsLen int
-	if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-
-	if bidirectional_fallback_ret_literal {
-		s.nfa_emit(finalStem, origStemsCount, origStemsLen)
-	} else {
-		if origStemsCount > 0 {
-			s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], finalStem...)
-		}
-	}
+	s.capture(finalStem)
 }
 
 func (s *symstr) opTryFallbackGlobGreedRev(l int) {
@@ -6271,16 +5779,9 @@ func (s *symstr) opTryFallbackGlobGreedRev(l int) {
 			s.ops = append(s.ops, opConseqGlobGreedRev)
 			return
 		}
-		// Truncate stem to emit <nil>
-		origStemsCount := len(s.stems)
-		var origStemsLen int
-		if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-		if bidirectional_fallback_ret_literal {
-			s.nfa_emit(nil, origStemsCount, origStemsLen)
-		} else if origStemsCount > 0 {
-			s.stems[origStemsCount-1].syms = s.stems[origStemsCount-1].syms[:origStemsLen]
-		}
+		s.capture_rev(nil)
 		s.operands = s.operands[:l-1]
+		s.ops = append(s.ops, opFallbackGlobGreedRev) // CRITICAL FIX: Trap for fallback AST
 		s.err = errMatchFailed
 		return
 	}
@@ -6311,18 +5812,7 @@ func (s *symstr) opTryFallbackGlobGreedRev(l int) {
 		finalStem = append(finalStem, s.syms[targetIdx+1:]...)
 	}
 	finalStem = append(finalStem, g.stem...)
-
-	origStemsCount := len(s.stems)
-	var origStemsLen int
-	if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-
-	if bidirectional_fallback_ret_literal {
-		s.nfa_emit_rev(finalStem, origStemsCount, origStemsLen)
-	} else {
-		if origStemsCount > 0 {
-			s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], finalStem...)
-		}
-	}
+	s.capture_rev(finalStem)
 }
 
 func (s *symstr) opTryFallbackGlobCross(l int) {
@@ -6357,16 +5847,9 @@ func (s *symstr) opTryFallbackGlobCross(l int) {
 			s.ops = append(s.ops, opConseqGlobCross)
 			return
 		}
-		// Truncate stem to emit <nil>
-		origStemsCount := len(s.stems)
-		var origStemsLen int
-		if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-		if bidirectional_fallback_ret_literal {
-			s.nfa_emit(nil, origStemsCount, origStemsLen)
-		} else if origStemsCount > 0 {
-			s.stems[origStemsCount-1].syms = s.stems[origStemsCount-1].syms[:origStemsLen]
-		}
+		s.capture(nil)
 		s.operands = s.operands[:l-1]
+		s.ops = append(s.ops, opFallbackGlobCross) // CRITICAL FIX: Trap for fallback AST
 		s.err = errMatchFailed
 		return
 	}
@@ -6393,18 +5876,7 @@ func (s *symstr) opTryFallbackGlobCross(l int) {
 	}
 
 	finalStem := append(append([]posym(nil), g.stem...), left...)
-
-	origStemsCount := len(s.stems)
-	var origStemsLen int
-	if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-
-	if bidirectional_fallback_ret_literal {
-		s.nfa_emit(finalStem, origStemsCount, origStemsLen)
-	} else {
-		if origStemsCount > 0 {
-			s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], finalStem...)
-		}
-	}
+	s.capture(finalStem)
 }
 
 func (s *symstr) opTryFallbackGlobCrossRev(l int) {
@@ -6436,16 +5908,9 @@ func (s *symstr) opTryFallbackGlobCrossRev(l int) {
 			s.ops = append(s.ops, opConseqGlobCrossRev)
 			return
 		}
-		// Truncate stem to emit <nil>
-		origStemsCount := len(s.stems)
-		var origStemsLen int
-		if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-		if bidirectional_fallback_ret_literal {
-			s.nfa_emit(nil, origStemsCount, origStemsLen)
-		} else if origStemsCount > 0 {
-			s.stems[origStemsCount-1].syms = s.stems[origStemsCount-1].syms[:origStemsLen]
-		}
+		s.capture_rev(nil)
 		s.operands = s.operands[:l-1]
+		s.ops = append(s.ops, opFallbackGlobCrossRev) // CRITICAL FIX: Trap for fallback AST
 		s.err = errMatchFailed
 		return
 	}
@@ -6476,18 +5941,7 @@ func (s *symstr) opTryFallbackGlobCrossRev(l int) {
 		finalStem = append(finalStem, s.syms[targetIdx+1:]...)
 	}
 	finalStem = append(finalStem, g.stem...)
-
-	origStemsCount := len(s.stems)
-	var origStemsLen int
-	if origStemsCount > 0 { origStemsLen = len(s.stems[origStemsCount-1].syms) }
-
-	if bidirectional_fallback_ret_literal {
-		s.nfa_emit_rev(finalStem, origStemsCount, origStemsLen)
-	} else {
-		if origStemsCount > 0 {
-			s.stems[origStemsCount-1].syms = append(s.stems[origStemsCount-1].syms[:origStemsLen], finalStem...)
-		}
-	}
+	s.capture_rev(finalStem)
 }
 
 func (s *symstr) opRegexMatch(l int) {
