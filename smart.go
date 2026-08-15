@@ -3049,6 +3049,108 @@ const (
 	opLocPack                         // 82 - Annotates packed buffer elements with location metadata
 )
 
+var evalopNames = [...]string{
+	// 1. MISC
+	"opEnd",
+	"opUnwind",
+	"opDebug",
+	"opRestoreContext",
+	"opSwap",
+	"opCons",
+	"opCompact",
+	"opValidate",
+	"opCompactValid",
+
+	// 2. EVALUATOR
+	"opEval",
+	"opEvalRev",
+	"opEvoke",
+	"opEvokeRet",
+	"opResolve",
+	"opExpandArgs",
+	"opExpandArgsRev",
+	"opSelect",
+	"opEase",
+	"opMerge",
+	"opModify",
+	"opPathStr",
+	"opFullname",
+	"opCompound",
+	"opQualword",
+	"opGlobbrace",
+	"opPath",
+	"opConjunct",
+	"opDisjunct",
+	"opNegate",
+	"opFlag",
+	"opPair",
+	"opRule",
+	"opCompose",
+
+	// 3. SYMBOLIZE
+	"opUnroll",
+	"opUnrollRev",
+	"opUnrollMatch",
+	"opUnrollMatchRev",
+	"opMatchLiteral",
+	"opMatchLiteralRev",
+	"opRegexMatch",
+	"opRegexMatchRev",
+	"opRegexCon",
+	"opFallbackGlobSeg",
+	"opFallbackGlobSegRev",
+	"opFallbackGlobGreed",
+	"opFallbackGlobGreedRev",
+	"opFallbackGlobCross",
+	"opFallbackGlobCrossRev",
+	"opGlobQues",
+	"opGlobQuesRev",
+	"opGlobRange",
+	"opGlobRangeRev",
+	"opGlobSeg",
+	"opGlobSegRev",
+	"opGlobGreed",
+	"opGlobGreedRev",
+	"opGlobCross",
+	"opGlobCrossRev",
+	"opTryGlobSeg",
+	"opTryGlobSegRev",
+	"opTryGlobGreed",
+	"opTryGlobGreedRev",
+	"opTryGlobCross",
+	"opTryGlobCrossRev",
+	"opTryFallbackGlobSeg",
+	"opTryFallbackGlobSegRev",
+	"opTryFallbackGlobGreed",
+	"opTryFallbackGlobGreedRev",
+	"opTryFallbackGlobCross",
+	"opTryFallbackGlobCrossRev",
+	"opConseqGlobSeg",
+	"opConseqGlobSegRev",
+	"opConseqGlobGreed",
+	"opConseqGlobGreedRev",
+	"opConseqGlobCross",
+	"opConseqGlobCrossRev",
+
+	// 4. STRUCTURALIZE
+	"opUnrollPack",
+	"opUnrollPackRev",
+	"opPack",
+	"opPackRev",
+	"opReduce",
+	"opReduceRev",
+	"opLocPack",
+}
+
+// String implements the fmt.Stringer interface for evalop,
+// providing human-readable debug output for the VM stack.
+func (op evalop) String() string {
+	if op >= 0 && int(op) < len(evalopNames) {
+		return evalopNames[op]
+	}
+	return "evalop(" + strconv.Itoa(int(op)) + ")"
+}
+
 const (
 	clsMatcher = 1 << iota
 	clsPacker
@@ -3081,6 +3183,7 @@ type Pos int
 
 // posym is the tuple of Pos and Symbol to help simplify VM implementation.
 type posym struct { Pos; Symbol }
+func (ps posym) String() string { return ps.Symbol.String() }
 
 // NoPos indicates an invalid or uninitialized position.
 const NoPos Pos = 0
@@ -3092,6 +3195,21 @@ type capture struct {
 	end   int
 	name  posym
 	syms  []posym
+}
+
+func (c capture) String() string {
+	var b compactbuilds
+	b.write("capture{")
+	if c.name.Symbol != symEmpty {
+		c.name.build(&b)
+		b.write(":")
+	}
+	for i, sym := range c.syms {
+		if i > 0 { b.write(" ") }
+		sym.build(&b)
+	}
+	b.write("}")
+	return b.shared()
 }
 
 type vmstr Symbol //string
@@ -3305,6 +3423,13 @@ func (g *op_glob) String() string {
 	var b compactbuilds
 	b.write("op_glob{lookahead:")
 	g.lookahead.build(&b)
+	if len(g.stem) > 0 {
+		b.write(",stems:")
+		for i, stem := range g.stem {
+			if i > 0 { b.write(" ") }
+			stem.build(&b)
+		}
+	}
 	b.write("}")
 	return b.shared()
 }
@@ -3314,8 +3439,15 @@ type fallback_glob struct { op_glob }
 
 func (f *fallback_glob) String() string {
 	var b compactbuilds
-	b.write("fallback_glob{")
+	b.write("fallback_glob{lookahead:")
 	f.lookahead.build(&b)
+	if len(f.stem) > 0 {
+		b.write(",stems:")
+		for i, stem := range f.stem {
+			if i > 0 { b.write(" ") }
+			stem.build(&b)
+		}
+	}
 	b.write("}")
 	return b.shared()
 }
@@ -4661,7 +4793,7 @@ func (s *symstr) opConseqGlobSeg(l int) {
 		if target.Symbol == symSlash {
 			s.operands = s.operands[:l-1]
 			if len(g.stem) > 0 {
-				s.capture(g.stem) // Clean yield to allow subsequent instructions to execute/fail natively
+				s.capture(g.stem)
 			} else {
 				s.capture(nil)
 				s.err = errMatchFailed
@@ -4754,7 +4886,7 @@ func (s *symstr) opConseqGlobSeg(l int) {
 
 		if len(g.stem) > 0 {
 			s.capture(g.stem)
-			return // Clean yield
+			return
 		}
 
 		s.tie.syms = g.stem
@@ -5252,7 +5384,6 @@ func (s *symstr) opTryGlobSeg(l int) {
 		}
 		s.operands = s.operands[:l-1]
 		s.capture(nil)
-		s.ops = append(s.ops, opConseqGlobSeg)
 		s.err = errMatchFailed
 		return
 	}
@@ -5309,7 +5440,6 @@ func (s *symstr) opTryGlobSegRev(l int) {
 		}
 		s.operands = s.operands[:l-1]
 		s.capture_rev(nil)
-		s.ops = append(s.ops, opConseqGlobSegRev)
 		s.err = errMatchFailed
 		return
 	}
@@ -5361,7 +5491,6 @@ func (s *symstr) opTryGlobGreed(l int) {
 		}
 		s.operands = s.operands[:l-1]
 		s.capture(nil)
-		s.ops = append(s.ops, opConseqGlobGreed)
 		s.err = errMatchFailed
 		return
 	}
@@ -5420,7 +5549,6 @@ func (s *symstr) opTryGlobGreedRev(l int) {
 		}
 		s.operands = s.operands[:l-1]
 		s.capture_rev(nil)
-		s.ops = append(s.ops, opConseqGlobGreedRev)
 		s.err = errMatchFailed
 		return
 	}
@@ -5483,7 +5611,6 @@ func (s *symstr) opTryGlobCross(l int) {
 		}
 		s.operands = s.operands[:l-1]
 		s.capture(nil)
-		s.ops = append(s.ops, opConseqGlobCross)
 		s.err = errMatchFailed
 		return
 	}
@@ -5539,7 +5666,6 @@ func (s *symstr) opTryGlobCrossRev(l int) {
 		}
 		s.operands = s.operands[:l-1]
 		s.capture_rev(nil)
-		s.ops = append(s.ops, opConseqGlobCrossRev)
 		s.err = errMatchFailed
 		return
 	}
@@ -9629,7 +9755,7 @@ var d_step bool
 
 func (s *symstr) step() {
 	if checkpoints && d_step {
-		debug(s, "pc=%v %v %v %v, syms=%v stems=%v", s.opsDone, s.ops, s.operands, s.results, s.syms, s.stems) }
+		debug(s, "pc=%v stack={%v %v %v}, syms=%v stems=%v", s.opsDone, s.ops, s.operands, s.results, s.syms, s.stems) }
 
 	op := s.ops[len(s.ops)-1]
 	s.ops = s.ops[:len(s.ops)-1]
@@ -11673,12 +11799,12 @@ func match(ctx Context, pattern, target Value) (matched bool, res, rem Value, st
 
 	if checkpoints {
 		switch sf("%v %v", pattern, target) {
+		// case "":
 		// case "foo/bar/xx/yy/zz.h *.h", "*.h foo/bar/xx/yy/zz.h":
 		// case "foo/bar/xx/yy/zz.h **.h", "**.h foo/bar/xx/yy/zz.h":
 		// case "foo/bar/v?.h *?.h", "*?.h foo/bar/v?.h":
 		// case "{glob *.c} foo/bar.c":
-		// case "foo/b*?y foo/bar/x/y/xx/yy":
-		case "":
+		case "foo/b*?y foo/bar/x/y/xx/yy":
 			debug(ctx, "match: %v %v", pattern, target)
 			d_step = true; defer func() { d_step = false } ()
 		}
