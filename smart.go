@@ -3710,7 +3710,7 @@ func (s *symstr) ensure_fallback_match_syms(matchOp evalop) bool {
 			// instead of forming a wildcard-cycle!
 			s.ops = s.ops[:len(s.ops)-1]
 			s.syms = append(s.syms, posym{/* FIXME: s.vpos lost for wildcard ops */NoPos, sym})
-			debug(s, "wildcard: %v %d - %d %d %d", s.syms, sym.Rank(), symAsterisk.Rank(), symAsteriskQues.Rank(), symAsteriskAst.Rank(), callstack{num:2})
+			if false { debug(s, "wildcard: %v %d - %d %d %d", s.syms, sym.Rank(), symAsterisk.Rank(), symAsteriskQues.Rank(), symAsteriskAst.Rank(), callstack{num:2}) }
 			return true
 		}
 
@@ -4659,19 +4659,25 @@ func (s *symstr) opConseqGlobSeg(l int) {
 	if s.tie.ensure_syms() {
 		target := s.tie.syms[0]
 		if target.Symbol == symSlash {
-			s.capture(g.stem)
 			s.operands = s.operands[:l-1]
-			s.ops = append(s.ops, opConseqGlobSeg)
-			s.err = errMatchFailed
+			if len(g.stem) > 0 {
+				s.capture(g.stem) // Clean yield to allow subsequent instructions to execute/fail natively
+			} else {
+				s.capture(nil)
+				s.err = errMatchFailed
+			}
 			return
 		}
 
 		if t := s.tie.syms[0]; isWildcardMeta(t.Symbol) {
 			if symAsterisk.Rank() < t.Symbol.Rank() {
-				s.capture(nil)
 				s.operands = s.operands[:l-1]
-				s.ops = append(s.ops, opConseqGlobSeg)
-				s.err = errMatchFailed
+				if len(g.stem) > 0 {
+					s.capture(g.stem)
+				} else {
+					s.capture(nil)
+					s.err = errMatchFailed
+				}
 				return
 			} else {
 				if len(s.stems) == 0 {
@@ -4705,10 +4711,13 @@ func (s *symstr) opConseqGlobSeg(l int) {
 
 			if slashIdx != -1 {
 				s.operands = s.operands[:l-1]
-				s.capture(g.stem)
+				if len(g.stem) > 0 {
+					s.capture(g.stem)
+				} else {
+					s.capture(nil)
+					s.err = errMatchFailed
+				}
 				s.tie.syms = s.tie.syms[slashIdx:]
-				s.ops = append(s.ops, opConseqGlobSeg)
-				s.err = errMatchFailed
 			} else {
 				s.ops = append(s.ops, opConseqGlobSeg)
 				s.tie.syms = nil
@@ -4719,7 +4728,7 @@ func (s *symstr) opConseqGlobSeg(l int) {
 			g.bt = s.checkpoint(undoBranch)
 
 			s.ops = s.ops[:len(s.ops)-1]
-			s.operands = s.operands[:len(s.operands)-1]
+			s.operands = s.operands[:l-1]
 
 			left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, g.idx)
 
@@ -4745,10 +4754,10 @@ func (s *symstr) opConseqGlobSeg(l int) {
 
 		if len(g.stem) > 0 {
 			s.capture(g.stem)
+			return // Clean yield
 		}
 
 		s.tie.syms = g.stem
-		s.ops = append(s.ops, opConseqGlobSeg)
 		s.err = errMatchFailed
 	}
 }
@@ -4767,19 +4776,25 @@ func (s *symstr) opConseqGlobSegRev(l int) {
 	if s.tie.ensure_syms() {
 		target := s.tie.syms[len(s.tie.syms)-1]
 		if target.Symbol == symSlash {
-			s.capture_rev(g.stem)
 			s.operands = s.operands[:l-1]
-			s.ops = append(s.ops, opConseqGlobSegRev)
-			s.err = errMatchFailed
+			if len(g.stem) > 0 {
+				s.capture_rev(g.stem)
+			} else {
+				s.capture_rev(nil)
+				s.err = errMatchFailed
+			}
 			return
 		}
 
 		if t := s.tie.syms[len(s.tie.syms)-1]; isWildcardMeta(t.Symbol) {
 			if symAsterisk.Rank() < t.Symbol.Rank() {
-				s.capture_rev(nil)
 				s.operands = s.operands[:l-1]
-				s.ops = append(s.ops, opConseqGlobSegRev)
-				s.err = errMatchFailed
+				if len(g.stem) > 0 {
+					s.capture_rev(g.stem)
+				} else {
+					s.capture_rev(nil)
+					s.err = errMatchFailed
+				}
 				return
 			} else {
 				if len(s.stems) == 0 {
@@ -4810,10 +4825,13 @@ func (s *symstr) opConseqGlobSegRev(l int) {
 
 			if slashIdx != -1 {
 				s.operands = s.operands[:l-1]
-				s.capture_rev(g.stem)
+				if len(g.stem) > 0 {
+					s.capture_rev(g.stem)
+				} else {
+					s.capture_rev(nil)
+					s.err = errMatchFailed
+				}
 				s.tie.syms = s.tie.syms[:slashIdx+1]
-				s.ops = append(s.ops, opConseqGlobSegRev)
-				s.err = errMatchFailed
 			} else {
 				s.ops = append(s.ops, opConseqGlobSegRev)
 				s.tie.syms = nil
@@ -4824,7 +4842,7 @@ func (s *symstr) opConseqGlobSegRev(l int) {
 			g.bt = s.checkpoint(undoBranch)
 
 			s.ops = s.ops[:len(s.ops)-1]
-			s.operands = s.operands[:len(s.operands)-1]
+			s.operands = s.operands[:l-1]
 
 			splitIdx := g.idx
 			if slashIdx != -1 {
@@ -4859,10 +4877,10 @@ func (s *symstr) opConseqGlobSegRev(l int) {
 
 		if len(g.stem) > 0 {
 			s.capture_rev(g.stem)
+			return
 		}
 
 		s.tie.syms = g.stem
-		s.ops = append(s.ops, opConseqGlobSegRev)
 		s.err = errMatchFailed
 	}
 }
@@ -4881,13 +4899,15 @@ func (s *symstr) opConseqGlobGreed(l int) {
 	if s.tie.ensure_syms() {
 		if t := s.tie.syms[0]; isWildcardMeta(t.Symbol) {
 			if symAsteriskAst.Rank() < t.Symbol.Rank() {
-				s.capture(g.stem)
 				s.operands = s.operands[:l-1]
-				s.ops = append(s.ops, opConseqGlobGreed) // CRITICAL FIX: Trap for fallback AST
-				s.err = errMatchFailed
+				if len(g.stem) > 0 {
+					s.capture(g.stem)
+				} else {
+					s.capture(nil)
+					s.err = errMatchFailed
+				}
 				return
 			} else {
-				// Eaten wildcard compensation
 				if len(s.stems) == 0 {
 					s.stems = append(s.stems, capture{start: -1})
 				}
@@ -4913,9 +4933,8 @@ func (s *symstr) opConseqGlobGreed(l int) {
 
 			g.bt = s.checkpoint(undoBranch)
 
-			// CRITICAL: Pop from active path to prevent downstream panics!
 			s.ops = s.ops[:len(s.ops)-1]
-			s.operands = s.operands[:len(s.operands)-1]
+			s.operands = s.operands[:l-1]
 
 			left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, g.idx)
 
@@ -4941,10 +4960,10 @@ func (s *symstr) opConseqGlobGreed(l int) {
 
 		if len(g.stem) > 0 {
 			s.capture(g.stem)
+			return
 		}
 
 		s.tie.syms = g.stem
-		s.ops = append(s.ops, opConseqGlobGreed) // CRITICAL FIX: Trap for fallback AST
 		s.err = errMatchFailed
 	}
 }
@@ -4963,13 +4982,15 @@ func (s *symstr) opConseqGlobGreedRev(l int) {
 	if s.tie.ensure_syms() {
 		if t := s.tie.syms[len(s.tie.syms)-1]; isWildcardMeta(t.Symbol) {
 			if symAsteriskAst.Rank() < t.Symbol.Rank() {
-				s.capture_rev(g.stem)
 				s.operands = s.operands[:l-1]
-				s.ops = append(s.ops, opConseqGlobGreedRev) // CRITICAL FIX: Trap for fallback AST
-				s.err = errMatchFailed
+				if len(g.stem) > 0 {
+					s.capture_rev(g.stem)
+				} else {
+					s.capture_rev(nil)
+					s.err = errMatchFailed
+				}
 				return
 			} else {
-				// Eaten wildcard compensation
 				if len(s.stems) == 0 {
 					s.stems = append(s.stems, capture{start: -1})
 				}
@@ -4993,7 +5014,7 @@ func (s *symstr) opConseqGlobGreedRev(l int) {
 			g.bt = s.checkpoint(undoBranch)
 
 			s.ops = s.ops[:len(s.ops)-1]
-			s.operands = s.operands[:len(s.operands)-1]
+			s.operands = s.operands[:l-1]
 
 			left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, g.idx)
 
@@ -5023,10 +5044,10 @@ func (s *symstr) opConseqGlobGreedRev(l int) {
 
 		if len(g.stem) > 0 {
 			s.capture_rev(g.stem)
+			return
 		}
 
 		s.tie.syms = g.stem
-		s.ops = append(s.ops, opConseqGlobGreedRev) // CRITICAL FIX: Trap for fallback AST
 		s.err = errMatchFailed
 	}
 }
@@ -5045,13 +5066,15 @@ func (s *symstr) opConseqGlobCross(l int) {
 	if s.tie.ensure_syms() {
 		if t := s.tie.syms[0]; isWildcardMeta(t.Symbol) {
 			if symAsteriskQues.Rank() < t.Symbol.Rank() {
-				s.capture(g.stem)
 				s.operands = s.operands[:l-1]
-				s.ops = append(s.ops, opConseqGlobCross) // CRITICAL FIX: Trap for fallback AST
-				s.err = errMatchFailed
+				if len(g.stem) > 0 {
+					s.capture(g.stem)
+				} else {
+					s.capture(nil)
+					s.err = errMatchFailed
+				}
 				return
 			} else {
-				// Eaten wildcard compensation
 				if len(s.stems) == 0 {
 					s.stems = append(s.stems, capture{start: -1})
 				}
@@ -5065,7 +5088,6 @@ func (s *symstr) opConseqGlobCross(l int) {
 			return
 		}
 
-		// Reluctant (Cross) Forward: Use __posymSeqIndex for SHORTEST match
 		if g.idx = __posymSeqIndex(s.tie.syms, 0, g.lookahead.Symbol); g.idx == -1 {
 			g.stem = append(g.stem, s.tie.syms...)
 			s.ops = append(s.ops, opConseqGlobCross)
@@ -5075,9 +5097,8 @@ func (s *symstr) opConseqGlobCross(l int) {
 
 			g.bt = s.checkpoint(undoBranch)
 
-			// CRITICAL: Pop from active path to prevent downstream panics
 			s.ops = s.ops[:len(s.ops)-1]
-			s.operands = s.operands[:len(s.operands)-1]
+			s.operands = s.operands[:l-1]
 
 			left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, g.idx)
 
@@ -5103,10 +5124,10 @@ func (s *symstr) opConseqGlobCross(l int) {
 
 		if len(g.stem) > 0 {
 			s.capture(g.stem)
+			return
 		}
 
 		s.tie.syms = g.stem
-		s.ops = append(s.ops, opConseqGlobCross) // CRITICAL FIX: Trap for fallback AST
 		s.err = errMatchFailed
 	}
 }
@@ -5125,13 +5146,15 @@ func (s *symstr) opConseqGlobCrossRev(l int) {
 	if s.tie.ensure_syms() {
 		if t := s.tie.syms[len(s.tie.syms)-1]; isWildcardMeta(t.Symbol) {
 			if symAsteriskQues.Rank() < t.Symbol.Rank() {
-				s.capture_rev(g.stem)
 				s.operands = s.operands[:l-1]
-				s.ops = append(s.ops, opConseqGlobCrossRev) // CRITICAL FIX: Trap for fallback AST
-				s.err = errMatchFailed
+				if len(g.stem) > 0 {
+					s.capture_rev(g.stem)
+				} else {
+					s.capture_rev(nil)
+					s.err = errMatchFailed
+				}
 				return
 			} else {
-				// Eaten wildcard compensation
 				if len(s.stems) == 0 {
 					s.stems = append(s.stems, capture{start: -1})
 				}
@@ -5148,7 +5171,6 @@ func (s *symstr) opConseqGlobCrossRev(l int) {
 		var totalBytes int
 		for _, ps := range s.tie.syms { totalBytes += ps.len() }
 
-		// Reluctant (Cross) Reverse: Use __posymSeqLastIndex for SHORTEST match in reverse
 		if g.idx = __posymSeqLastIndex(s.tie.syms, totalBytes-1, g.lookahead.Symbol); g.idx == -1 {
 			g.stem = append(g.stem, s.tie.syms...)
 			s.ops = append(s.ops, opConseqGlobCrossRev)
@@ -5159,7 +5181,7 @@ func (s *symstr) opConseqGlobCrossRev(l int) {
 			g.bt = s.checkpoint(undoBranch)
 
 			s.ops = s.ops[:len(s.ops)-1]
-			s.operands = s.operands[:len(s.operands)-1]
+			s.operands = s.operands[:l-1]
 
 			left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, g.idx)
 
@@ -5189,10 +5211,10 @@ func (s *symstr) opConseqGlobCrossRev(l int) {
 
 		if len(g.stem) > 0 {
 			s.capture_rev(g.stem)
+			return
 		}
 
 		s.tie.syms = g.stem
-		s.ops = append(s.ops, opConseqGlobCrossRev) // CRITICAL FIX: Trap for fallback AST
 		s.err = errMatchFailed
 	}
 }
@@ -5228,9 +5250,9 @@ func (s *symstr) opTryGlobSeg(l int) {
 			s.ops = append(s.ops, opConseqGlobSeg)
 			return
 		}
-		s.capture(nil)
 		s.operands = s.operands[:l-1]
-		s.ops = append(s.ops, opConseqGlobSeg) // CRITICAL FIX: Trap for fallback AST
+		s.capture(nil)
+		s.ops = append(s.ops, opConseqGlobSeg)
 		s.err = errMatchFailed
 		return
 	}
@@ -5285,9 +5307,9 @@ func (s *symstr) opTryGlobSegRev(l int) {
 			s.ops = append(s.ops, opConseqGlobSegRev)
 			return
 		}
-		s.capture_rev(nil)
 		s.operands = s.operands[:l-1]
-		s.ops = append(s.ops, opConseqGlobSegRev) // CRITICAL FIX: Trap for fallback AST
+		s.capture_rev(nil)
+		s.ops = append(s.ops, opConseqGlobSegRev)
 		s.err = errMatchFailed
 		return
 	}
@@ -5319,10 +5341,10 @@ func (s *symstr) opTryGlobGreed(l int) {
 
 	s.unwind(&g.bt)
 	s.err = nil
-	l = len(s.operands) // CRITICAL: Refresh length post-unwind!
+	l = len(s.operands)
 
 	nextIdx := -1
-	searchStart := g.idx - 1 // Greed searches backwards
+	searchStart := g.idx - 1
 	if searchStart >= 0 {
 		if g.lookahead.Symbol != symEmpty {
 			nextIdx = __posymSeqLastIndex(s.tie.syms, searchStart, g.lookahead.Symbol)
@@ -5337,16 +5359,15 @@ func (s *symstr) opTryGlobGreed(l int) {
 			s.ops = append(s.ops, opConseqGlobGreed)
 			return
 		}
-		s.capture(nil)
 		s.operands = s.operands[:l-1]
-		s.ops = append(s.ops, opConseqGlobGreed) // CRITICAL FIX: Trap for fallback AST
+		s.capture(nil)
+		s.ops = append(s.ops, opConseqGlobGreed)
 		s.err = errMatchFailed
 		return
 	}
 
 	g.idx = nextIdx
 	g.bt = s.checkpoint(undoBranch)
-
 	s.operands = s.operands[:l-1]
 
 	left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, nextIdx)
@@ -5381,7 +5402,7 @@ func (s *symstr) opTryGlobGreedRev(l int) {
 	for _, ps := range s.tie.syms { totalBytes += ps.len() }
 
 	nextIdx := -1
-	searchStart := g.idx + g.lookahead.len() // GreedRev searches forwards
+	searchStart := g.idx + g.lookahead.len()
 
 	if searchStart <= totalBytes {
 		if g.lookahead.Symbol != symEmpty {
@@ -5397,16 +5418,15 @@ func (s *symstr) opTryGlobGreedRev(l int) {
 			s.ops = append(s.ops, opConseqGlobGreedRev)
 			return
 		}
-		s.capture_rev(nil)
 		s.operands = s.operands[:l-1]
-		s.ops = append(s.ops, opConseqGlobGreedRev) // CRITICAL FIX: Trap for fallback AST
+		s.capture_rev(nil)
+		s.ops = append(s.ops, opConseqGlobGreedRev)
 		s.err = errMatchFailed
 		return
 	}
 
 	g.idx = nextIdx
 	g.bt = s.checkpoint(undoBranch)
-
 	s.operands = s.operands[:l-1]
 
 	left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, nextIdx)
@@ -5445,7 +5465,7 @@ func (s *symstr) opTryGlobCross(l int) {
 	for _, ps := range s.tie.syms { totalBytes += ps.len() }
 
 	nextIdx := -1
-	searchStart := g.idx + g.lookahead.len() // Cross (reluctant) searches forwards
+	searchStart := g.idx + g.lookahead.len()
 
 	if searchStart <= totalBytes {
 		if g.lookahead.Symbol != symEmpty {
@@ -5461,16 +5481,15 @@ func (s *symstr) opTryGlobCross(l int) {
 			s.ops = append(s.ops, opConseqGlobCross)
 			return
 		}
-		s.capture(nil)
 		s.operands = s.operands[:l-1]
-		s.ops = append(s.ops, opConseqGlobCross) // CRITICAL FIX: Trap for fallback AST
+		s.capture(nil)
+		s.ops = append(s.ops, opConseqGlobCross)
 		s.err = errMatchFailed
 		return
 	}
 
 	g.idx = nextIdx
 	g.bt = s.checkpoint(undoBranch)
-
 	s.operands = s.operands[:l-1]
 
 	left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, nextIdx)
@@ -5502,7 +5521,7 @@ func (s *symstr) opTryGlobCrossRev(l int) {
 	l = len(s.operands)
 
 	nextIdx := -1
-	searchStart := g.idx - 1 // CrossRev searches backwards
+	searchStart := g.idx - 1
 
 	if searchStart >= 0 {
 		if g.lookahead.Symbol != symEmpty {
@@ -5518,16 +5537,15 @@ func (s *symstr) opTryGlobCrossRev(l int) {
 			s.ops = append(s.ops, opConseqGlobCrossRev)
 			return
 		}
-		s.capture_rev(nil)
 		s.operands = s.operands[:l-1]
-		s.ops = append(s.ops, opConseqGlobCrossRev) // CRITICAL FIX: Trap for fallback AST
+		s.capture_rev(nil)
+		s.ops = append(s.ops, opConseqGlobCrossRev)
 		s.err = errMatchFailed
 		return
 	}
 
 	g.idx = nextIdx
 	g.bt = s.checkpoint(undoBranch)
-
 	s.operands = s.operands[:l-1]
 
 	left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, nextIdx)
@@ -9711,6 +9729,9 @@ _op_switch_:
 		s.operands = s.operands[:l-1]
 		s.unwind(&bt)
 
+	case opRegexMatch   : s.opRegexMatch(l)
+	case opRegexMatchRev: s.opRegexMatchRev(l)
+
 	case opMatchLiteral   : s.opMatchLiteral(l)
 	case opMatchLiteralRev: s.opMatchLiteralRev(l)
 
@@ -9721,11 +9742,6 @@ _op_switch_:
 	case opFallbackGlobCross   : s.opFallbackGlobCross(l)
 	case opFallbackGlobCrossRev: s.opFallbackGlobCrossRev(l)
 
-	case opRegexMatch   : s.opRegexMatch(l)
-	case opRegexMatchRev: s.opRegexMatchRev(l)
-
-	case opGlobRange   : s.opGlobRange(l)
-	case opGlobRangeRev: s.opGlobRangeRev(l)
 	case opGlobQues:
 		if emitted := s.opGlobQues(l, opGlobQues); len(emitted) > 0 {
 			for i := len(emitted) - 1; i >= 0; i-- {
@@ -9740,6 +9756,9 @@ _op_switch_:
 				s.operands = append(s.operands, ps)
 			}
 		}
+
+	case opGlobRange   : s.opGlobRange(l)
+	case opGlobRangeRev: s.opGlobRangeRev(l)
 
 	case opGlobSeg     : s.ops = append(s.ops, opConseqGlobSeg     ); s.stems = append(s.stems, capture{start:-1}); s.operands = append(s.operands, &op_glob{})
 	case opGlobSegRev  : s.ops = append(s.ops, opConseqGlobSegRev  ); s.stems = append(s.stems, capture{start:-1}); s.operands = append(s.operands, &op_glob{})
@@ -11654,10 +11673,11 @@ func match(ctx Context, pattern, target Value) (matched bool, res, rem Value, st
 
 	if checkpoints {
 		switch sf("%v %v", pattern, target) {
-		// "foo/bar/xx/yy/zz.h *.h", "*.h foo/bar/xx/yy/zz.h",
-		// "foo/bar/xx/yy/zz.h **.h", "**.h foo/bar/xx/yy/zz.h",
-		// "foo/bar/v?.h *?.h", "*?.h foo/bar/v?.h",
-		// "{glob *.c} foo/bar.c",
+		// case "foo/bar/xx/yy/zz.h *.h", "*.h foo/bar/xx/yy/zz.h":
+		// case "foo/bar/xx/yy/zz.h **.h", "**.h foo/bar/xx/yy/zz.h":
+		// case "foo/bar/v?.h *?.h", "*?.h foo/bar/v?.h":
+		// case "{glob *.c} foo/bar.c":
+		// case "foo/b*?y foo/bar/x/y/xx/yy":
 		case "":
 			debug(ctx, "match: %v %v", pattern, target)
 			d_step = true; defer func() { d_step = false } ()
