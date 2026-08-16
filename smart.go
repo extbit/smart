@@ -2954,6 +2954,7 @@ const (
 	// Primary stack: s.results
 	// ============================================================================
 	// -- Execution & Resolution --
+	opExpand
 	opEval                             // 9 - Evaluates an AST node
 	_                          // 10 - Evaluates an AST node (reversed direction)
 	opEvoke                            // 11 - Evokes a callable/function
@@ -2973,6 +2974,7 @@ const (
 	opFullname                         // 21 - Resolves absolute path values
 
 	// -- AST Constructors --
+	opList
 	opCompound                         // 22 - Combines N results into a compound node
 	opQualword                         // 23 - Combines N results into a qualword node
 	opGlobbrace                        // 24 - Combines N results into a globbrace node
@@ -2983,7 +2985,9 @@ const (
 	opFlag                             // 29 - Applies flag wrapping
 	opPair                             // 30 - Combines results into key-value pairs
 	opRule                             // 31 - Instantiates a rule AST
-	opCompose                          // 32 - Composes complex element constructs
+	_ // TODO: Upgrade opCompose?                          // 32 - Composes complex element constructs
+	opCartesianCompose
+	opCombineProduct
 
 	// ============================================================================
 	// 3. SYMBOLIZE (AST -> Symbols)
@@ -3067,6 +3071,7 @@ var evalopNames = [...]string{
 	"opCompactValid",
 
 	// 2. EVALUATOR
+	"opExpand",
 	"opEval",
 	"", // FIXME: No more opEvalRev!
 	"opEvoke",
@@ -3082,6 +3087,7 @@ var evalopNames = [...]string{
 	"opModify",
 	"opPathStr",
 	"opFullname",
+	"opList",
 	"opCompound",
 	"opQualword",
 	"opGlobbrace",
@@ -3092,7 +3098,9 @@ var evalopNames = [...]string{
 	"opFlag",
 	"opPair",
 	"opRule",
-	"opCompose",
+	"", // FIXME: No more opCompose!
+	"opCartesianCompose",
+	"opCombineProduct",
 
 	// 3. SYMBOLIZE
 	"opUnroll",
@@ -3303,7 +3311,13 @@ func (s *symstr) do(ctx Context, op any) any { // Optional!
     switch t := op.(type) {
 	case inner_cast: return s.Context
 	case dynamic_cast: return t.ctx(s, s.Context)
-	case get_pos: if s.loc != NoPos { return s.loc }
+	case get_pos:
+		if s.loc != NoPos { return s.loc }
+		if len(s.syms) > 0 {
+			for _, t := range s.syms {
+				if t.Pos != NoPos { return t.Pos }
+			}
+		}
     }
     return s.Context.do(ctx, op)
 }
@@ -6553,7 +6567,7 @@ type ident_result struct { Value; name Symbol }
 type resolve_result struct { Value; obj Value }
 
 type restore_context struct { Context }
-func (c *restore_context) String() string {
+func (c restore_context) String() string {
 	var b compactbuilds
 	b.writef("RestoreContext{%s}", typeof(c.Context))
 	return b.shared()
@@ -6582,32 +6596,31 @@ func (l *op_loop) String() string {
 	return b.shared()
 }
 
-// 2. FORWARD UNROLLER
 func (s *symstr) opUnroll(l int) {
 	targetOp := s.operands[l-1].(evalop)
-	node     := s.operands[l-2]
+	arg      := s.operands[l-2]
 	s.operands = s.operands[:l-2]
 
-	switch t := node.(type) {
+	switch t := arg.(type) {
 	case *list:
+		if len(t.elems) == 0 { return }
+		s.ops = append(s.ops, opLoop)
+		s.operands = append(s.operands, &op_loop{t.elems, 1, 0, len(t.elems), targetOp, symSpace})
+
+	case *compound:
 		if len(t.elems) == 0 { return }
 		s.ops = append(s.ops, opLoop)
 		s.operands = append(s.operands, &op_loop{t.elems, 1, 0, len(t.elems), targetOp, symEmpty})
 
-	case *compound:
-		if len(t.elems) == 0 { return }
-		s.ops = append(s.ops, opCompound, opLoop)
-		s.operands = append(s.operands, len(t.elems), &op_loop{t.elems, 1, 0, len(t.elems), targetOp, symEmpty})
-
 	case *path:
 		if len(t.elems) == 0 { return }
-		s.ops = append(s.ops, opPath, opLoop)
-		s.operands = append(s.operands, len(t.elems), &op_loop{t.elems, 1, 0, len(t.elems), targetOp, symSlash})
+		s.ops = append(s.ops, opLoop)
+		s.operands = append(s.operands, &op_loop{t.elems, 1, 0, len(t.elems), targetOp, symSlash})
 
 	case *qualword:
 		if len(t.elems) == 0 { return }
-		s.ops = append(s.ops, opQualword, opLoop)
-		s.operands = append(s.operands, len(t.elems), &op_loop{t.elems, 1, 0, len(t.elems), targetOp, symDot})
+		s.ops = append(s.ops, opLoop)
+		s.operands = append(s.operands, &op_loop{t.elems, 1, 0, len(t.elems), targetOp, symDot})
 
 	// case *strlit:
 	// 	// 1. Push TAIL (Executes Last)
@@ -6632,7 +6645,6 @@ func (s *symstr) opUnroll(l int) {
 	}
 }
 
-// 3. REVERSE UNROLLER
 func (s *symstr) opUnrollRev(l int) {
 	targetOp := s.operands[l-1].(evalop)
 	node     := s.operands[l-2]
@@ -6642,22 +6654,22 @@ func (s *symstr) opUnrollRev(l int) {
 	case *list:
 		if len(t.elems) == 0 { return }
 		s.ops = append(s.ops, opLoop)
-		s.operands = append(s.operands, &op_loop{t.elems, -1, len(t.elems) - 1, -1, targetOp, symEmpty})
+		s.operands = append(s.operands, &op_loop{t.elems, -1, len(t.elems) - 1, -1, targetOp, symSpace})
 
 	case *compound:
 		if len(t.elems) == 0 { return }
-		s.ops = append(s.ops, opCompound, opLoop)
-		s.operands = append(s.operands, len(t.elems), &op_loop{t.elems, -1, len(t.elems) - 1, -1, targetOp, symEmpty})
+		s.ops = append(s.ops, opLoop)
+		s.operands = append(s.operands, &op_loop{t.elems, -1, len(t.elems) - 1, -1, targetOp, symEmpty})
 
 	case *path:
 		if len(t.elems) == 0 { return }
-		s.ops = append(s.ops, opPath, opLoop)
-		s.operands = append(s.operands, len(t.elems), &op_loop{t.elems, -1, len(t.elems) - 1, -1, targetOp, symSlash})
+		s.ops = append(s.ops, opLoop)
+		s.operands = append(s.operands, &op_loop{t.elems, -1, len(t.elems) - 1, -1, targetOp, symSlash})
 
 	case *qualword:
 		if len(t.elems) == 0 { return }
-		s.ops = append(s.ops, opQualword, opLoop)
-		s.operands = append(s.operands, len(t.elems), &op_loop{t.elems, -1, len(t.elems) - 1, -1, targetOp, symDot})
+		s.ops = append(s.ops, opLoop)
+		s.operands = append(s.operands, &op_loop{t.elems, -1, len(t.elems) - 1, -1, targetOp, symDot})
 
 	// case *strlit:
 	// 	// 1. Push HEAD (Executes Last in Reverse)
@@ -6686,7 +6698,7 @@ var d_step bool = checkpoints
 
 func (s *symstr) step() {
 	if checkpoints && d_step {
-		debug(s, "pc=%v stack={%v %v %v}, syms=%v stems=%v", s.opsDone, s.ops, s.operands, s.results, s.syms, s.stems) }
+		debug(s, "pc=%v stack={%v, %v, %v}, syms=%v stems=%v", s.opsDone, s.ops, s.operands, s.results, s.syms, s.stems) }
 
 	op := s.ops[len(s.ops)-1]
 	s.ops = s.ops[:len(s.ops)-1]
@@ -6746,14 +6758,18 @@ _op_switch_:
 
 		// Your existing shattering logic!
 		switch t := a.(type) {
+		case posym:
+			s.syms = append(s.syms, t)
 		case *word:
 			// If word contains a pre-shattered slice of posyms
 			s.syms = append(s.syms, posym{t.pos, t.s})
-		// OR if you shatter strings dynamically:
-		// for i, char := range t.str { s.syms = append(s.syms, posym{t.Pos+i, sym(char)}) }
 		case *punct:
 			s.syms = append(s.syms, posym{t.pos, t.s})
-			// ... any other scalar types
+
+		// TODO: ... any other scalar types
+
+		default:
+			erro(pc(s,t), "FIXME: opYieldSym unhandled %T %v", t, t, unwind{})
 		}
 		
 	case opLoop:
@@ -6775,6 +6791,13 @@ _op_switch_:
 				s.ops = append(s.ops, t.op)
 				// Ensure the targetOp knows how to unpack a posym!
 				s.operands = append(s.operands, posym{NoPos, t.sep})
+			}
+		}
+
+		if false && checkpoints {
+			switch t.op {
+			case opEval:
+				erro(s, "opLoop expects opExpand, not opEval: %v", t)
 			}
 		}
 
@@ -6803,7 +6826,7 @@ _op_switch_:
 			}
 			// If it's a list, unroll it into identifiers dynamically
 			s.ops = append(s.ops, opUnroll)
-			s.operands = append(s.operands, t.elems, opIdent)
+			s.operands = append(s.operands, t, opIdent)
 			break _op_switch_ // Suspend current operation
 		default:
 			erro(pc(s.Context, x), "FIXME: opIdent unhandled %T %v", x, x, unwind{})
@@ -6873,7 +6896,11 @@ _op_switch_:
 		// Future optimization: drop `x` if legacy funcs are updated to not require it
 		s.results = append(s.results, resolve_result{id.Value, res})
 
-	case opEval: // NOTE: opEval should be work with opUnroll to ensure unrolled value!
+	case opExpand: // Designed for dynamic op (wrappers), e.g., opLoop.
+		s.ops = append(s.ops, opUnroll)
+		s.operands = append(s.operands, opEval)
+
+	case opEval: // Works with opUnroll to evaluate unrolled value!
 		arg := s.operands[l-1]
 		s.operands = s.operands[:l-1]
 
@@ -6887,14 +6914,14 @@ _op_switch_:
 			s.operands = append(s.operands, len(t.a))
 			if len(t.a) > 0 {
 				s.ops = append(s.ops, opLoop)
-				s.operands = append(s.operands, &op_loop{t.a, 1, 0, len(t.a), opEval, symEmpty})
+				s.operands = append(s.operands, &op_loop{t.a, 1, 0, len(t.a), opExpand, symEmpty})
 			}
 
 			s.ops = append(s.ops, opGroup)
 			s.operands = append(s.operands, len(t.o))
 			if len(t.o) > 0 {
 				s.ops = append(s.ops, opLoop)
-				s.operands = append(s.operands, &op_loop{t.o, 1, 0, len(t.o), opEval, symEmpty})
+				s.operands = append(s.operands, &op_loop{t.o, 1, 0, len(t.o), opExpand, symEmpty})
 			}
 
 			if t.x != nil {
@@ -6915,14 +6942,14 @@ _op_switch_:
 			s.operands = append(s.operands, len(t.a))
 			if len(t.a) > 0 {
 				s.ops = append(s.ops, opLoop)
-				s.operands = append(s.operands, &op_loop{t.a, 1, 0, len(t.a), opEval, symEmpty})
+				s.operands = append(s.operands, &op_loop{t.a, 1, 0, len(t.a), opExpand, symEmpty})
 			}
 
 			s.ops = append(s.ops, opGroup)
 			s.operands = append(s.operands, len(t.o))
 			if len(t.o) > 0 {
 				s.ops = append(s.ops, opLoop)
-				s.operands = append(s.operands, &op_loop{t.o, 1, 0, len(t.o), opEval, symEmpty})
+				s.operands = append(s.operands, &op_loop{t.o, 1, 0, len(t.o), opExpand, symEmpty})
 			}
 
 			if t.x != nil {
@@ -6940,7 +6967,41 @@ _op_switch_:
 		case *rule: // opRule
 			erro(pc(s,arg), "VM execution trap: opEval unimplemented %T", arg, unwind{})
 
-		case Value:
+		case *compound, *qualword, *globbrace, *path:
+			var elems []Value
+			var composeOp evalop
+			switch x := t.(type) {
+			case *globbrace: elems = x.elems; composeOp = opGlobbrace
+			case *compound:  elems = x.elems; composeOp = opCompound
+			case *qualword:  elems = x.elems; composeOp = opQualword
+			case *path:      elems = x.elems; composeOp = opPath
+			}
+
+			// 1. Cartesian Composer (Executes Last)
+			// Reads s.results, matrix-expands, and pushes arrays to s.operands for the composeOp!
+			s.ops = append(s.ops, opCartesianCompose)
+			s.operands = append(s.operands, composeOp, len(elems))
+
+			// 2. Evaluate Children (Executes First)
+			// Pushes evaluated components directly to s.results
+			if len(elems) > 0 {
+				s.ops = append(s.ops, opLoop)
+				s.operands = append(s.operands, &op_loop{elems, 1, 0, len(elems), opExpand, symEmpty})
+			}
+
+		case *list:
+			if len(t.elems) > 0 {
+				s.ops = append(s.ops, opList, opSwap, opGroup, opLoop)
+				s.operands = append(s.operands, 1, len(t.elems), &op_loop{t.elems, 1, 0, len(t.elems), opExpand, symSpace})
+			}
+
+		case *conjunction:
+
+		case *disjunction:
+			s.ops = append(s.ops, opUnroll)
+			s.operands = append(s.operands, opDisjunct, t.val)
+
+		case posym, Value:
 			s.results = append(s.results, t)
 
 		case nil:
@@ -6998,8 +7059,156 @@ _op_switch_:
 			s.evoking = s.evoking[:len(s.evoking)-1]
 			s.results = append(s.results, res)
 		default:
-			erro(pc(s,x), "opEvoke: unexpected %T %v", x, x, unwind{})
+			erro(pc(s,x), "opEvoke: unexpected %T %v", x.obj, x.obj, unwind{})
 		}
+
+	case opCartesianCompose:
+		n := s.operands[l-1].(int)
+		constructOp := s.operands[l-2].(evalop)
+		s.operands = s.operands[:l-2]
+
+		items := s.results[rl-n:]
+
+		var merge func(Value) []Value
+		merge = func(v Value) []Value {
+			if v == nil { return nil }
+			switch t := v.(type) {
+			case *loc:
+				elems := merge(t.Value)
+				for i, e := range elems { elems[i] = _loc(e, t.pos) }
+				return elems
+			case *list:
+				var elems []Value
+				for _, e := range t.elems { elems = append(elems, merge(e)...) }
+				return elems
+			}
+			return []Value{v}
+		}
+
+		var matrix [][]Value
+		for _, item := range items {
+			if item != nil {
+				matrix = append(matrix, merge(item.(Value)))
+			} else {
+				matrix = append(matrix, nil)
+			}
+		}
+
+		var cartesian func(int) [][]Value
+		cartesian = func(depth int) [][]Value {
+			if depth == len(matrix) { return [][]Value{{}} }
+			var res [][]Value
+			for _, v := range matrix[depth] {
+				for _, rest := range cartesian(depth+1) {
+					row := make([]Value, 0, 1+len(rest))
+					row = append(row, v)
+					row = append(row, rest...)
+					res = append(res, row)
+				}
+			}
+			return res
+		}
+
+		if n > 0 {
+			combinations := cartesian(0)
+			s.ops = append(s.ops, opCombineProduct)
+			s.operands = append(s.operands, combinations, constructOp)
+		}
+
+	case opCombineProduct:
+		constructOp := s.operands[l-1].(evalop)
+		combinations := s.operands[l-2].([][]Value)
+		switch n := len(combinations); n {
+		case 0:
+			s.operands = s.operands[:l-2]
+			break _op_switch_
+		case 1:
+			// Pop 'combinations' and 'constructOp', push the single '[]Value'
+			s.operands = append(s.operands[:l-2], combinations[0])
+			s.ops = append(s.ops, constructOp)
+		default:
+			composed := combinations[0]
+			s.operands[l-1] = combinations[1:] // Keep combinations (reduced)
+			s.operands = append(s.operands, constructOp, composed) // Push the composed for the constructor
+			s.ops = append(s.ops, opCombineProduct, constructOp) // opCombineProduct loops for the next combination!
+		}
+
+	case opList:
+		elems := s.operands[l-1].([]Value)
+		s.operands = s.operands[:l-1]
+		s.results = append(s.results, &list{elements{elems}})
+
+	case opCompound:
+		elems := s.operands[l-1].([]Value)
+		s.operands = s.operands[:l-1]
+		s.results = append(s.results, &compound{elements{elems}})
+
+	case opQualword:
+		elems := s.operands[l-1].([]Value)
+		s.operands = s.operands[:l-1]
+		s.results = append(s.results, &qualword{elements{elems}})
+
+	case opGlobbrace:
+		elems := s.operands[l-1].([]Value)
+		s.operands = s.operands[:l-1]
+		s.results = append(s.results, &globbrace{compound{elements{elems}}})
+
+	case opPath:
+		elems := s.operands[l-1].([]Value)
+		s.operands = s.operands[:l-1]
+		s.results = append(s.results, &path{elements{elems}})
+
+	case opConjunct:
+		elems := s.operands[l-1].([]Value)
+		sep := s.operands[l-2].(Value)
+		s.operands = s.operands[:l-2]
+		s.results = append(s.results, &conjunction{list{elements{elems}}, sep})
+		/* FIXME: this algorithm must be fused into the new designed op set.
+		sep := cons[0].(Value)
+		var vals []Value
+		for i := 1; i < len(cons); i++ { vals = append(vals, cons[i].(Value)) }
+
+		_, dynamicVals := _redis_elems(vals)
+		_, dynamicSep := _redis(sep)
+
+		var res Value
+		if dynamicVals || dynamicSep {
+			res = &conjunction{list{elements{vals}}, sep}
+		} else {
+			var valid []Value
+			for _, val := range vals {
+				if !isEmpty(val) { valid = append(valid, val) }
+			}
+			if len(valid) == 0 {
+				res = _null(v.list.Pos())
+			} else {
+				c := &compound{}
+				c.app(valid[0])
+				if sep != nil {
+					for _, val := range valid[1:] { c.app(sep, val) }
+				} else {
+					for _, val := range valid[1:] { c.app(val) }
+				}
+				res = c
+			}
+		}
+		 */
+
+	case opDisjunct/*ion*/:
+		val := s.operands[l-1].(Value)
+		s.operands = s.operands[:l-1]
+		s.results = append(s.results, &disjunction{valbase{val.Pos()},val})
+
+	case opPair:
+		key := s.operands[l-1].(Value)
+		val := s.operands[l-2].(Value)
+		s.operands = s.operands[:l-2]
+		s.results = append(s.results, &pair{key, val})
+
+	case opFlag:
+		val := s.operands[l-1].(Value)
+		s.operands = s.operands[:l-1]
+		s.results = append(s.results, flag{val})
 
 	////////////////////////////////////////////////////////////////////////////////
 	case opDebug:
@@ -7215,74 +7424,6 @@ _op_switch_:
 			s.results[rl-1] = []Value{}
 		}
 
-	case opCompound, opQualword, opGlobbrace, opPath:
-		n := s.operands[l-1].(int)
-		s.operands = s.operands[:l-1]
-
-		items := s.results[rl-n:]
-
-		var merge func(Value) []Value
-		merge = func(v Value) []Value {
-			if v == nil { return nil }
-			switch t := v.(type) {
-			case *loc:
-				elems := merge(t.Value)
-				for i, e := range elems { elems[i] = _loc(e, t.pos) }
-				return elems
-			case *list:
-				var elems []Value
-				for _, e := range t.elems { elems = append(elems, merge(e)...) }
-				return elems
-			}
-			return []Value{v}
-		}
-
-		var matrix [][]Value
-		for _, item := range items {
-			if item != nil {
-				matrix = append(matrix, merge(item.(Value)))
-			} else {
-				matrix = append(matrix, nil)
-			}
-		}
-
-		var cartesian func(int) [][]Value
-		cartesian = func(depth int) [][]Value {
-			if depth == len(matrix) { return [][]Value{{}} }
-			var res [][]Value
-			for _, v := range matrix[depth] {
-				for _, rest := range cartesian(depth+1) {
-					row := make([]Value, 0, 1+len(rest))
-					row = append(row, v)
-					row = append(row, rest...)
-					res = append(res, row)
-				}
-			}
-			return res
-		}
-
-		var combinations [][]Value
-		if n > 0 { combinations = cartesian(0) } else { combinations = [][]Value{{}} }
-
-		var composed []Value
-		for _, combo := range combinations {
-			var node Value
-			switch op {
-			case opCompound:  node = &compound{elements{combo}}
-			case opQualword:  node = &qualword{elements{combo}}
-			case opPath:      node = &path{elements{combo}}
-			case opGlobbrace: node = &globbrace{compound{elements{combo}}}
-			}
-			composed = append(composed, node)
-		}
-
-		s.results = s.results[:rl-n]
-		switch len(composed) {
-		case 0: s.results = append(s.results, nil)
-		case 1: s.results = append(s.results, composed[0])
-		default: s.results = append(s.results, &list{elements{composed}})
-		}
-
 	case opPathStr:
 		isVal := s.operands[l-1].(bool)
 		v := s.operands[l-2].(Value)
@@ -7393,64 +7534,6 @@ _op_switch_:
 		}
 		s.results = append(s.results, fullname{v})
 
-	case opDisjunct:
-		ex := s.operands[l-1].(Value)
-		v := s.operands[l-2].(*disjunction)
-		s.operands = s.operands[:l-2]
-
-		var vals []Value
-		var flattened []Value
-		if lst, ok := ex.(*list); ok {
-			flattened = lst.elems
-		} else if _, ok := ex.(*null); !ok {
-			flattened = []Value{ex}
-		}
-
-		for _, val := range flattened { vals = append(vals, redis(val)) }
-
-		var res Value
-		switch len(vals) {
-		case 0 : res = _null(v.Pos())
-		case 1 : res = vals[0]
-		default: res = &list{elements{vals}}
-		}
-		s.results = append(s.results, res)
-
-	case opConjunct:
-		cons := s.operands[l-1].([]any)
-		v := s.operands[l-2].(*conjunction)
-		s.operands = s.operands[:l-2]
-
-		sep := cons[0].(Value)
-		var vals []Value
-		for i := 1; i < len(cons); i++ { vals = append(vals, cons[i].(Value)) }
-
-		_, dynamicVals := _redis_elems(vals)
-		_, dynamicSep := _redis(sep)
-
-		var res Value
-		if dynamicVals || dynamicSep {
-			res = &conjunction{list{elements{vals}}, sep}
-		} else {
-			var valid []Value
-			for _, val := range vals {
-				if !isEmpty(val) { valid = append(valid, val) }
-			}
-			if len(valid) == 0 {
-				res = _null(v.list.Pos())
-			} else {
-				c := &compound{}
-				c.app(valid[0])
-				if sep != nil {
-					for _, val := range valid[1:] { c.app(sep, val) }
-				} else {
-					for _, val := range valid[1:] { c.app(val) }
-				}
-				res = c
-			}
-		}
-		s.results = append(s.results, res)
-
 	case opRule:
 		target := s.operands[l-1].(Value)
 		r := s.operands[l-2].(*rule)
@@ -7481,31 +7564,6 @@ _op_switch_:
 		default: s.results[rl-1] = &list{elements{flags}}
 		}
 
-	case opFlag:
-		vals := s.results[rl-1].([]Value)
-		var flags []Value
-		for _, v := range vals { flags = append(flags, flag{v}) }
-		switch len(flags) {
-		case 0 : s.results[rl-1] = nil
-		case 1 : s.results[rl-1] = flags[0]
-		default: s.results[rl-1] = &list{elements{flags}}
-		}
-
-	case opPair:
-		keys := s.results[rl-1].([]Value)
-		vals := s.results[rl-2].([]Value)
-		var pairs []Value
-		for _, k := range keys {
-			for _, v := range vals { pairs = append(pairs, &pair{k, v}) }
-		}
-		switch len(pairs) {
-		case 0 : s.results[rl-2] = nil
-		case 1 : s.results[rl-2] = pairs[0]
-		default: s.results[rl-2] = &list{elements{pairs}}
-		}
-		s.results = s.results[:rl-1]
-
-	case opCompose: s.opCompose(l)
 	case opSelect: s.opSelect(l)
 
 	case opPack:
@@ -8935,7 +8993,7 @@ func (s *symstr) evoke(x Value, o, a []Value) (res Value) {
 	s.operands = append(s.operands, len(a))
 	if len(a) > 0 {
 		s.ops = append(s.ops, opLoop)
-		s.operands = append(s.operands, &op_loop{a, 1, 0, len(a), opEval, symEmpty})
+		s.operands = append(s.operands, &op_loop{a, 1, 0, len(a), opExpand, symEmpty})
 	}
 
 	// Evaluate Options (Executes 2nd)
@@ -8943,7 +9001,7 @@ func (s *symstr) evoke(x Value, o, a []Value) (res Value) {
 	s.operands = append(s.operands, len(o))
 	if len(o) > 0 {
 		s.ops = append(s.ops, opLoop)
-		s.operands = append(s.operands, &op_loop{o, 1, 0, len(o), opEval, symEmpty})
+		s.operands = append(s.operands, &op_loop{o, 1, 0, len(o), opExpand, symEmpty})
 	}
 
 	// Evaluate Callee (Executes 1st)
