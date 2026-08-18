@@ -50,6 +50,7 @@ func (*__debug) check() {}
 func (*__grep) check(_ *regexp.Regexp, _ string, _, _ Value) {}
 func (*__trimprefix) check(_, _, _ Value) {}
 
+func (*compiler) check_expr(Value) {}
 func (*compiler) check_ident(*ident_ctx, Context, Value, string, Symbol) {}
 func (*compiler) check_sources(Context, Symbol) func(*[]Symbol) { return nil }
 func (*compiler) check_assign(ctx Context, id Value, sym Symbol, tok token, vals []Value, d *def, isNew bool, idx int) func(*[]*def) { return nil }

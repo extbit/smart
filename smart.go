@@ -102,6 +102,7 @@ var (
 	// Reusing hashers prevents constant heap escapes during massive build graphs.
 	sha256Pool = sync.Pool{ New: func() any { return sha256.New() } }
     udots = []byte("…")
+	d_step = 0
 )
 
 // compactbuilds provides zero-allocation stream compression and lazy separator
@@ -3049,11 +3050,17 @@ const (
 	// Accumulates raw symbols and packs them back into concrete AST boundaries.
 	// Primary stack: s.vmpack
 	// ============================================================================
-	opPack                             // 77 - Yields and packs a value into the buffer
-	opPackRev                          // 78 - Yields and packs a value into the buffer (reversed)
-	opReduce                           // 79 - Reduces a scoped expansion buffer into a concrete result
-	opReduceRev                        // 80 - Reduces a scoped expansion buffer into a concrete result (reversed)
-	opLocPack                          // 81 - Annotates packed buffer elements with location metadata
+	_                             // 77 - Yields and packs a value into the buffer
+	_                          // 78 - Yields and packs a value into the buffer (reversed)
+	opFrame
+	opShift
+	opShiftResult                           // 79 - Reduces a scoped expansion buffer into a concrete result
+	opReduce                        // 80 - Reduces a scoped expansion buffer into a concrete result (reversed)
+	// opReduceCompound
+	// opReduceQualword
+	// opReduceGlobbrace
+	// opReducePath
+	_                          // 81 - Annotates packed buffer elements with location metadata
 )
 
 var evalopNames = [...]string{
@@ -3149,11 +3156,17 @@ var evalopNames = [...]string{
 	"opConseqGlobCrossRev",
 
 	// 4. STRUCTURALIZE
-	"opPack",
-	"opPackRev",
+	"", // FIXME: No more opPack!
+	"", // FIXME: No more opPackRev!
+	"opFrame",
+	"opShift",
+	"opShiftResult",
 	"opReduce",
-	"opReduceRev",
-	"opLocPack",
+	// "opReduceCompound",
+	// "opReduceQualword",
+	// "opReduceGlobbrace",
+	// "opReducePath",
+	"", // FIXME: No more opLocPack!
 }
 
 // String implements the fmt.Stringer interface for evalop,
@@ -3184,7 +3197,7 @@ const (
 	undoStack  // Restores execution instructions (ops, operands)
 	undoTape   // Restores generated output tape (syms, offsets, offset)
 	undoStems  // Restores captured wildcard stems
-	undoPack   // Restores vmpack
+	undoPack   // Restores s.pack/s.frames
 	undoErr    // Restores s.err
 	undoOwn    // Restores s bits
 	undoTie    // Restores s.tie bits
@@ -3203,6 +3216,11 @@ func (ps posym) String() string { return ps.Symbol.String() }
 const NoPos Pos = 0
 
 func (p Pos) valid() bool { return p != NoPos }
+
+type frame struct {
+	i    int    // Start index in s.values
+	ctor evalop // The constructor operation (opPath, opQualword, etc.)
+}
 
 type capture struct {
 	start int
@@ -3246,26 +3264,13 @@ type vmstack struct {
 	opsDone  int      // Counter of executed ops (Instruction Retired Counter - IRC)
 }
 
-// vmpack is a cascading state machine mirrors the structural hierarchy.
-type vmpack struct {
-	parent *vmpack // Links to the outer scope (for nested brackets!)
-	pairKey  Value // Holds the LHS of an '=' pair
-	arrowObj Value // Holds the LHS of an '→' arrow
-	closer Symbol  // The symbol that will pop this state (e.g., symRparen)
-	flag   Pos     // If valid, wraps the fully reduced segment in a flag
-
-	comp elements
-	qual elements
-	path elements
-	list elements
-}
-
 // snapshot holds the restorable states for a single VM instance.
 type snapshot struct {
 	context Context
 	vmhead                 // Physical tape head (boundary, str)
 	vmstack                // Execution instructions
-	*vmpack                // AST state
+	values     []Value     // The flat compile-time parsing tape
+	frames     []frame     // Indices marking the start of each nested boundary in `pack`
 	syms       []posym     // O(1) slice header (restores pop_head mutations!)
 	stems      []capture   // O(1) slice header
 	activeStem capture     // O(1) backup for active capture mutation
@@ -3297,11 +3302,14 @@ type symstr struct {
 	// 2. Execution Stack
 	vmstack              // Execution instructions and operands
 
-	// 3. AST & Telemetry (Passive Tracking)
-	*vmpack                // AST packer state
+	// 3. AST Construction Stack
+	values []Value // The flat compile-time parsing tape (pack values)
+	frames []frame // Indices marking the start of each nested boundary in `pack`
+
+	// 4. Match Stack
 	stems       []capture  // Extracted capture groups
 
-	// 4. Time-Travel & Volatiles
+	// 5. Time-Travel & Volatiles
 	backtracks  []backtrack // The VM State Machine Rewind Stack
 	err         error       // VM fatal error state
 	class       int         // Bitmask tracking AST structural composition (volatile)
@@ -3322,3254 +3330,23 @@ func (s *symstr) do(ctx Context, op any) any { // Optional!
     return s.Context.do(ctx, op)
 }
 
-// HELPER 4: Branch Capture
-func (s *symstr) capture(captured []posym) {
-	if len(s.stems) > 0 {
-		p := &s.stems[len(s.stems)-1]
-		p.syms = append(p.syms[:0], captured...) // Clears backtracking garbage
-	}
-	// UNCONDITIONAL: Normal operations must populate s.syms for the AST builder!
-	for i := len(captured) - 1; i >= 0; i-- {
-		s.ops = append(s.ops, opPack)
-		s.operands = append(s.operands, captured[i])
-	}
-}
-
-func (s *symstr) capture_rev(captured []posym) {
-	if len(s.stems) > 0 {
-		p := &s.stems[len(s.stems)-1]
-		p.syms = append(p.syms[:0], captured...)
-	}
-	// UNCONDITIONAL
-	for _, ps := range captured {
-		s.ops = append(s.ops, opPackRev)
-		s.operands = append(s.operands, ps)
-	}
-}
-
-func (s *symstr) capture_fallback(captured []posym) {
-	if len(s.stems) > 0 {
-		p := &s.stems[len(s.stems)-1]
-		p.syms = append(p.syms[:0], captured...)
-	}
-	if bidirectional_fallback_ret_literal {
-		for i := len(captured) - 1; i >= 0; i-- {
-			s.ops = append(s.ops, opPack)
-			s.operands = append(s.operands, captured[i])
-		}
-	}
-}
-
-func (s *symstr) capture_fallback_rev(captured []posym) {
-	if len(s.stems) > 0 {
-		p := &s.stems[len(s.stems)-1]
-		p.syms = append(p.syms[:0], captured...)
-	}
-	if bidirectional_fallback_ret_literal {
-		for _, ps := range captured {
-			s.ops = append(s.ops, opPackRev)
-			s.operands = append(s.operands, ps)
-		}
-	}
-}
-
-// HELPER 5: Tape Restoration (Right side of split for native tie tape)
-func (s *symstr) nfa_push_unconsumed(rightValid bool, right posym, targetIdx int, stem, origTieSyms []posym) {
-	if rightValid || (targetIdx != -1 && targetIdx+1 < len(stem)) {
-		var unconsumed []posym
-		if rightValid { unconsumed = append(unconsumed, right) }
-		if targetIdx != -1 && targetIdx+1 < len(stem) {
-			unconsumed = append(unconsumed, stem[targetIdx+1:]...)
-		}
-		if len(unconsumed) > 0 {
-			safeQueue := make([]posym, 0, len(unconsumed)+len(origTieSyms))
-			safeQueue = append(safeQueue, unconsumed...)
-			safeQueue = append(safeQueue, origTieSyms...)
-			s.tie.syms = safeQueue
-			return
-		}
-	}
-	s.tie.syms = origTieSyms
-}
-
-const bidirectional_fallback_ret_literal = false
-
-type match_lit struct { posym }
-
-func (s *symstr) next_lit() posym {
-	// 1. Sandbox the lookahead to prevent side effects
-	bt := s.checkpoint(undoOwn | undoTie | undoStack | undoErr)
-
-	syms := s.syms
-	s.syms = nil
-	var lit posym
-
-_ops_loop_:
-	for len(s.ops) > 0 && s.err == nil {
-		switch s.ops[len(s.ops)-1] {
-		case opMatchLiteral, opMatchLiteralRev:
-			// Strictly type-asserts to match_lit
-			lit = s.operands[len(s.operands)-1].(match_lit).posym
-			break _ops_loop_
-		case opGlobQues, opGlobQuesRev, opGlobRange, opGlobRangeRev,
-			opGlobSeg, opGlobSegRev, opGlobGreed,
-			opGlobGreedRev, opGlobCross, opGlobCrossRev,
-			opConseqGlobSeg, opConseqGlobSegRev, opConseqGlobGreed,
-			opConseqGlobGreedRev, opConseqGlobCross, opConseqGlobCrossRev:
-			break _ops_loop_
-		}
-
-		if s.step(); s.syms != nil {
-			syms = append(syms, s.syms...)
-			s.syms = nil
-		}
-	}
-
-	// 2. Rewind the VM
-	s.unwind(&bt)
-	s.syms = syms
-
-	return lit
-}
-
-type op_glob struct {
-	idx       int
-	lookahead posym
-	stem      []posym
-	bt        backtrack
-}
-
-func (g *op_glob) String() string {
-	var b compactbuilds
-	b.write("op_glob{lookahead:")
-	g.lookahead.build(&b)
-	if len(g.stem) > 0 {
-		b.write(",stems:")
-		for i, stem := range g.stem {
-			if i > 0 { b.write(" ") }
-			stem.build(&b)
-		}
-	}
-	b.write("}")
-	return b.shared()
-}
-
-// NOTE: stem enabled only if bidirectional_fallback_ret_literal
-type fallback_glob struct { op_glob }
-
-func (f *fallback_glob) String() string {
-	var b compactbuilds
-	b.write("fallback_glob{lookahead:")
-	f.lookahead.build(&b)
-	if len(f.stem) > 0 {
-		b.write(",stems:")
-		for i, stem := range f.stem {
-			if i > 0 { b.write(" ") }
-			stem.build(&b)
-		}
-	}
-	b.write("}")
-	return b.shared()
-}
-
-func (s *symstr) opMatchLiteral(l int) {
-	lit := s.operands[l-1].(match_lit)
-	s.operands = s.operands[:l-1]
-
-	if s.tie.ensure_syms() {
-		if lit.Symbol == symEmpty {
-			switch s.tie.syms[0].Symbol {
-			case symEmpty:
-				s.tie.syms = s.tie.syms[1:]
-			case symQues, symAsterisk, symAsteriskAst, symAsteriskQues:
-				s.err = errMatchFailedCrossSeg
-			}
-			return
-		}
-
-		target := s.tie.syms[0]
-
-		switch target.Symbol {
-		case lit.Symbol:
-			lit.Symbol = target.Symbol
-			s.tie.syms = s.tie.syms[1:]
-			s.ops = append(s.ops, opPack)
-			s.operands = append(s.operands, lit.posym)
-			return
-
-		case symQues:
-			if lit.Symbol == symSlash {
-				s.err = errMatchFailedCrossSeg
-				return
-			}
-
-			s.tie.syms = s.tie.syms[1:]
-
-			s.loc = lit.Pos
-			s.str = lit.Symbol.String()
-			r, size := s.decodeRune()
-			if size == 0 || r == 0 {
-				s.err = errMatchFailedZeroRune
-				return
-			}
-
-			lit.Symbol = intern(s.str)
-			s.ops = append(s.ops, opMatchLiteral)
-			s.operands = append(s.operands, lit)
-			s.loc = NoPos
-			s.str = ""
-
-			if bidirectional_fallback_ret_literal {
-				lit.Symbol = intern(string(r))
-			} else {
-				lit.Symbol = target.Symbol
-			}
-			s.ops = append(s.ops, opPack)
-			s.operands = append(s.operands, lit.posym)
-			return
-
-		case symAsterisk, symAsteriskAst, symAsteriskQues:
-			origLit := lit.posym
-			if !bidirectional_fallback_ret_literal { lit.Symbol = target.Symbol }
-			s.ops = append(s.ops, opPack)
-			s.operands = append(s.operands, lit.posym)
-
-			s.tie.syms = s.tie.syms[1:]
-
-			var fallbackOp evalop
-			switch target.Symbol {
-			case symAsterisk: fallbackOp = opFallbackGlobSeg
-			case symAsteriskAst: fallbackOp = opFallbackGlobGreed
-			case symAsteriskQues: fallbackOp = opFallbackGlobCross
-			}
-
-			// Safely pull the next lookahead from the tie generator
-			lookahead := s.tie.next_lit_no_match()
-
-			fg := &fallback_glob{op_glob{idx: -1, lookahead: lookahead}}
-			s.ops = append(s.ops, fallbackOp)
-			s.operands = append(s.operands, fg)
-
-			// Inject the string fragment back into the tape so the fallback handler
-			// can consume it character-by-character!
-			s.syms = append([]posym{origLit}, s.syms...)
-
-			// NATIVE TRANSITION: Removed s.err = errMatchFailed here so the VM loop
-			// continues naturally to fallbackOp!
-			return
-		}
-
-		if lit.Symbol == symSlash || target.Symbol == symSlash || lit.Kind() != target.Kind() {
-			s.err = errMatchFailed
-			return
-		}
-
-		if target.has_prefix(lit.Symbol) {
-			s.tie.pop_head()
-
-			ll := lit.len()
-			if target.Pos != NoPos {
-				s.tie.loc = target.Pos + Pos(ll)
-			} else {
-				s.tie.loc = NoPos
-			}
-
-			s.tie.str = target.String()[ll:]
-
-			s.ops = append(s.ops, opPack)
-			s.operands = append(s.operands, lit.posym)
-			return
-		}
-
-		if lit.has_prefix(target.Symbol) {
-			s.tie.pop_head()
-
-			sym := intern(lit.String()[target.len():])
-
-			lit.Symbol = target.Symbol
-			s.ops = append(s.ops, opPack)
-			s.operands = append(s.operands, lit.posym)
-
-			lit.Symbol = sym
-			s.ops = append(s.ops, opMatchLiteral)
-			s.operands = append(s.operands, lit)
-			return
-		}
-
-		str := lit.String()
-		tpos := target.Pos
-		s.tie.loc = tpos
-		s.tie.str = target.String()
-		s.tie.pop_head()
-
-		n := len(str)
-		if len(s.tie.str) < n { n = len(s.tie.str) }
-
-		frag := s.tie.str[:n]
-		if str[:n] != frag {
-			if len(s.tie.str) > 0 {
-				s.tie.syms = append([]posym{{tpos, intern(s.tie.str)}}, s.tie.syms...)
-				s.tie.loc = NoPos
-				s.tie.str = ""
-			}
-			s.err = errMatchFailed
-			return
-		}
-
-		str = str[n:]
-		s.tie.str = s.tie.str[n:]
-
-		if tpos != NoPos {
-			s.tie.loc = tpos + Pos(n)
-		}
-
-		lit.Symbol = intern(frag)
-		s.ops = append(s.ops, opPack)
-		s.operands = append(s.operands, lit.posym)
-
-		if len(str) > 0 {
-			if lit.Pos != NoPos { lit.Pos += Pos(n) }
-			lit.Symbol = intern(str)
-			s.ops = append(s.ops, opMatchLiteral)
-			s.operands = append(s.operands, lit)
-		}
-
-	} else if len(s.tie.str) != 0 {
-		erro(s, "ensure_syms left str=%s", s.tie.str)
-	} else if lit.Symbol != symEmpty {
-		s.err = errMatchFailedStarvedT
-	}
-}
-
-func (s *symstr) opMatchLiteralRev(l int) {
-	lit := s.operands[l-1].(match_lit)
-	s.operands = s.operands[:l-1]
-
-	if s.tie.ensure_syms() {
-		if lit.Symbol == symEmpty {
-			switch s.tie.syms[len(s.tie.syms)-1].Symbol {
-			case symEmpty:
-				s.tie.syms = s.tie.syms[:len(s.tie.syms)-1]
-			case symQues, symAsterisk, symAsteriskAst, symAsteriskQues:
-				s.err = errMatchFailedCrossSeg
-			}
-			return
-		}
-
-		target := s.tie.syms[len(s.tie.syms)-1]
-
-		switch target.Symbol {
-		case lit.Symbol:
-			lit.Symbol = target.Symbol
-			s.tie.syms = s.tie.syms[:len(s.tie.syms)-1]
-			s.ops = append(s.ops, opPackRev)
-			s.operands = append(s.operands, lit.posym)
-			return
-
-		case symQues:
-			if lit.Symbol == symSlash {
-				s.err = errMatchFailedCrossSeg
-				return
-			}
-
-			s.tie.syms = s.tie.syms[:len(s.tie.syms)-1]
-
-			s.loc = lit.Pos
-			s.str = lit.Symbol.String()
-			r, size := s.decodeRuneRev()
-			if size == 0 || r == 0 {
-				s.err = errMatchFailedZeroRune
-				return
-			}
-
-			lit.Symbol = intern(s.str)
-			s.ops = append(s.ops, opMatchLiteralRev)
-			s.operands = append(s.operands, lit)
-			s.loc = NoPos
-			s.str = ""
-
-			if bidirectional_fallback_ret_literal {
-				lit.Symbol = intern(string(r))
-			} else {
-				lit.Symbol = target.Symbol
-			}
-			s.ops = append(s.ops, opPackRev)
-			s.operands = append(s.operands, lit.posym)
-			return
-
-		case symAsterisk, symAsteriskAst, symAsteriskQues:
-			origLit := lit.posym
-			if !bidirectional_fallback_ret_literal { lit.Symbol = target.Symbol }
-			s.ops = append(s.ops, opPackRev)
-			s.operands = append(s.operands, lit.posym)
-
-			s.tie.syms = s.tie.syms[:len(s.tie.syms)-1]
-
-			var fallbackOp evalop
-			switch target.Symbol {
-			case symAsterisk: fallbackOp = opFallbackGlobSegRev
-			case symAsteriskAst: fallbackOp = opFallbackGlobGreedRev
-			case symAsteriskQues: fallbackOp = opFallbackGlobCrossRev
-			}
-
-			lookahead := s.tie.next_lit_no_match()
-			fg := &fallback_glob{op_glob{idx: -1, lookahead: lookahead}}
-
-			s.ops = append(s.ops, fallbackOp)
-			s.operands = append(s.operands, fg)
-
-			// Reverse injection pushes to the END of the tape
-			s.syms = append(s.syms, origLit)
-
-			// NATIVE TRANSITION: Removed s.err = errMatchFailed here.
-			return
-		}
-
-		if lit.Symbol == symSlash || target.Symbol == symSlash || lit.Kind() != target.Kind() {
-			s.err = errMatchFailed
-			return
-		}
-
-		if target.has_suffix(lit.Symbol) {
-			s.tie.pop_tail()
-
-			ll := lit.len()
-			s.tie.str = target.String()[:target.len()-ll]
-
-			s.ops = append(s.ops, opPackRev)
-			s.operands = append(s.operands, lit.posym)
-			return
-		}
-
-		if lit.has_suffix(target.Symbol) {
-			s.tie.pop_tail()
-
-			sym := intern(lit.String()[:lit.len()-target.len()])
-
-			lit.Symbol = target.Symbol
-			s.ops = append(s.ops, opPackRev)
-			s.operands = append(s.operands, lit.posym)
-
-			lit.Symbol = sym
-			s.ops = append(s.ops, opMatchLiteralRev)
-			s.operands = append(s.operands, lit)
-			return
-		}
-
-		str := lit.String()
-		s.tie.str = target.String()
-		s.tie.pop_tail()
-
-		n := len(str)
-		if len(s.tie.str) < n { n = len(s.tie.str) }
-
-		frag := s.tie.str[len(s.tie.str)-n:]
-		if str[len(str)-n:] != frag {
-			if len(s.tie.str) > 0 {
-				s.tie.syms = append(s.tie.syms, posym{NoPos, intern(s.tie.str)})
-				s.tie.str = ""
-			}
-			s.err = errMatchFailed
-			return
-		}
-
-		str = str[:len(str)-n]
-		s.tie.str = s.tie.str[:len(s.tie.str)-n]
-
-		lit.Symbol = intern(frag)
-		s.ops = append(s.ops, opPackRev)
-		s.operands = append(s.operands, lit.posym)
-
-		if len(str) > 0 {
-			lit.Symbol = intern(str)
-			s.ops = append(s.ops, opMatchLiteralRev)
-			s.operands = append(s.operands, lit)
-		}
-
-	} else if len(s.tie.str) != 0 {
-		erro(s, "ensure_syms left str=%s", s.tie.str)
-	} else if lit.Symbol != symEmpty {
-		s.err = errMatchFailedStarvedT
-	}
-}
-
-func (s *symstr) next_lit_no_match() posym {
-	// 1. Sandbox the lookahead to prevent side effects
-	bt := s.checkpoint(undoOwn | undoTie | undoStack | undoErr)
-
-	syms := s.syms
-	s.syms = nil
-	var lit posym
-
-_ops_loop_:
-	for len(s.ops) > 0 && s.err == nil {
-		switch s.ops[len(s.ops)-1] {
-		case opUnroll, opUnrollRev:
-			val := s.operands[len(s.operands)-1]
-			switch v := val.(type) {
-			case *globmeta, *percpat, *globrange, *regexpat:
-				erro(s, "FIXME: undetermined wildcard during literal lookahead: %T", v)
-			case posym:
-				if isWildcardMeta(v.Symbol) || v.Symbol == symPercent {
-					erro(s, "FIXME: undetermined wildcard during literal lookahead: posym{%v}", v.Symbol)
-				}
-			}
-		}
-
-		// Safely unroll the AST
-		s.step()
-		if len(s.syms) > 0 {
-			lit = s.syms[0] // Capture the exact resolved literal!
-			break _ops_loop_
-		}
-	}
-
-	// 2. Erase the unroll execution and perfectly rewind the VM
-	s.unwind(&bt)
-	s.syms = syms
-
-	return lit
-}
-
-// ensure_fallback_match_syms securely extracts raw symbols from the target tape during
-// active NFA glob fallbacks, intercepting and downgrading any trapped
-// opMatchLiteral instructions to prevent premature match failures.
-func (s *symstr) ensure_fallback_match_syms(matchOp evalop) bool {
-	if len(s.syms) > 0 { return true }
-	if s.err != nil { return false }
-
-	for len(s.ops) > 0 && s.err == nil && len(s.syms) == 0 {
-		var sym Symbol
-
-		switch s.ops[len(s.ops)-1] {
-		case matchOp: // i.e., opMatchLiteral or opMatchLiteralRev
-			lit := s.operands[len(s.operands)-1].(match_lit)
-			s.ops = s.ops[:len(s.ops)-1]
-			s.operands = s.operands[:len(s.operands)-1]
-			s.syms = append(s.syms, lit.posym)
-			return true
-
-		// FIXME: the VM uses `s.vpos` to make posym for matching; when pushing match ops, `s.vpos` was discarded and slided away as wildcard only conserns what glob op; so when converting op back to sym, we loss the Pos.
-		case opGlobSeg,   opGlobSegRev,   opConseqGlobSeg,   opConseqGlobSegRev:   sym = symAsterisk
-		case opGlobGreed, opGlobGreedRev, opConseqGlobGreed, opConseqGlobGreedRev: sym = symAsteriskAst
-		case opGlobCross, opGlobCrossRev, opConseqGlobCross, opConseqGlobCrossRev: sym = symAsteriskQues
-		case opGlobQues,  opGlobQuesRev: sym = symQues
-		}
-
-		if sym != 0 {
-			// CRITICAL: when a wildcard meets a wildcard, the fallback-wildcard became a NOOP!
-			// The wildcard op (e.g., opGlob) do not execute; it pushes the converted sym
-			// instead of forming a wildcard-cycle!
-			s.ops = s.ops[:len(s.ops)-1]
-			s.syms = append(s.syms, posym{/* FIXME: s.vpos lost for wildcard ops */NoPos, sym})
-			if false { debug(s, "wildcard: %v %d - %d %d %d", s.syms, sym.Rank(), symAsterisk.Rank(), symAsteriskQues.Rank(), symAsteriskAst.Rank(), callstack{num:2}) }
-			return true
-		}
-
-		s.step()
-	}
-	return len(s.syms) > 0
-}
-
-// shatter_syms dynamically splits the most recently pulled tape symbol if it
-// contains the NFA lookahead natively within its string payload.
-func (s *symstr) shatter_syms(lookahead Symbol, last bool) {
-	if len(s.syms) == 0 || lookahead == symEmpty { return }
-
-	idx := len(s.syms) - 1
-	ps := s.syms[idx]
-
-	if ps.Symbol == lookahead { return }
-
-	var strIdx int
-	if last {
-		strIdx = ps.last_index(lookahead)
-	} else {
-		strIdx = ps.index(lookahead)
-	}
-
-	if strIdx != -1 && ps.len() >= lookahead.len() {
-		str := ps.String()
-		ll := lookahead.len()
-
-		var newSyms []posym
-		if strIdx > 0 {
-			newSyms = append(newSyms, posym{ps.Pos, intern(str[:strIdx])})
-		}
-
-		newSyms = append(newSyms, posym{ps.Pos + Pos(strIdx), lookahead})
-
-		if strIdx+ll < len(str) {
-			newSyms = append(newSyms, posym{ps.Pos + Pos(strIdx+ll), intern(str[strIdx+ll:])})
-		}
-
-		s.syms = append(s.syms[:idx], newSyms...)
-	}
-}
-
-func (s *symstr) opFallbackGlobSeg(l int) {
-	g := s.operands[l-1].(*fallback_glob)
-	s.operands = s.operands[:l-1]
-
-	if g.lookahead.Symbol == symEmpty && s.tie.err != io.EOF {
-		g.lookahead = s.tie.next_lit_no_match()
-	}
-
-	if s.tie.err != nil { return }
-
-	if s.ensure_fallback_match_syms(opMatchLiteral) {
-		s.shatter_syms(g.lookahead.Symbol, true)
-
-		if len(s.syms) == 0 { return }
-		if t := s.syms[0]; isWildcardMeta(t.Symbol) {
-			if symAsterisk.Rank() < t.Rank() {
-				s.capture_fallback(g.stem)
-				s.err = errMatchFailed
-				return
-			} else {
-				if len(s.stems) == 0 {
-					s.stems = append(s.stems, capture{start: -1})
-				}
-				if !bidirectional_fallback_ret_literal {
-					g.stem = nil
-					s.syms = s.syms[1:]
-					s.ops = append(s.ops, opFallbackGlobSeg)
-					s.operands = append(s.operands, g)
-					return
-				}
-			}
-		}
-
-		var totalBytes int
-		for _, ps := range s.syms { totalBytes += ps.len() }
-
-		if g.lookahead.Symbol == symEmpty {
-			slashIdx := __posymSeqIndex(s.syms, 0, symSlash)
-			if slashIdx != -1 {
-				s.err = errMatchFailed
-				return
-			}
-			g.stem = append(g.stem, s.syms...)
-			s.ops = append(s.ops, opFallbackGlobSeg)
-			s.operands = append(s.operands, g)
-			s.syms = nil
-			return
-		}
-
-		g.idx = __posymSeqLastIndex(s.syms, totalBytes-1, g.lookahead.Symbol)
-
-		if g.idx != -1 {
-			slashIdx := __posymSeqIndex(s.syms, 0, symSlash)
-			if slashIdx != -1 && slashIdx < g.idx {
-				g.idx = -1
-			}
-		}
-
-		if g.idx == -1 {
-			slashIdx := __posymSeqIndex(s.syms, 0, symSlash)
-			if slashIdx != -1 {
-				s.err = errMatchFailed
-				return
-			}
-
-			g.stem = append(g.stem, s.syms...)
-			s.ops = append(s.ops, opFallbackGlobSeg)
-			s.operands = append(s.operands, g)
-			s.syms = nil
-		} else {
-			s.ops = append(s.ops, opTryFallbackGlobSeg)
-			s.operands = append(s.operands, g)
-			g.bt = s.checkpoint(undoBranch)
-
-			s.ops = s.ops[:len(s.ops)-1]
-			s.operands = s.operands[:len(s.operands)-1]
-
-			left, right, targetIdx := __posymSeqSplitAt(s.syms, g.idx)
-
-			var restore []posym
-			if right.Symbol != symEmpty || right.len() > 0 {
-				restore = append(restore, right)
-			}
-			if targetIdx != -1 && targetIdx+1 < len(s.syms) {
-				restore = append(restore, s.syms[targetIdx+1:]...)
-			}
-
-			s.syms = nil
-			for i := len(restore) - 1; i >= 0; i-- {
-				s.ops = append(s.ops, opMatchLiteral)
-				s.operands = append(s.operands, match_lit{restore[i]})
-			}
-
-			finalStem := append(append([]posym(nil), g.stem...), left...)
-			s.capture_fallback(finalStem)
-		}
-	} else {
-		if g.lookahead.Symbol == symEmpty {
-			s.capture_fallback(g.stem)
-			return
-		}
-		if len(g.stem) > 0 {
-			s.capture_fallback(g.stem)
-		}
-		s.syms = g.stem
-		s.err = errMatchFailed
-	}
-}
-
-func (s *symstr) opFallbackGlobSegRev(l int) {
-	g := s.operands[l-1].(*fallback_glob)
-	s.operands = s.operands[:l-1]
-
-	if g.lookahead.Symbol == symEmpty && s.tie.err != io.EOF {
-		g.lookahead = s.tie.next_lit_no_match()
-	}
-
-	if s.tie.err != nil { return }
-
-	if s.ensure_fallback_match_syms(opMatchLiteralRev) {
-		s.shatter_syms(g.lookahead.Symbol, false)
-
-		if len(s.syms) == 0 { return }
-		if t := s.syms[len(s.syms)-1]; isWildcardMeta(t.Symbol) {
-			if symAsterisk.Rank() < t.Rank() {
-				s.capture_fallback_rev(g.stem)
-				s.err = errMatchFailed
-				return
-			} else {
-				if len(s.stems) == 0 {
-					s.stems = append(s.stems, capture{start: -1})
-				}
-				if !bidirectional_fallback_ret_literal {
-					g.stem = nil
-					s.syms = s.syms[1:]
-					s.ops = append(s.ops, opFallbackGlobSegRev)
-					s.operands = append(s.operands, g)
-					return
-				}
-			}
-		}
-
-		var totalBytes int
-		for _, ps := range s.syms { totalBytes += ps.len() }
-
-		if g.lookahead.Symbol == symEmpty {
-			slashIdx := __posymSeqLastIndex(s.syms, totalBytes-1, symSlash)
-			if slashIdx != -1 {
-				s.err = errMatchFailed
-				return
-			}
-			g.stem = append(g.stem, s.syms...)
-			s.ops = append(s.ops, opFallbackGlobSegRev)
-			s.operands = append(s.operands, g)
-			s.syms = nil
-			return
-		}
-
-		g.idx = __posymSeqIndex(s.syms, 0, g.lookahead.Symbol)
-
-		if g.idx != -1 {
-			slashIdx := __posymSeqLastIndex(s.syms, totalBytes-1, symSlash)
-			if slashIdx != -1 && slashIdx > g.idx {
-				g.idx = -1
-			}
-		}
-
-		if g.idx == -1 {
-			slashIdx := __posymSeqLastIndex(s.syms, totalBytes-1, symSlash)
-			if slashIdx != -1 {
-				s.err = errMatchFailed
-				return
-			}
-
-			g.stem = append(g.stem, s.syms...)
-			s.ops = append(s.ops, opFallbackGlobSegRev)
-			s.operands = append(s.operands, g)
-			s.syms = nil
-		} else {
-			s.ops = append(s.ops, opTryFallbackGlobSegRev)
-			s.operands = append(s.operands, g)
-			g.bt = s.checkpoint(undoBranch)
-
-			s.ops = s.ops[:len(s.ops)-1]
-			s.operands = s.operands[:len(s.operands)-1]
-
-			left, right, targetIdx := __posymSeqSplitAt(s.syms, g.idx)
-
-			var restore []posym
-			if len(left) > 0 {
-				restore = append([]posym(nil), left...)
-			}
-
-			s.syms = nil
-			for i := len(restore) - 1; i >= 0; i-- {
-				s.ops = append(s.ops, opMatchLiteralRev)
-				s.operands = append(s.operands, match_lit{restore[i]})
-			}
-
-			var finalStem []posym
-			if right.Symbol != symEmpty || right.len() > 0 {
-				finalStem = append(finalStem, right)
-			}
-			if targetIdx != -1 && targetIdx+1 < len(s.syms) {
-				finalStem = append(finalStem, s.syms[targetIdx+1:]...)
-			}
-			finalStem = append(finalStem, g.stem...)
-			s.capture_fallback_rev(finalStem)
-		}
-	} else {
-		if g.lookahead.Symbol == symEmpty {
-			s.capture_fallback_rev(g.stem)
-			return
-		}
-		if len(g.stem) > 0 {
-			s.capture_fallback_rev(g.stem)
-		}
-		s.syms = g.stem
-		s.err = errMatchFailed
-	}
-}
-
-func (s *symstr) opFallbackGlobGreed(l int) {
-	g := s.operands[l-1].(*fallback_glob)
-	s.operands = s.operands[:l-1]
-
-	if g.lookahead.Symbol == symEmpty && s.tie.err != io.EOF {
-		g.lookahead = s.tie.next_lit_no_match()
-	}
-
-	if s.tie.err != nil { return }
-
-	if s.ensure_fallback_match_syms(opMatchLiteral) {
-		s.shatter_syms(g.lookahead.Symbol, true)
-
-		if len(s.syms) == 0 { return }
-		if t := s.syms[0]; isWildcardMeta(t.Symbol) {
-			if symAsteriskAst.Rank() < t.Rank() {
-				s.capture_fallback(g.stem)
-				s.err = errMatchFailed
-				return
-			} else {
-				if len(s.stems) == 0 {
-					s.stems = append(s.stems, capture{start: -1})
-				}
-				if !bidirectional_fallback_ret_literal {
-					g.stem = nil
-					s.syms = s.syms[1:]
-					s.ops = append(s.ops, opFallbackGlobGreed)
-					s.operands = append(s.operands, g)
-					return
-				}
-			}
-		}
-
-		if g.lookahead.Symbol == symEmpty {
-			g.stem = append(g.stem, s.syms...)
-			s.ops = append(s.ops, opFallbackGlobGreed)
-			s.operands = append(s.operands, g)
-			s.syms = nil
-			return
-		}
-
-		var totalBytes int
-		for _, ps := range s.syms { totalBytes += ps.len() }
-
-		if g.idx = __posymSeqLastIndex(s.syms, totalBytes-1, g.lookahead.Symbol); g.idx == -1 {
-			g.stem = append(g.stem, s.syms...)
-			s.ops = append(s.ops, opFallbackGlobGreed)
-			s.operands = append(s.operands, g)
-			s.syms = nil
-		} else {
-			s.ops = append(s.ops, opTryFallbackGlobGreed)
-			s.operands = append(s.operands, g)
-			g.bt = s.checkpoint(undoBranch)
-
-			s.ops = s.ops[:len(s.ops)-1]
-			s.operands = s.operands[:len(s.operands)-1]
-
-			left, right, targetIdx := __posymSeqSplitAt(s.syms, g.idx)
-
-			var restore []posym
-			if right.Symbol != symEmpty || right.len() > 0 {
-				restore = append(restore, right)
-			}
-			if targetIdx != -1 && targetIdx+1 < len(s.syms) {
-				restore = append(restore, s.syms[targetIdx+1:]...)
-			}
-
-			s.syms = nil
-			for i := len(restore) - 1; i >= 0; i-- {
-				s.ops = append(s.ops, opMatchLiteral)
-				s.operands = append(s.operands, match_lit{restore[i]})
-			}
-
-			finalStem := append(append([]posym(nil), g.stem...), left...)
-			s.capture_fallback(finalStem)
-		}
-	} else {
-		if g.lookahead.Symbol == symEmpty {
-			s.capture_fallback(g.stem)
-			return
-		}
-		if len(g.stem) > 0 {
-			s.capture_fallback(g.stem)
-		}
-		s.syms = g.stem
-		s.err = errMatchFailed
-	}
-}
-
-func (s *symstr) opFallbackGlobGreedRev(l int) {
-	g := s.operands[l-1].(*fallback_glob)
-	s.operands = s.operands[:l-1]
-
-	if g.lookahead.Symbol == symEmpty && s.tie.err != io.EOF {
-		g.lookahead = s.tie.next_lit_no_match()
-	}
-
-	if s.tie.err != nil { return }
-
-	if s.ensure_fallback_match_syms(opMatchLiteralRev) {
-		s.shatter_syms(g.lookahead.Symbol, false)
-
-		if len(s.syms) == 0 { return }
-		if t := s.syms[len(s.syms)-1]; isWildcardMeta(t.Symbol) {
-			if symAsteriskAst.Rank() < t.Rank() {
-				s.capture_fallback_rev(g.stem)
-				s.err = errMatchFailed
-				return
-			} else {
-				if len(s.stems) == 0 {
-					s.stems = append(s.stems, capture{start: -1})
-				}
-				if !bidirectional_fallback_ret_literal {
-					g.stem = nil
-					s.syms = s.syms[1:]
-					s.ops = append(s.ops, opFallbackGlobGreedRev)
-					s.operands = append(s.operands, g)
-					return
-				}
-			}
-		}
-
-		if g.lookahead.Symbol == symEmpty {
-			g.stem = append(g.stem, s.syms...)
-			s.ops = append(s.ops, opFallbackGlobGreedRev)
-			s.operands = append(s.operands, g)
-			s.syms = nil
-			return
-		}
-
-		var totalBytes int
-		for _, ps := range s.syms { totalBytes += ps.len() }
-
-		if g.idx = __posymSeqIndex(s.syms, 0, g.lookahead.Symbol); g.idx == -1 {
-			g.stem = append(g.stem, s.syms...)
-			s.ops = append(s.ops, opFallbackGlobGreedRev)
-			s.operands = append(s.operands, g)
-			s.syms = nil
-		} else {
-			s.ops = append(s.ops, opTryFallbackGlobGreedRev)
-			s.operands = append(s.operands, g)
-			g.bt = s.checkpoint(undoBranch)
-
-			s.ops = s.ops[:len(s.ops)-1]
-			s.operands = s.operands[:len(s.operands)-1]
-
-			left, right, targetIdx := __posymSeqSplitAt(s.syms, g.idx)
-
-			var restore []posym
-			if len(left) > 0 {
-				restore = append([]posym(nil), left...)
-			}
-
-			s.syms = nil
-			for i := len(restore) - 1; i >= 0; i-- {
-				s.ops = append(s.ops, opMatchLiteralRev)
-				s.operands = append(s.operands, match_lit{restore[i]})
-			}
-
-			var finalStem []posym
-			if right.Symbol != symEmpty || right.len() > 0 {
-				finalStem = append(finalStem, right)
-			}
-			if targetIdx != -1 && targetIdx+1 < len(s.syms) {
-				finalStem = append(finalStem, s.syms[targetIdx+1:]...)
-			}
-			finalStem = append(finalStem, g.stem...)
-			s.capture_fallback_rev(finalStem)
-		}
-	} else {
-		if g.lookahead.Symbol == symEmpty {
-			s.capture_fallback_rev(g.stem)
-			return
-		}
-		if len(g.stem) > 0 {
-			s.capture_fallback_rev(g.stem)
-		}
-		s.syms = g.stem
-		s.err = errMatchFailed
-	}
-}
-
-func (s *symstr) opFallbackGlobCross(l int) {
-	g := s.operands[l-1].(*fallback_glob)
-	s.operands = s.operands[:l-1]
-
-	if g.lookahead.Symbol == symEmpty && s.tie.err != io.EOF {
-		g.lookahead = s.tie.next_lit_no_match()
-	}
-
-	if s.tie.err != nil { return }
-
-	if s.ensure_fallback_match_syms(opMatchLiteral) {
-		s.shatter_syms(g.lookahead.Symbol, false)
-
-		if len(s.syms) == 0 { return }
-		if t := s.syms[0]; isWildcardMeta(t.Symbol) {
-			if symAsteriskQues.Rank() < t.Rank() {
-				s.capture_fallback(g.stem)
-				s.err = errMatchFailed
-				return
-			} else {
-				if len(s.stems) == 0 {
-					s.stems = append(s.stems, capture{start: -1})
-				}
-				if !bidirectional_fallback_ret_literal {
-					g.stem = nil
-					s.syms = s.syms[1:]
-					s.ops = append(s.ops, opFallbackGlobCross)
-					s.operands = append(s.operands, g)
-					return
-				}
-			}
-		}
-
-		if g.lookahead.Symbol == symEmpty {
-			g.stem = append(g.stem, s.syms...)
-			s.ops = append(s.ops, opFallbackGlobCross)
-			s.operands = append(s.operands, g)
-			s.syms = nil
-			return
-		}
-
-		var totalBytes int
-		for _, ps := range s.syms { totalBytes += ps.len() }
-
-		if g.idx = __posymSeqIndex(s.syms, 0, g.lookahead.Symbol); g.idx == -1 {
-			g.stem = append(g.stem, s.syms...)
-			s.ops = append(s.ops, opFallbackGlobCross)
-			s.operands = append(s.operands, g)
-			s.syms = nil
-		} else {
-			s.ops = append(s.ops, opTryFallbackGlobCross)
-			s.operands = append(s.operands, g)
-			g.bt = s.checkpoint(undoBranch)
-
-			s.ops = s.ops[:len(s.ops)-1]
-			s.operands = s.operands[:len(s.operands)-1]
-
-			left, right, targetIdx := __posymSeqSplitAt(s.syms, g.idx)
-
-			var restore []posym
-			if right.Symbol != symEmpty || right.len() > 0 {
-				restore = append(restore, right)
-			}
-			if targetIdx != -1 && targetIdx+1 < len(s.syms) {
-				restore = append(restore, s.syms[targetIdx+1:]...)
-			}
-
-			s.syms = nil
-			for i := len(restore) - 1; i >= 0; i-- {
-				s.ops = append(s.ops, opMatchLiteral)
-				s.operands = append(s.operands, match_lit{restore[i]})
-			}
-
-			finalStem := append(append([]posym(nil), g.stem...), left...)
-			s.capture_fallback(finalStem)
-		}
-	} else {
-		if g.lookahead.Symbol == symEmpty {
-			s.capture_fallback(g.stem)
-			return
-		}
-		if len(g.stem) > 0 {
-			s.capture_fallback(g.stem)
-		}
-		s.syms = g.stem
-		s.err = errMatchFailed
-	}
-}
-
-func (s *symstr) opFallbackGlobCrossRev(l int) {
-	g := s.operands[l-1].(*fallback_glob)
-	s.operands = s.operands[:l-1]
-
-	if g.lookahead.Symbol == symEmpty && s.tie.err != io.EOF {
-		g.lookahead = s.tie.next_lit_no_match()
-	}
-
-	if s.tie.err != nil { return }
-
-	if s.ensure_fallback_match_syms(opMatchLiteralRev) {
-		s.shatter_syms(g.lookahead.Symbol, true)
-
-		if len(s.syms) == 0 { return }
-		if t := s.syms[len(s.syms)-1]; isWildcardMeta(t.Symbol) {
-			if symAsteriskQues.Rank() < t.Rank() {
-				s.capture_fallback_rev(g.stem)
-				s.err = errMatchFailed
-				return
-			} else {
-				if len(s.stems) == 0 {
-					s.stems = append(s.stems, capture{start: -1})
-				}
-				if !bidirectional_fallback_ret_literal {
-					g.stem = nil
-					s.syms = s.syms[1:]
-					s.ops = append(s.ops, opFallbackGlobCrossRev)
-					s.operands = append(s.operands, g)
-					return
-				}
-			}
-		}
-
-		if g.lookahead.Symbol == symEmpty {
-			g.stem = append(g.stem, s.syms...)
-			s.ops = append(s.ops, opFallbackGlobCrossRev)
-			s.operands = append(s.operands, g)
-			s.syms = nil
-			return
-		}
-
-		var totalBytes int
-		for _, ps := range s.syms { totalBytes += ps.len() }
-
-		if g.idx = __posymSeqLastIndex(s.syms, totalBytes-1, g.lookahead.Symbol); g.idx == -1 {
-			g.stem = append(g.stem, s.syms...)
-			s.ops = append(s.ops, opFallbackGlobCrossRev)
-			s.operands = append(s.operands, g)
-			s.syms = nil
-		} else {
-			s.ops = append(s.ops, opTryFallbackGlobCrossRev)
-			s.operands = append(s.operands, g)
-			g.bt = s.checkpoint(undoBranch)
-
-			s.ops = s.ops[:len(s.ops)-1]
-			s.operands = s.operands[:len(s.operands)-1]
-
-			left, right, targetIdx := __posymSeqSplitAt(s.syms, g.idx)
-
-			var restore []posym
-			if len(left) > 0 {
-				restore = append([]posym(nil), left...)
-			}
-
-			s.syms = nil
-			for i := len(restore) - 1; i >= 0; i-- {
-				s.ops = append(s.ops, opMatchLiteralRev)
-				s.operands = append(s.operands, match_lit{restore[i]})
-			}
-
-			var finalStem []posym
-			if right.Symbol != symEmpty || right.len() > 0 {
-				finalStem = append(finalStem, right)
-			}
-			if targetIdx != -1 && targetIdx+1 < len(s.syms) {
-				finalStem = append(finalStem, s.syms[targetIdx+1:]...)
-			}
-			finalStem = append(finalStem, g.stem...)
-			s.capture_fallback_rev(finalStem)
-		}
-	} else {
-		if g.lookahead.Symbol == symEmpty {
-			s.capture_fallback_rev(g.stem)
-			return
-		}
-		if len(g.stem) > 0 {
-			s.capture_fallback_rev(g.stem)
-		}
-		s.syms = g.stem
-		s.err = errMatchFailed
-	}
-}
-
-func (s *symstr) opGlobQues(l int, targetOp evalop) []posym {
-	reverse := targetOp == opGlobQuesRev
-	count := 1
-	for len(s.ops) > 0 && s.ops[len(s.ops)-1] == targetOp {
-		s.ops = s.ops[:len(s.ops)-1]
-		count++
-	}
-
-	var emitted []posym
-
-	if len(s.tie.str) == 0 && len(s.tie.syms) > 0 {
-		target := s.tie.syms[0]
-
-		switch target.Symbol {
-		case symQues, symAsterisk, symAsteriskAst, symAsteriskQues, symPercent:
-			if target.Symbol == symQues {
-				var consumed int
-				var syms []posym
-				for i := 0; i < count; i++ {
-					if !s.tie.ensure_syms() {
-						s.err = io.EOF
-						return nil
-					}
-
-					ps := s.tie.pop_head()
-					consumed++
-					syms = append(syms, ps)
-					emitted = append(emitted, ps)
-				}
-
-				if consumed < count {
-					s.err = errMatchFailed
-					return nil
-				}
-				s.tie.loc = NoPos
-				s.tie.str = ""
-
-				for _, ps := range syms {
-					s.stems = append(s.stems, capture{
-						start: -1,
-						name:  posym{NoPos, symEmptyName},
-						syms:  []posym{ps},
-					})
-				}
-				return emitted
-
-			} else if target.Symbol == symPercent {
-				if len(s.tie.syms) > 1 && s.tie.syms[1].Symbol == symPercent {
-					emitted = append(emitted, posym{target.Pos, symPercent})
-					s.tie.pop_head()
-				}
-				emitted = append(emitted, posym{target.Pos, symPercent})
-				s.tie.pop_head()
-				s.tie.loc = NoPos
-				s.tie.str = ""
-
-				for i := 0; i < count; i++ {
-					s.stems = append(s.stems, capture{start: -1, name: posym{NoPos, symEmptyName}})
-				}
-				return emitted
-
-			} else {
-				ps := s.tie.pop_head()
-				emitted = append(emitted, ps)
-
-				for i := 0; i < count; i++ {
-					s.stems = append(s.stems, capture{start: -1, name: posym{NoPos, symEmptyName}})
-				}
-				return emitted
-			}
-		}
-	}
-
-	{
-		var str string
-		var basePos Pos
-
-		for i := 0; i < count; i++ {
-			if len(s.tie.str) == 0 {
-				if !s.tie.ensure_syms() {
-					s.err = io.EOF
-					return nil
-				}
-				if basePos == NoPos { basePos = s.tie.syms[0].Pos }
-				s.tie.loc = s.tie.syms[0].Pos
-				s.tie.str = s.tie.syms[0].String()
-				s.tie.pop_head()
-			}
-
-			var r rune
-			var rsize int
-			if reverse {
-				r, rsize = s.tie.decodeRuneRev()
-			} else {
-				r, rsize = s.tie.decodeRune()
-			}
-
-			if rsize == 0 {
-				s.err = io.EOF
-				return nil
-			}
-			if r == '/' {
-				if len(s.tie.str) > 0 {
-					s.tie.syms = append([]posym{{s.tie.loc, intern(s.tie.str)}}, s.tie.syms...)
-					s.tie.loc = NoPos
-					s.tie.str = ""
-				}
-				s.err = errMatchFailed
-				return nil
-			}
-
-			if reverse {
-				str = string(r) + str
-			} else {
-				str += string(r)
-			}
-		}
-
-		sym := intern(str)
-		s.stems = append(s.stems, capture{
-			start: -1,
-			name:  posym{NoPos, symEmptyName},
-			syms:  []posym{{basePos, sym}},
-		})
-		emitted = append(emitted, posym{basePos, sym})
-	}
-
-	return emitted
-}
-
-func (s *symstr) opGlobRange(l int) {
-	v := s.operands[l-1].(*globrange)
-	s.operands = s.operands[:l-1]
-
-	var tpos Pos
-	if len(s.tie.str) == 0 {
-		if !s.tie.ensure_syms() {
-			s.err = io.EOF
-			return
-		}
-		tpos = s.tie.syms[0].Pos
-		s.tie.loc = tpos
-		s.tie.str = s.tie.syms[0].String()
-		s.tie.pop_head()
-	} else {
-		tpos = s.tie.loc
-	}
-
-	r, rsize := s.tie.decodeRune()
-	if rsize == 0 {
-		s.err = io.EOF
-		return
-	}
-	if r == '/' {
-		if len(s.tie.str) > 0 {
-			s.tie.syms = append([]posym{{tpos, intern(s.tie.str)}}, s.tie.syms...)
-			s.tie.loc = NoPos
-			s.tie.str = ""
-		}
-		s.err = errMatchFailed
-		return
-	}
-
-	matched := false
-
-	if v.static {
-		if strings.ContainsRune(v.runes, r) {
-			matched = true
-		} else {
-			for _, span := range v.spans {
-				if r >= span.min && r <= span.max {
-					matched = true
-					break
-				}
-			}
-		}
-	} else {
-		sym := __symbol(s.Context, v.Value)
-		rangeStr := sym.String()
-
-		var prevRune rune
-		inRange := false
-
-		for len(rangeStr) > 0 {
-			currRune, crsize := utf8.DecodeRuneInString(rangeStr)
-			rangeStr = rangeStr[crsize:]
-
-			if currRune == '-' && prevRune != 0 && len(rangeStr) > 0 {
-				inRange = true
-				continue
-			}
-
-			if inRange {
-				if r >= prevRune && r <= currRune { matched = true; break }
-				inRange = false
-			} else {
-				if r == currRune { matched = true; break }
-			}
-			prevRune = currRune
-		}
-	}
-
-	if matched == v.negated {
-		if len(s.tie.str) > 0 {
-			s.tie.syms = append([]posym{{tpos, intern(s.tie.str)}}, s.tie.syms...)
-			s.tie.loc = NoPos
-			s.tie.str = ""
-		}
-		s.err = errMatchFailed
-		return
-	}
-
-	sym := intern(string(r))
-	s.ops = append(s.ops, opPack)
-	s.operands = append(s.operands, posym{tpos, sym})
-}
-
-func (s *symstr) opGlobRangeRev(l int) {
-	v := s.operands[l-1].(*globrange)
-	s.operands = s.operands[:l-1]
-
-	var tpos Pos
-	if len(s.tie.str) == 0 {
-		if !s.tie.ensure_syms() {
-			s.err = io.EOF
-			return
-		}
-		tpos = s.tie.syms[0].Pos
-		s.tie.loc = tpos
-		s.tie.str = s.tie.syms[0].String()
-		s.tie.pop_head()
-	} else {
-		tpos = s.tie.loc
-	}
-
-	r, rsize := s.tie.decodeRuneRev()
-	if rsize == 0 {
-		s.err = io.EOF
-		return
-	}
-	if r == '/' {
-		if len(s.tie.str) > 0 {
-			s.tie.syms = append([]posym{{tpos, intern(s.tie.str)}}, s.tie.syms...)
-			s.tie.loc = NoPos
-			s.tie.str = ""
-		}
-		s.err = errMatchFailed
-		return
-	}
-
-	matched := false
-
-	if v.static {
-		if strings.ContainsRune(v.runes, r) {
-			matched = true
-		} else {
-			for _, span := range v.spans {
-				if r >= span.min && r <= span.max {
-					matched = true
-					break
-				}
-			}
-		}
-	} else {
-		sym := __symbol(s.Context, v.Value)
-		rangeStr := sym.String()
-
-		var prevRune rune
-		inRange := false
-
-		for len(rangeStr) > 0 {
-			currRune, crsize := utf8.DecodeRuneInString(rangeStr)
-			rangeStr = rangeStr[crsize:]
-
-			if currRune == '-' && prevRune != 0 && len(rangeStr) > 0 {
-				inRange = true
-				continue
-			}
-
-			if inRange {
-				if r >= prevRune && r <= currRune { matched = true; break }
-				inRange = false
-			} else {
-				if r == currRune { matched = true; break }
-			}
-			prevRune = currRune
-		}
-	}
-
-	if matched == v.negated {
-		if len(s.tie.str) > 0 {
-			s.tie.syms = append([]posym{{tpos, intern(s.tie.str)}}, s.tie.syms...)
-			s.tie.loc = NoPos
-			s.tie.str = ""
-		}
-		s.err = errMatchFailed
-		return
-	}
-
-	sym := intern(string(r))
-	s.ops = append(s.ops, opPackRev)
-	s.operands = append(s.operands, posym{tpos, sym})
-}
-
-func (s *symstr) opConseqGlobSeg(l int) {
-	g := s.operands[l-1].(*op_glob)
-
-	if g.lookahead.Symbol == symEmpty && s.err != io.EOF {
-		s.operands = s.operands[:l-1]
-		g.lookahead = s.next_lit()
-		s.operands = append(s.operands, g)
-	}
-
-	if s.err != nil { return }
-
-	if s.tie.ensure_syms() {
-		target := s.tie.syms[0]
-		if target.Symbol == symSlash {
-			s.operands = s.operands[:l-1]
-			if len(g.stem) > 0 {
-				s.capture(g.stem)
-			} else {
-				s.capture(nil)
-				s.err = errMatchFailed
-			}
-			return
-		}
-
-		if t := s.tie.syms[0]; isWildcardMeta(t.Symbol) {
-			if symAsterisk.Rank() < t.Symbol.Rank() {
-				s.operands = s.operands[:l-1]
-				if len(g.stem) > 0 {
-					s.capture(g.stem)
-				} else {
-					s.capture(nil)
-					s.err = errMatchFailed
-				}
-				return
-			} else {
-				if len(s.stems) == 0 {
-					s.stems = append(s.stems, capture{start: -1})
-				}
-			}
-		}
-
-		slashIdx := __posymSeqIndex(s.tie.syms, 0, symSlash)
-		searchSpace := s.tie.syms
-		if slashIdx != -1 {
-			searchSpace = s.tie.syms[:slashIdx]
-		}
-
-		var totalSearchBytes int
-		for _, ps := range searchSpace { totalSearchBytes += ps.len() }
-
-		if g.lookahead.Symbol == symEmpty {
-			g.stem = append(g.stem, searchSpace...)
-			s.ops = append(s.ops, opConseqGlobSeg)
-			if slashIdx != -1 {
-				s.tie.syms = s.tie.syms[slashIdx:]
-			} else {
-				s.tie.syms = nil
-			}
-			return
-		}
-
-		if g.idx = __posymSeqLastIndex(searchSpace, totalSearchBytes-1, g.lookahead.Symbol); g.idx == -1 {
-			g.stem = append(g.stem, searchSpace...)
-
-			if slashIdx != -1 {
-				s.operands = s.operands[:l-1]
-				if len(g.stem) > 0 {
-					s.capture(g.stem)
-				} else {
-					s.capture(nil)
-					s.err = errMatchFailed
-				}
-				s.tie.syms = s.tie.syms[slashIdx:]
-			} else {
-				s.ops = append(s.ops, opConseqGlobSeg)
-				s.tie.syms = nil
-			}
-		} else {
-			s.ops = append(s.ops, opTryGlobSeg)
-
-			g.bt = s.checkpoint(undoBranch)
-
-			s.ops = s.ops[:len(s.ops)-1]
-			s.operands = s.operands[:l-1]
-
-			left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, g.idx)
-
-			var restore []posym
-			if right.Symbol != symEmpty || right.len() > 0 {
-				restore = append(restore, right)
-			}
-			if targetIdx != -1 && targetIdx+1 < len(s.tie.syms) {
-				restore = append(restore, s.tie.syms[targetIdx+1:]...)
-			}
-			s.tie.syms = restore
-
-			finalStem := append(append([]posym(nil), g.stem...), left...)
-			s.capture(finalStem)
-		}
-	} else {
-		s.operands = s.operands[:l-1]
-
-		if g.lookahead.Symbol == symEmpty {
-			s.capture(g.stem)
-			return
-		}
-
-		if len(g.stem) > 0 {
-			s.capture(g.stem)
-			return
-		}
-
-		s.tie.syms = g.stem
-		s.err = errMatchFailed
-	}
-}
-
-func (s *symstr) opConseqGlobSegRev(l int) {
-	g := s.operands[l-1].(*op_glob)
-
-	if g.lookahead.Symbol == symEmpty && s.err != io.EOF {
-		s.operands = s.operands[:l-1]
-		g.lookahead = s.next_lit()
-		s.operands = append(s.operands, g)
-	}
-
-	if s.err != nil { return }
-
-	if s.tie.ensure_syms() {
-		target := s.tie.syms[len(s.tie.syms)-1]
-		if target.Symbol == symSlash {
-			s.operands = s.operands[:l-1]
-			if len(g.stem) > 0 {
-				s.capture_rev(g.stem)
-			} else {
-				s.capture_rev(nil)
-				s.err = errMatchFailed
-			}
-			return
-		}
-
-		if t := s.tie.syms[len(s.tie.syms)-1]; isWildcardMeta(t.Symbol) {
-			if symAsterisk.Rank() < t.Symbol.Rank() {
-				s.operands = s.operands[:l-1]
-				if len(g.stem) > 0 {
-					s.capture_rev(g.stem)
-				} else {
-					s.capture_rev(nil)
-					s.err = errMatchFailed
-				}
-				return
-			} else {
-				if len(s.stems) == 0 {
-					s.stems = append(s.stems, capture{start: -1})
-				}
-			}
-		}
-
-		slashIdx := __posymSeqLastIndex(s.tie.syms, -1, symSlash)
-		searchSpace := s.tie.syms
-		if slashIdx != -1 {
-			searchSpace = s.tie.syms[slashIdx+1:]
-		}
-
-		if g.lookahead.Symbol == symEmpty {
-			g.stem = append(g.stem, searchSpace...)
-			s.ops = append(s.ops, opConseqGlobSegRev)
-			if slashIdx != -1 {
-				s.tie.syms = s.tie.syms[:slashIdx+1]
-			} else {
-				s.tie.syms = nil
-			}
-			return
-		}
-
-		if g.idx = __posymSeqIndex(searchSpace, 0, g.lookahead.Symbol); g.idx == -1 {
-			g.stem = append(g.stem, searchSpace...)
-
-			if slashIdx != -1 {
-				s.operands = s.operands[:l-1]
-				if len(g.stem) > 0 {
-					s.capture_rev(g.stem)
-				} else {
-					s.capture_rev(nil)
-					s.err = errMatchFailed
-				}
-				s.tie.syms = s.tie.syms[:slashIdx+1]
-			} else {
-				s.ops = append(s.ops, opConseqGlobSegRev)
-				s.tie.syms = nil
-			}
-		} else {
-			s.ops = append(s.ops, opTryGlobSegRev)
-
-			g.bt = s.checkpoint(undoBranch)
-
-			s.ops = s.ops[:len(s.ops)-1]
-			s.operands = s.operands[:l-1]
-
-			splitIdx := g.idx
-			if slashIdx != -1 {
-				splitIdx += slashIdx + 1
-			}
-
-			left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, splitIdx)
-
-			var restore []posym
-			if len(left) > 0 {
-				restore = append([]posym(nil), left...)
-			}
-			s.tie.syms = restore
-
-			var finalStem []posym
-			if right.Symbol != symEmpty || right.len() > 0 {
-				finalStem = append(finalStem, right)
-			}
-			if targetIdx != -1 && targetIdx+1 < len(s.tie.syms) {
-				finalStem = append(finalStem, s.tie.syms[targetIdx+1:]...)
-			}
-			finalStem = append(finalStem, g.stem...)
-			s.capture_rev(finalStem)
-		}
-	} else {
-		s.operands = s.operands[:l-1]
-
-		if g.lookahead.Symbol == symEmpty {
-			s.capture_rev(g.stem)
-			return
-		}
-
-		if len(g.stem) > 0 {
-			s.capture_rev(g.stem)
-			return
-		}
-
-		s.tie.syms = g.stem
-		s.err = errMatchFailed
-	}
-}
-
-func (s *symstr) opConseqGlobGreed(l int) {
-	g := s.operands[l-1].(*op_glob)
-
-	if g.lookahead.Symbol == symEmpty && s.err != io.EOF {
-		s.operands = s.operands[:l-1]
-		g.lookahead = s.next_lit()
-		s.operands = append(s.operands, g)
-	}
-
-	if s.err != nil { return }
-
-	if s.tie.ensure_syms() {
-		if t := s.tie.syms[0]; isWildcardMeta(t.Symbol) {
-			if symAsteriskAst.Rank() < t.Symbol.Rank() {
-				s.operands = s.operands[:l-1]
-				if len(g.stem) > 0 {
-					s.capture(g.stem)
-				} else {
-					s.capture(nil)
-					s.err = errMatchFailed
-				}
-				return
-			} else {
-				if len(s.stems) == 0 {
-					s.stems = append(s.stems, capture{start: -1})
-				}
-			}
-		}
-
-		if g.lookahead.Symbol == symEmpty {
-			g.stem = append(g.stem, s.tie.syms...)
-			s.ops = append(s.ops, opConseqGlobGreed)
-			s.tie.syms = nil
-			return
-		}
-
-		var totalBytes int
-		for _, ps := range s.tie.syms { totalBytes += ps.len() }
-
-		if g.idx = __posymSeqLastIndex(s.tie.syms, totalBytes-1, g.lookahead.Symbol); g.idx == -1 {
-			g.stem = append(g.stem, s.tie.syms...)
-			s.ops = append(s.ops, opConseqGlobGreed)
-			s.tie.syms = nil
-		} else {
-			s.ops = append(s.ops, opTryGlobGreed)
-
-			g.bt = s.checkpoint(undoBranch)
-
-			s.ops = s.ops[:len(s.ops)-1]
-			s.operands = s.operands[:l-1]
-
-			left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, g.idx)
-
-			var restore []posym
-			if right.Symbol != symEmpty || right.len() > 0 {
-				restore = append(restore, right)
-			}
-			if targetIdx != -1 && targetIdx+1 < len(s.tie.syms) {
-				restore = append(restore, s.tie.syms[targetIdx+1:]...)
-			}
-			s.tie.syms = restore
-
-			finalStem := append(append([]posym(nil), g.stem...), left...)
-			s.capture(finalStem)
-		}
-	} else {
-		s.operands = s.operands[:l-1]
-
-		if g.lookahead.Symbol == symEmpty {
-			s.capture(g.stem)
-			return
-		}
-
-		if len(g.stem) > 0 {
-			s.capture(g.stem)
-			return
-		}
-
-		s.tie.syms = g.stem
-		s.err = errMatchFailed
-	}
-}
-
-func (s *symstr) opConseqGlobGreedRev(l int) {
-	g := s.operands[l-1].(*op_glob)
-
-	if g.lookahead.Symbol == symEmpty && s.err != io.EOF {
-		s.operands = s.operands[:l-1]
-		g.lookahead = s.next_lit()
-		s.operands = append(s.operands, g)
-	}
-
-	if s.err != nil { return }
-
-	if s.tie.ensure_syms() {
-		if t := s.tie.syms[len(s.tie.syms)-1]; isWildcardMeta(t.Symbol) {
-			if symAsteriskAst.Rank() < t.Symbol.Rank() {
-				s.operands = s.operands[:l-1]
-				if len(g.stem) > 0 {
-					s.capture_rev(g.stem)
-				} else {
-					s.capture_rev(nil)
-					s.err = errMatchFailed
-				}
-				return
-			} else {
-				if len(s.stems) == 0 {
-					s.stems = append(s.stems, capture{start: -1})
-				}
-			}
-		}
-
-		if g.lookahead.Symbol == symEmpty {
-			g.stem = append(g.stem, s.tie.syms...)
-			s.ops = append(s.ops, opConseqGlobGreedRev)
-			s.tie.syms = nil
-			return
-		}
-
-		if g.idx = __posymSeqIndex(s.tie.syms, 0, g.lookahead.Symbol); g.idx == -1 {
-			g.stem = append(g.stem, s.tie.syms...)
-			s.ops = append(s.ops, opConseqGlobGreedRev)
-			s.tie.syms = nil
-		} else {
-			s.ops = append(s.ops, opTryGlobGreedRev)
-
-			g.bt = s.checkpoint(undoBranch)
-
-			s.ops = s.ops[:len(s.ops)-1]
-			s.operands = s.operands[:l-1]
-
-			left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, g.idx)
-
-			var restore []posym
-			if len(left) > 0 {
-				restore = append([]posym(nil), left...)
-			}
-			s.tie.syms = restore
-
-			var finalStem []posym
-			if right.Symbol != symEmpty || right.len() > 0 {
-				finalStem = append(finalStem, right)
-			}
-			if targetIdx != -1 && targetIdx+1 < len(s.tie.syms) {
-				finalStem = append(finalStem, s.tie.syms[targetIdx+1:]...)
-			}
-			finalStem = append(finalStem, g.stem...)
-			s.capture_rev(finalStem)
-		}
-	} else {
-		s.operands = s.operands[:l-1]
-
-		if g.lookahead.Symbol == symEmpty {
-			s.capture_rev(g.stem)
-			return
-		}
-
-		if len(g.stem) > 0 {
-			s.capture_rev(g.stem)
-			return
-		}
-
-		s.tie.syms = g.stem
-		s.err = errMatchFailed
-	}
-}
-
-func (s *symstr) opConseqGlobCross(l int) {
-	g := s.operands[l-1].(*op_glob)
-
-	if g.lookahead.Symbol == symEmpty && s.err != io.EOF {
-		s.operands = s.operands[:l-1]
-		g.lookahead = s.next_lit()
-		s.operands = append(s.operands, g)
-	}
-
-	if s.err != nil { return }
-
-	if s.tie.ensure_syms() {
-		if t := s.tie.syms[0]; isWildcardMeta(t.Symbol) {
-			if symAsteriskQues.Rank() < t.Symbol.Rank() {
-				s.operands = s.operands[:l-1]
-				if len(g.stem) > 0 {
-					s.capture(g.stem)
-				} else {
-					s.capture(nil)
-					s.err = errMatchFailed
-				}
-				return
-			} else {
-				if len(s.stems) == 0 {
-					s.stems = append(s.stems, capture{start: -1})
-				}
-			}
-		}
-
-		if g.lookahead.Symbol == symEmpty {
-			g.stem = append(g.stem, s.tie.syms...)
-			s.ops = append(s.ops, opConseqGlobCross)
-			s.tie.syms = nil
-			return
-		}
-
-		if g.idx = __posymSeqIndex(s.tie.syms, 0, g.lookahead.Symbol); g.idx == -1 {
-			g.stem = append(g.stem, s.tie.syms...)
-			s.ops = append(s.ops, opConseqGlobCross)
-			s.tie.syms = nil
-		} else {
-			s.ops = append(s.ops, opTryGlobCross)
-
-			g.bt = s.checkpoint(undoBranch)
-
-			s.ops = s.ops[:len(s.ops)-1]
-			s.operands = s.operands[:l-1]
-
-			left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, g.idx)
-
-			var restore []posym
-			if right.Symbol != symEmpty || right.len() > 0 {
-				restore = append(restore, right)
-			}
-			if targetIdx != -1 && targetIdx+1 < len(s.tie.syms) {
-				restore = append(restore, s.tie.syms[targetIdx+1:]...)
-			}
-			s.tie.syms = restore
-
-			finalStem := append(append([]posym(nil), g.stem...), left...)
-			s.capture(finalStem)
-		}
-	} else {
-		s.operands = s.operands[:l-1]
-
-		if g.lookahead.Symbol == symEmpty {
-			s.capture(g.stem)
-			return
-		}
-
-		if len(g.stem) > 0 {
-			s.capture(g.stem)
-			return
-		}
-
-		s.tie.syms = g.stem
-		s.err = errMatchFailed
-	}
-}
-
-func (s *symstr) opConseqGlobCrossRev(l int) {
-	g := s.operands[l-1].(*op_glob)
-
-	if g.lookahead.Symbol == symEmpty && s.err != io.EOF {
-		s.operands = s.operands[:l-1]
-		g.lookahead = s.next_lit()
-		s.operands = append(s.operands, g)
-	}
-
-	if s.err != nil { return }
-
-	if s.tie.ensure_syms() {
-		if t := s.tie.syms[len(s.tie.syms)-1]; isWildcardMeta(t.Symbol) {
-			if symAsteriskQues.Rank() < t.Symbol.Rank() {
-				s.operands = s.operands[:l-1]
-				if len(g.stem) > 0 {
-					s.capture_rev(g.stem)
-				} else {
-					s.capture_rev(nil)
-					s.err = errMatchFailed
-				}
-				return
-			} else {
-				if len(s.stems) == 0 {
-					s.stems = append(s.stems, capture{start: -1})
-				}
-			}
-		}
-
-		if g.lookahead.Symbol == symEmpty {
-			g.stem = append(g.stem, s.tie.syms...)
-			s.ops = append(s.ops, opConseqGlobCrossRev)
-			s.tie.syms = nil
-			return
-		}
-
-		var totalBytes int
-		for _, ps := range s.tie.syms { totalBytes += ps.len() }
-
-		if g.idx = __posymSeqLastIndex(s.tie.syms, totalBytes-1, g.lookahead.Symbol); g.idx == -1 {
-			g.stem = append(g.stem, s.tie.syms...)
-			s.ops = append(s.ops, opConseqGlobCrossRev)
-			s.tie.syms = nil
-		} else {
-			s.ops = append(s.ops, opTryGlobCrossRev)
-
-			g.bt = s.checkpoint(undoBranch)
-
-			s.ops = s.ops[:len(s.ops)-1]
-			s.operands = s.operands[:l-1]
-
-			left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, g.idx)
-
-			var restore []posym
-			if len(left) > 0 {
-				restore = append([]posym(nil), left...)
-			}
-			s.tie.syms = restore
-
-			var finalStem []posym
-			if right.Symbol != symEmpty || right.len() > 0 {
-				finalStem = append(finalStem, right)
-			}
-			if targetIdx != -1 && targetIdx+1 < len(s.tie.syms) {
-				finalStem = append(finalStem, s.tie.syms[targetIdx+1:]...)
-			}
-			finalStem = append(finalStem, g.stem...)
-			s.capture_rev(finalStem)
-		}
-	} else {
-		s.operands = s.operands[:l-1]
-
-		if g.lookahead.Symbol == symEmpty {
-			s.capture_rev(g.stem)
-			return
-		}
-
-		if len(g.stem) > 0 {
-			s.capture_rev(g.stem)
-			return
-		}
-
-		s.tie.syms = g.stem
-		s.err = errMatchFailed
-	}
-}
-
-func (s *symstr) opTryGlobSeg(l int) {
-	g := s.operands[l-1].(*op_glob)
-
-	if s.err == nil {
-		s.operands = s.operands[:l-1]
-		return
-	}
-
-	s.unwind(&g.bt)
-	s.err = nil
-	l = len(s.operands)
-
-	nextIdx := -1
-	searchStart := g.idx - 1
-	if searchStart >= 0 {
-		if g.lookahead.Symbol != symEmpty {
-			nextIdx = __posymSeqLastIndex(s.tie.syms, searchStart, g.lookahead.Symbol)
-		}
-		if nextIdx == -1 { nextIdx = searchStart }
-	}
-
-	if nextIdx != -1 {
-		slashIdx := __posymSeqIndex(s.tie.syms, 0, symSlash)
-		if slashIdx != -1 && slashIdx < nextIdx { nextIdx = -1 }
-	}
-
-	if nextIdx < 0 {
-		if s.tie.ensure_syms() {
-			s.ops = append(s.ops, opConseqGlobSeg)
-			return
-		}
-		s.operands = s.operands[:l-1]
-		s.capture(nil)
-		s.err = errMatchFailed
-		return
-	}
-
-	g.idx = nextIdx
-	g.bt = s.checkpoint(undoBranch)
-	s.operands = s.operands[:l-1]
-
-	left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, nextIdx)
-
-	var restore []posym
-	if right.Symbol != symEmpty || right.len() > 0 { restore = append(restore, right) }
-	if targetIdx != -1 && targetIdx+1 < len(s.tie.syms) { restore = append(restore, s.tie.syms[targetIdx+1:]...) }
-	s.tie.syms = restore
-
-	finalStem := append(append([]posym(nil), g.stem...), left...)
-	s.capture(finalStem)
-}
-
-func (s *symstr) opTryGlobSegRev(l int) {
-	g := s.operands[l-1].(*op_glob)
-
-	if s.err == nil {
-		s.operands = s.operands[:l-1]
-		return
-	}
-
-	s.unwind(&g.bt)
-	s.err = nil
-	l = len(s.operands)
-
-	var totalBytes int
-	for _, ps := range s.tie.syms { totalBytes += ps.len() }
-
-	nextIdx := -1
-	searchStart := g.idx + g.lookahead.len()
-
-	if searchStart <= totalBytes {
-		if g.lookahead.Symbol != symEmpty {
-			nextIdx = __posymSeqIndex(s.tie.syms, searchStart, g.lookahead.Symbol)
-		}
-		if nextIdx == -1 { nextIdx = searchStart }
-	}
-
-	if nextIdx != -1 {
-		slashIdx := __posymSeqLastIndex(s.tie.syms, totalBytes-1, symSlash)
-		if slashIdx != -1 && slashIdx > nextIdx { nextIdx = -1 }
-	}
-
-	if nextIdx > totalBytes || nextIdx == -1 {
-		if s.tie.ensure_syms() {
-			s.ops = append(s.ops, opConseqGlobSegRev)
-			return
-		}
-		s.operands = s.operands[:l-1]
-		s.capture_rev(nil)
-		s.err = errMatchFailed
-		return
-	}
-
-	g.idx = nextIdx
-	g.bt = s.checkpoint(undoBranch)
-	s.operands = s.operands[:l-1]
-
-	left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, nextIdx)
-
-	var restore []posym
-	if len(left) > 0 { restore = append([]posym(nil), left...) }
-	s.tie.syms = restore
-
-	var finalStem []posym
-	if right.Symbol != symEmpty || right.len() > 0 { finalStem = append(finalStem, right) }
-	if targetIdx != -1 && targetIdx+1 < len(s.tie.syms) { finalStem = append(finalStem, s.tie.syms[targetIdx+1:]...) }
-	finalStem = append(finalStem, g.stem...)
-	s.capture_rev(finalStem)
-}
-
-func (s *symstr) opTryGlobGreed(l int) {
-	g := s.operands[l-1].(*op_glob)
-
-	if s.err == nil {
-		s.operands = s.operands[:l-1]
-		return
-	}
-
-	s.unwind(&g.bt)
-	s.err = nil
-	l = len(s.operands)
-
-	nextIdx := -1
-	searchStart := g.idx - 1
-	if searchStart >= 0 {
-		if g.lookahead.Symbol != symEmpty {
-			nextIdx = __posymSeqLastIndex(s.tie.syms, searchStart, g.lookahead.Symbol)
-		}
-		if nextIdx == -1 {
-			nextIdx = searchStart
-		}
-	}
-
-	if nextIdx < 0 {
-		if s.tie.ensure_syms() {
-			s.ops = append(s.ops, opConseqGlobGreed)
-			return
-		}
-		s.operands = s.operands[:l-1]
-		s.capture(nil)
-		s.err = errMatchFailed
-		return
-	}
-
-	g.idx = nextIdx
-	g.bt = s.checkpoint(undoBranch)
-	s.operands = s.operands[:l-1]
-
-	left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, nextIdx)
-
-	var restore []posym
-	if right.Symbol != symEmpty || right.len() > 0 {
-		restore = append(restore, right)
-	}
-	if targetIdx != -1 && targetIdx+1 < len(s.tie.syms) {
-		restore = append(restore, s.tie.syms[targetIdx+1:]...)
-	}
-
-	s.tie.syms = restore
-
-	finalStem := append(append([]posym(nil), g.stem...), left...)
-	s.capture(finalStem)
-}
-
-func (s *symstr) opTryGlobGreedRev(l int) {
-	g := s.operands[l-1].(*op_glob)
-
-	if s.err == nil {
-		s.operands = s.operands[:l-1]
-		return
-	}
-
-	s.unwind(&g.bt)
-	s.err = nil
-	l = len(s.operands)
-
-	var totalBytes int
-	for _, ps := range s.tie.syms { totalBytes += ps.len() }
-
-	nextIdx := -1
-	searchStart := g.idx + g.lookahead.len()
-
-	if searchStart <= totalBytes {
-		if g.lookahead.Symbol != symEmpty {
-			nextIdx = __posymSeqIndex(s.tie.syms, searchStart, g.lookahead.Symbol)
-		}
-		if nextIdx == -1 {
-			nextIdx = searchStart
-		}
-	}
-
-	if nextIdx > totalBytes || nextIdx == -1 {
-		if s.tie.ensure_syms() {
-			s.ops = append(s.ops, opConseqGlobGreedRev)
-			return
-		}
-		s.operands = s.operands[:l-1]
-		s.capture_rev(nil)
-		s.err = errMatchFailed
-		return
-	}
-
-	g.idx = nextIdx
-	g.bt = s.checkpoint(undoBranch)
-	s.operands = s.operands[:l-1]
-
-	left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, nextIdx)
-
-	var restore []posym
-	if len(left) > 0 {
-		restore = append([]posym(nil), left...)
-	}
-
-	s.tie.syms = restore
-
-	var finalStem []posym
-	if right.Symbol != symEmpty || right.len() > 0 {
-		finalStem = append(finalStem, right)
-	}
-	if targetIdx != -1 && targetIdx+1 < len(s.tie.syms) {
-		finalStem = append(finalStem, s.tie.syms[targetIdx+1:]...)
-	}
-	finalStem = append(finalStem, g.stem...)
-	s.capture_rev(finalStem)
-}
-
-func (s *symstr) opTryGlobCross(l int) {
-	g := s.operands[l-1].(*op_glob)
-
-	if s.err == nil {
-		s.operands = s.operands[:l-1]
-		return
-	}
-
-	s.unwind(&g.bt)
-	s.err = nil
-	l = len(s.operands)
-
-	var totalBytes int
-	for _, ps := range s.tie.syms { totalBytes += ps.len() }
-
-	nextIdx := -1
-	searchStart := g.idx + g.lookahead.len()
-
-	if searchStart <= totalBytes {
-		if g.lookahead.Symbol != symEmpty {
-			nextIdx = __posymSeqIndex(s.tie.syms, searchStart, g.lookahead.Symbol)
-		}
-		if nextIdx == -1 {
-			nextIdx = searchStart
-		}
-	}
-
-	if nextIdx > totalBytes || nextIdx == -1 {
-		if s.tie.ensure_syms() {
-			s.ops = append(s.ops, opConseqGlobCross)
-			return
-		}
-		s.operands = s.operands[:l-1]
-		s.capture(nil)
-		s.err = errMatchFailed
-		return
-	}
-
-	g.idx = nextIdx
-	g.bt = s.checkpoint(undoBranch)
-	s.operands = s.operands[:l-1]
-
-	left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, nextIdx)
-
-	var restore []posym
-	if right.Symbol != symEmpty || right.len() > 0 {
-		restore = append(restore, right)
-	}
-	if targetIdx != -1 && targetIdx+1 < len(s.tie.syms) {
-		restore = append(restore, s.tie.syms[targetIdx+1:]...)
-	}
-
-	s.tie.syms = restore
-
-	finalStem := append(append([]posym(nil), g.stem...), left...)
-	s.capture(finalStem)
-}
-
-func (s *symstr) opTryGlobCrossRev(l int) {
-	g := s.operands[l-1].(*op_glob)
-
-	if s.err == nil {
-		s.operands = s.operands[:l-1]
-		return
-	}
-
-	s.unwind(&g.bt)
-	s.err = nil
-	l = len(s.operands)
-
-	nextIdx := -1
-	searchStart := g.idx - 1
-
-	if searchStart >= 0 {
-		if g.lookahead.Symbol != symEmpty {
-			nextIdx = __posymSeqLastIndex(s.tie.syms, searchStart, g.lookahead.Symbol)
-		}
-		if nextIdx == -1 {
-			nextIdx = searchStart
-		}
-	}
-
-	if nextIdx < 0 {
-		if s.tie.ensure_syms() {
-			s.ops = append(s.ops, opConseqGlobCrossRev)
-			return
-		}
-		s.operands = s.operands[:l-1]
-		s.capture_rev(nil)
-		s.err = errMatchFailed
-		return
-	}
-
-	g.idx = nextIdx
-	g.bt = s.checkpoint(undoBranch)
-	s.operands = s.operands[:l-1]
-
-	left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, nextIdx)
-
-	var restore []posym
-	if len(left) > 0 {
-		restore = append([]posym(nil), left...)
-	}
-
-	s.tie.syms = restore
-
-	var finalStem []posym
-	if right.Symbol != symEmpty || right.len() > 0 {
-		finalStem = append(finalStem, right)
-	}
-	if targetIdx != -1 && targetIdx+1 < len(s.tie.syms) {
-		finalStem = append(finalStem, s.tie.syms[targetIdx+1:]...)
-	}
-	finalStem = append(finalStem, g.stem...)
-	s.capture_rev(finalStem)
-}
-
-func (s *symstr) opTryFallbackGlobSeg(l int) {
-	g := s.operands[l-1].(*fallback_glob)
-
-	if s.err == nil {
-		s.operands = s.operands[:l-1]
-		return
-	}
-
-	s.unwind(&g.bt)
-	s.err = nil
-	l = len(s.operands)
-
-	nextIdx := -1
-	searchStart := g.idx - 1
-	if searchStart >= 0 {
-		if g.lookahead.Symbol != symEmpty {
-			nextIdx = __posymSeqLastIndex(s.syms, searchStart, g.lookahead.Symbol)
-		}
-		if nextIdx == -1 {
-			nextIdx = searchStart
-		}
-	}
-
-	if nextIdx != -1 {
-		slashIdx := __posymSeqIndex(s.syms, 0, symSlash)
-		if slashIdx != -1 && slashIdx < nextIdx {
-			nextIdx = -1
-		}
-	}
-
-	if nextIdx < 0 {
-		if s.tie.ensure_syms() {
-			s.ops = append(s.ops, opConseqGlobSeg)
-			return
-		}
-		s.capture_fallback(nil)
-		s.operands = s.operands[:l-1]
-		s.ops = append(s.ops, opFallbackGlobSeg)
-		s.err = errMatchFailed
-		return
-	}
-
-	g.idx = nextIdx
-	g.bt = s.checkpoint(undoBranch)
-
-	s.operands = s.operands[:l-1]
-
-	left, right, targetIdx := __posymSeqSplitAt(s.syms, nextIdx)
-
-	var restore []posym
-	if right.Symbol != symEmpty || right.len() > 0 {
-		restore = append(restore, right)
-	}
-	if targetIdx != -1 && targetIdx+1 < len(s.syms) {
-		restore = append(restore, s.syms[targetIdx+1:]...)
-	}
-
-	s.syms = nil
-	for i := len(restore) - 1; i >= 0; i-- {
-		s.ops = append(s.ops, opMatchLiteral)
-		s.operands = append(s.operands, match_lit{restore[i]})
-	}
-
-	finalStem := append(append([]posym(nil), g.stem...), left...)
-	s.capture_fallback(finalStem)
-}
-
-func (s *symstr) opTryFallbackGlobSegRev(l int) {
-	g := s.operands[l-1].(*fallback_glob)
-
-	if s.err == nil {
-		s.operands = s.operands[:l-1]
-		return
-	}
-
-	s.unwind(&g.bt)
-	s.err = nil
-	l = len(s.operands)
-
-	var totalBytes int
-	for _, ps := range s.syms { totalBytes += ps.len() }
-
-	nextIdx := -1
-	searchStart := g.idx + g.lookahead.len()
-
-	if searchStart <= totalBytes {
-		if g.lookahead.Symbol != symEmpty {
-			nextIdx = __posymSeqIndex(s.syms, searchStart, g.lookahead.Symbol)
-		}
-		if nextIdx == -1 {
-			nextIdx = searchStart
-		}
-	}
-
-	if nextIdx != -1 {
-		slashIdx := __posymSeqLastIndex(s.syms, totalBytes-1, symSlash)
-		if slashIdx != -1 && slashIdx > nextIdx {
-			nextIdx = -1
-		}
-	}
-
-	if nextIdx > totalBytes || nextIdx == -1 {
-		if s.tie.ensure_syms() {
-			s.ops = append(s.ops, opConseqGlobSegRev)
-			return
-		}
-		s.capture_fallback_rev(nil)
-		s.operands = s.operands[:l-1]
-		s.ops = append(s.ops, opFallbackGlobSegRev)
-		s.err = errMatchFailed
-		return
-	}
-
-	g.idx = nextIdx
-	g.bt = s.checkpoint(undoBranch)
-
-	s.operands = s.operands[:l-1]
-
-	left, right, targetIdx := __posymSeqSplitAt(s.syms, nextIdx)
-
-	var restore []posym
-	if len(left) > 0 {
-		restore = append([]posym(nil), left...)
-	}
-
-	s.syms = nil
-	for i := len(restore) - 1; i >= 0; i-- {
-		s.ops = append(s.ops, opMatchLiteralRev)
-		s.operands = append(s.operands, match_lit{restore[i]})
-	}
-
-	var finalStem []posym
-	if right.Symbol != symEmpty || right.len() > 0 {
-		finalStem = append(finalStem, right)
-	}
-	if targetIdx != -1 && targetIdx+1 < len(s.syms) {
-		finalStem = append(finalStem, s.syms[targetIdx+1:]...)
-	}
-	finalStem = append(finalStem, g.stem...)
-	s.capture_fallback_rev(finalStem)
-}
-
-func (s *symstr) opTryFallbackGlobGreed(l int) {
-	g := s.operands[l-1].(*fallback_glob)
-
-	if s.err == nil {
-		s.operands = s.operands[:l-1]
-		return
-	}
-
-	s.unwind(&g.bt)
-	s.err = nil
-	l = len(s.operands)
-
-	nextIdx := -1
-	searchStart := g.idx - 1
-	if searchStart >= 0 {
-		if g.lookahead.Symbol != symEmpty {
-			nextIdx = __posymSeqLastIndex(s.syms, searchStart, g.lookahead.Symbol)
-		}
-		if nextIdx == -1 {
-			nextIdx = searchStart
-		}
-	}
-
-	if nextIdx < 0 {
-		if s.tie.ensure_syms() {
-			s.ops = append(s.ops, opConseqGlobGreed)
-			return
-		}
-		s.capture_fallback(nil)
-		s.operands = s.operands[:l-1]
-		s.ops = append(s.ops, opFallbackGlobGreed)
-		s.err = errMatchFailed
-		return
-	}
-
-	g.idx = nextIdx
-	g.bt = s.checkpoint(undoBranch)
-
-	s.operands = s.operands[:l-1]
-
-	left, right, targetIdx := __posymSeqSplitAt(s.syms, nextIdx)
-
-	var restore []posym
-	if right.Symbol != symEmpty || right.len() > 0 {
-		restore = append(restore, right)
-	}
-	if targetIdx != -1 && targetIdx+1 < len(s.syms) {
-		restore = append(restore, s.syms[targetIdx+1:]...)
-	}
-
-	s.syms = nil
-	for i := len(restore) - 1; i >= 0; i-- {
-		s.ops = append(s.ops, opMatchLiteral)
-		s.operands = append(s.operands, match_lit{restore[i]})
-	}
-
-	finalStem := append(append([]posym(nil), g.stem...), left...)
-	s.capture_fallback(finalStem)
-}
-
-func (s *symstr) opTryFallbackGlobGreedRev(l int) {
-	g := s.operands[l-1].(*fallback_glob)
-
-	if s.err == nil {
-		s.operands = s.operands[:l-1]
-		return
-	}
-
-	s.unwind(&g.bt)
-	s.err = nil
-	l = len(s.operands)
-
-	var totalBytes int
-	for _, ps := range s.syms { totalBytes += ps.len() }
-
-	nextIdx := -1
-	searchStart := g.idx + g.lookahead.len()
-
-	if searchStart <= totalBytes {
-		if g.lookahead.Symbol != symEmpty {
-			nextIdx = __posymSeqIndex(s.syms, searchStart, g.lookahead.Symbol)
-		}
-		if nextIdx == -1 {
-			nextIdx = searchStart
-		}
-	}
-
-	if nextIdx > totalBytes || nextIdx == -1 {
-		if s.tie.ensure_syms() {
-			s.ops = append(s.ops, opConseqGlobGreedRev)
-			return
-		}
-		s.capture_fallback_rev(nil)
-		s.operands = s.operands[:l-1]
-		s.ops = append(s.ops, opFallbackGlobGreedRev)
-		s.err = errMatchFailed
-		return
-	}
-
-	g.idx = nextIdx
-	g.bt = s.checkpoint(undoBranch)
-
-	s.operands = s.operands[:l-1]
-
-	left, right, targetIdx := __posymSeqSplitAt(s.syms, nextIdx)
-
-	var restore []posym
-	if len(left) > 0 {
-		restore = append([]posym(nil), left...)
-	}
-
-	s.syms = nil
-	for i := len(restore) - 1; i >= 0; i-- {
-		s.ops = append(s.ops, opMatchLiteralRev)
-		s.operands = append(s.operands, match_lit{restore[i]})
-	}
-
-	var finalStem []posym
-	if right.Symbol != symEmpty || right.len() > 0 {
-		finalStem = append(finalStem, right)
-	}
-	if targetIdx != -1 && targetIdx+1 < len(s.syms) {
-		finalStem = append(finalStem, s.syms[targetIdx+1:]...)
-	}
-	finalStem = append(finalStem, g.stem...)
-	s.capture_fallback_rev(finalStem)
-}
-
-func (s *symstr) opTryFallbackGlobCross(l int) {
-	g := s.operands[l-1].(*fallback_glob)
-
-	if s.err == nil {
-		s.operands = s.operands[:l-1]
-		return
-	}
-
-	s.unwind(&g.bt)
-	s.err = nil
-	l = len(s.operands)
-
-	var totalBytes int
-	for _, ps := range s.syms { totalBytes += ps.len() }
-
-	nextIdx := -1
-	searchStart := g.idx + g.lookahead.len()
-
-	if searchStart <= totalBytes {
-		if g.lookahead.Symbol != symEmpty {
-			nextIdx = __posymSeqIndex(s.syms, searchStart, g.lookahead.Symbol)
-		}
-		if nextIdx == -1 {
-			nextIdx = searchStart
-		}
-	}
-
-	if nextIdx > totalBytes || nextIdx == -1 {
-		if s.tie.ensure_syms() {
-			s.ops = append(s.ops, opConseqGlobCross)
-			return
-		}
-		s.capture_fallback(nil)
-		s.operands = s.operands[:l-1]
-		s.ops = append(s.ops, opFallbackGlobCross)
-		s.err = errMatchFailed
-		return
-	}
-
-	g.idx = nextIdx
-	g.bt = s.checkpoint(undoBranch)
-
-	s.operands = s.operands[:l-1]
-
-	left, right, targetIdx := __posymSeqSplitAt(s.syms, nextIdx)
-
-	var restore []posym
-	if right.Symbol != symEmpty || right.len() > 0 {
-		restore = append(restore, right)
-	}
-	if targetIdx != -1 && targetIdx+1 < len(s.syms) {
-		restore = append(restore, s.syms[targetIdx+1:]...)
-	}
-
-	s.syms = nil
-	for i := len(restore) - 1; i >= 0; i-- {
-		s.ops = append(s.ops, opMatchLiteral)
-		s.operands = append(s.operands, match_lit{restore[i]})
-	}
-
-	finalStem := append(append([]posym(nil), g.stem...), left...)
-	s.capture_fallback(finalStem)
-}
-
-func (s *symstr) opTryFallbackGlobCrossRev(l int) {
-	g := s.operands[l-1].(*fallback_glob)
-
-	if s.err == nil {
-		s.operands = s.operands[:l-1]
-		return
-	}
-
-	s.unwind(&g.bt)
-	s.err = nil
-	l = len(s.operands)
-
-	nextIdx := -1
-	searchStart := g.idx - 1
-
-	if searchStart >= 0 {
-		if g.lookahead.Symbol != symEmpty {
-			nextIdx = __posymSeqLastIndex(s.syms, searchStart, g.lookahead.Symbol)
-		}
-		if nextIdx == -1 {
-			nextIdx = searchStart
-		}
-	}
-
-	if nextIdx < 0 {
-		if s.tie.ensure_syms() {
-			s.ops = append(s.ops, opConseqGlobCrossRev)
-			return
-		}
-		s.capture_fallback_rev(nil)
-		s.operands = s.operands[:l-1]
-		s.ops = append(s.ops, opFallbackGlobCrossRev)
-		s.err = errMatchFailed
-		return
-	}
-
-	g.idx = nextIdx
-	g.bt = s.checkpoint(undoBranch)
-
-	s.operands = s.operands[:l-1]
-
-	left, right, targetIdx := __posymSeqSplitAt(s.syms, nextIdx)
-
-	var restore []posym
-	if len(left) > 0 {
-		restore = append([]posym(nil), left...)
-	}
-
-	s.syms = nil
-	for i := len(restore) - 1; i >= 0; i-- {
-		s.ops = append(s.ops, opMatchLiteralRev)
-		s.operands = append(s.operands, match_lit{restore[i]})
-	}
-
-	var finalStem []posym
-	if right.Symbol != symEmpty || right.len() > 0 {
-		finalStem = append(finalStem, right)
-	}
-	if targetIdx != -1 && targetIdx+1 < len(s.syms) {
-		finalStem = append(finalStem, s.syms[targetIdx+1:]...)
-	}
-	finalStem = append(finalStem, g.stem...)
-	s.capture_fallback_rev(finalStem)
-}
-
-func (s *symstr) opRegexMatch(l int) {
-	rx := s.operands[l-1].(*regexp.Regexp)
-	s.operands = s.operands[:l-1]
-
-	snap_err := s.tie.err
-	snap_head := s.tie.vmhead // Native safe VM coordinate struct capture
-	smem := &symsmem{symstr: s.tie}
-	locs := rx.FindReaderSubmatchIndex(smem)
-
-	s.tie.vmhead = snap_head
-	s.tie.err = snap_err
-	smem.revert()
-
-	if locs == nil {
-		s.err = errMatchFailedPreRegex
-		return
-	}
-
-	names := rx.SubexpNames()
-	stemStartIdx := len(s.stems)
-
-	// Initialize capture groups with relative byte offsets
-	for i := 2; i < len(locs); i += 2 {
-		if locs[i] != -1 && locs[i+1] != -1 && locs[i] <= locs[i+1] {
-			name := symEmptyName
-			if expIdx := i / 2; expIdx < len(names) {
-				if ns := names[expIdx]; ns != "" { name = intern(ns) }
-			}
-			s.stems = append(s.stems, capture{
-				start: locs[i],
-				end:   locs[i+1],
-				name:  posym{NoPos, name},
-				syms:  make([]posym, 0), // Guarantee a non-nil slice foundation!
-			})
-		} else {
-			s.stems = append(s.stems, capture{start: -1, name: posym{NoPos, symEmptyName}, syms: nil})
-		}
-	}
-
-	total := 0
-	consumed := locs[1]
-	var emitted []posym
-
-	for total < consumed {
-		if !s.tie.ensure_syms() {
-			s.err = errMatchFailedPreRegex
-			return
-		}
-
-		popped := s.tie.pop_head()
-		slen := popped.len()
-		needed := consumed - total
-
-		var ps posym
-		if slen > needed {
-			str := popped.String()
-
-			remPos := NoPos
-			if popped.Pos != NoPos { remPos = popped.Pos + Pos(needed) }
-
-			s.tie.syms = append([]posym{{remPos, intern(str[needed:])}}, s.tie.syms...)
-			ps = posym{popped.Pos, intern(str[:needed])}
-		} else {
-			ps = popped
-		}
-
-		emitted = append(emitted, ps)
-		symBytes := ps.len()
-
-		start := total
-		end := total + symBytes
-		total += symBytes
-
-		// Intersect the token's byte boundaries with the regex capture groups
-		for i := stemStartIdx; i < len(s.stems); i++ {
-			cap := s.stems[i]
-
-			if cap.start != -1 && start < cap.end && end > cap.start {
-				if start >= cap.start && end <= cap.end {
-					cap.syms = append(cap.syms, ps)
-				} else {
-					sliceStart := 0
-					if cap.start > start { sliceStart = cap.start - start }
-
-					sliceEnd := symBytes
-					if cap.end < end { sliceEnd = cap.end - start }
-
-					if sliceStart < sliceEnd {
-						str := ps.String()
-						fragPos := NoPos
-						if ps.Pos != NoPos { fragPos = ps.Pos + Pos(sliceStart) }
-						cap.syms = append(cap.syms, posym{fragPos, intern(str[sliceStart:sliceEnd])})
-					}
-				}
-				s.stems[i] = cap
-			}
-		}
-	}
-
-	if len(emitted) > 0 {
-		for i := len(emitted) - 1; i >= 0; i-- {
-			s.ops = append(s.ops, opPack)
-			s.operands = append(s.operands, emitted[i])
-		}
-	}
-}
-
-func (s *symstr) opRegexMatchRev(l int) {
-	rx := s.operands[l-1].(*regexp.Regexp)
-	s.operands = s.operands[:l-1]
-
-	snap_err := s.tie.err
-	snap_head := s.tie.vmhead // Native safe VM coordinate struct capture
-	smem := &symsmem{symstr: s.tie}
-	locs := rx.FindReaderSubmatchIndex(smem)
-
-	s.tie.vmhead = snap_head
-	s.tie.err = snap_err
-	smem.revert()
-
-	if locs == nil {
-		s.err = errMatchFailedPreRegex
-		return
-	}
-
-	names := rx.SubexpNames()
-	stemStartIdx := len(s.stems)
-
-	// Initialize capture groups with relative byte offsets
-	for i := 2; i < len(locs); i += 2 {
-		if locs[i] != -1 && locs[i+1] != -1 && locs[i] <= locs[i+1] {
-			name := symEmptyName
-			if expIdx := i / 2; expIdx < len(names) {
-				if ns := names[expIdx]; ns != "" { name = intern(ns) }
-			}
-			s.stems = append(s.stems, capture{
-				start: locs[i],
-				end:   locs[i+1],
-				name:  posym{NoPos, name},
-				syms:  make([]posym, 0), // Guarantee a non-nil slice foundation!
-			})
-		} else {
-			s.stems = append(s.stems, capture{start: -1, name: posym{NoPos, symEmptyName}, syms: nil})
-		}
-	}
-
-	total := 0
-	consumed := locs[1]
-	var emitted []posym
-
-	for total < consumed {
-		if !s.tie.ensure_syms() {
-			s.err = errMatchFailedPreRegex
-			return
-		}
-
-		popped := s.tie.pop_head()
-		slen := popped.len()
-		needed := consumed - total
-
-		var ps posym
-		if slen > needed {
-			str := popped.String()
-
-			remPos := NoPos
-			if popped.Pos != NoPos { remPos = popped.Pos + Pos(needed) }
-
-			s.tie.syms = append([]posym{{remPos, intern(str[needed:])}}, s.tie.syms...)
-			ps = posym{popped.Pos, intern(str[:needed])}
-		} else {
-			ps = popped
-		}
-
-		emitted = append(emitted, ps)
-		symBytes := ps.len()
-
-		start := total
-		end := total + symBytes
-		total += symBytes
-
-		// Intersect the token's byte boundaries with the regex capture groups
-		for i := stemStartIdx; i < len(s.stems); i++ {
-			cap := s.stems[i]
-
-			if cap.start != -1 && start < cap.end && end > cap.start {
-				if start >= cap.start && end <= cap.end {
-					cap.syms = append(cap.syms, ps)
-				} else {
-					sliceStart := 0
-					if cap.start > start { sliceStart = cap.start - start }
-
-					sliceEnd := symBytes
-					if cap.end < end { sliceEnd = cap.end - start }
-
-					if sliceStart < sliceEnd {
-						str := ps.String()
-						fragPos := NoPos
-						if ps.Pos != NoPos { fragPos = ps.Pos + Pos(sliceStart) }
-						cap.syms = append(cap.syms, posym{fragPos, intern(str[sliceStart:sliceEnd])})
-					}
-				}
-				s.stems[i] = cap
-			}
-		}
-	}
-
-	if len(emitted) > 0 {
-		for _, ps := range emitted {
-			s.ops = append(s.ops, opPackRev)
-			s.operands = append(s.operands, ps)
-		}
-	}
-}
-
-func (s *symstr) opSelect(l int) {
-	o_eval := s.operands[l-1].(Value)
-	s_eval := s.operands[l-2].(Value)
-	v := s.operands[l-3].(*arrow)
-	s.operands = s.operands[:l-3]
-
-	var p0 = v.Pos()
-	var _, lhs_is_opt = selprop(s.Context, v.o)
-	var os = selobjs(s.Context, v.t, o_eval)
-
-	var flattened_ss []Value
-	if lst, ok := s_eval.(*list); ok {
-		flattened_ss = lst.elems
-	} else if _, ok := s_eval.(*null); !ok {
-		flattened_ss = []Value{s_eval}
-	}
-
-	// THE DOD FIX: Right-Associative Inert Unpacker
-	// If the parser fed us a right-associative chain (A -> (B -> C)) that evaluated
-	// into an inert compound [B, →, C], we unpack it into [B, C] so we can fold
-	// them sequentially over the parent object!
-	var unpack func(val Value, out *[]Value)
-	unpack = func(val Value, out *[]Value) {
-		if c, ok := val.(*compound); ok {
-			for _, elem := range c.elems {
-				if p, ok := elem.(*punct); ok && p.s == symArrow {
-					for _, e := range c.elems {
-						if p, ok := e.(*punct); ok && p.s == symArrow {
-							continue
-						}
-						unpack(e, out)
-					}
-					return
-				}
-			}
-		}
-		*out = append(*out, val)
-	}
-
-	var vals []Value
-	for _, o := range os {
-		for _, st := range flattened_ss {
-			var chain []Value
-			unpack(st, &chain)
-
-			curr_o := o
-			var final_val Value
-			var p Pos = st.Pos()
-
-			// Iteratively fold the property chain over the object
-			for i, link := range chain {
-				p = link.Pos()
-				prop_sym, is_opt := selprop(s.Context, link)
-				prop := sel(s.Context, curr_o, prop_sym)
-
-				if prop == nil {
-					// Use the combined optionality of the current link and the LHS
-					if is_opt || lhs_is_opt || optional(link) || optional(curr_o) {
-						if truly(s.Context, keep_autos{}) {
-							s.do(s.Context, act_defer_macro{})
-							var actual_o = curr_o
-							for {
-								if locVal, ok := actual_o.(*loc); ok { actual_o = locVal.Value; continue }
-								if defVal, ok := actual_o.(*def); ok {
-									if defVal.value != nil { actual_o = defVal.value; continue }
-								}
-								break
-							}
-
-							// Rebuild the remainder of the inert chain
-							inertElems := []Value{actual_o}
-							for j := i; j < len(chain); j++ {
-								inertElems = append(inertElems, _punct(chain[j].Pos(), symArrow), chain[j])
-							}
-							final_val = &compound{elements{inertElems}}
-						} else {
-							final_val = _loc(_null(p), p0)
-						}
-					} else {
-						erro(pc(s.Context, p), "%v: no such property '%s'", curr_o, prop_sym, trace_ctx{100}, callstack{num: 12})
-						final_val = _loc(_null(p), p0)
-					}
-					break // Stop the chain early if a property lookup fails
-				} else {
-					curr_o = prop
-					final_val = _loc(_loc(prop, p), p0) // Wrap success identically to the original
-				}
-			}
-			vals = append(vals, final_val)
-		}
-	}
-
-	var res Value
-	if len(vals) == 0 { res = _null(p0) } else if len(vals) == 1 { res = vals[0] } else { res = &list{elements{vals}} }
-	s.results = append(s.results, res)
-}
-
-func (s *symstr) opCompose(l int) {
-	cons := s.operands[l-1].([]any)
-	kind := s.operands[l-2].(Kind)
-	s.operands = s.operands[:l-2]
-
-	// 1. Seed the Cartesian matrix with an empty branch
-	var branches [][]Value
-	branches = append(branches, []Value{})
-
-	for _, x := range cons {
-		val := x.(Value)
-
-		var items []Value
-		if lst, ok := val.(*list); ok {
-			items = lst.elems
-		} else if _, ok := val.(*null); !ok {
-			items = []Value{val}
-		}
-
-		if len(items) == 0 {
-			// CRITICAL FIX: An empty list mathematically kills Cartesian products
-			// like brace expansion (KindGlobbrace), BUT it must NOT kill
-			// string concatenations (KindCompound, KindQualword, KindPath)!
-			if kind == KindCompound || kind == KindQualword || kind == KindPath {
-				continue
-			} else {
-				branches = nil
-				break
-			}
-		}
-
-		// 2. Cartesian Product Loop (NxM Expansion)
-		var next [][]Value
-		for _, branch := range branches {
-			for _, item := range items {
-				newBranch := make([]Value, len(branch), len(branch)+1)
-				copy(newBranch, branch)
-
-				// Flatten nested AST nodes natively depending on the composing type
-				switch kind {
-				case KindGlobbrace:
-					if t, ok := item.(*globbrace); ok {
-						newBranch = append(newBranch, t.elems...)
-					} else {
-						newBranch = append(newBranch, item)
-					}
-				case KindCompound:
-					if t, ok := item.(*compound); ok {
-						newBranch = append(newBranch, t.elems...)
-					} else {
-						newBranch = append(newBranch, item)
-					}
-				case KindQualword:
-					if t, ok := item.(*qualword); ok {
-						newBranch = append(newBranch, t.elems...)
-					} else {
-						newBranch = append(newBranch, item)
-					}
-				case KindPath:
-					if t, ok := item.(*path); ok {
-						newBranch = append(newBranch, t.elems...)
-					} else {
-						newBranch = append(newBranch, item)
-					}
-				default:
-					// Kinds like Pair, Loc, and Flag do not associatively flatten themselves!
-					newBranch = append(newBranch, item)
-				}
-				next = append(next, newBranch)
-			}
-		}
-		branches = next
-	}
-
-	// 3. Rebuild the Branches into AST Nodes
-	var results []Value
-	for _, branch := range branches {
-		var node Value
-		if len(branch) == 0 {
-			var p Pos
-			if len(cons) > 0 { p = cons[0].(Value).Pos() }
-			node = _null(p)
-		} else if len(branch) == 1 && (kind == KindCompound || kind == KindQualword) {
-			// Only associative sequences can safely unwrap singletons!
-			node = branch[0]
-		} else {
-			switch kind {
-			case KindGlobbrace: node = &globbrace{compound{elements{branch}}}
-			case KindCompound: node = &compound{elements{branch}}
-			case KindQualword: node = &qualword{elements{branch}}
-			case KindPath:     node = &path{elements{branch}}
-			case KindPair:
-				if len(branch) >= 2 {
-					node = &pair{branch[0], branch[1]}
-				} else {
-					node = branch[0] // Safety fallback
-				}
-			case KindFlag:
-				node = flag{branch[0]}
-			case KindLoc:
-				node = &loc{branch[0], cons[0].(Value).Pos()}
-			default:
-				node = &compound{elements{branch}} // fallback
-			}
-		}
-
-		if false && checkpoints {
-			if node.kind() != kind {
-				erro(pc(s.Context,node), "composed kind conflicts: %v != %v", node.kind(), kind)
-				s.operands = append(s.operands, track(callstack{num:5}))
-				s.ops = append(s.ops, opDebug)
-			}
-		}
-
-		// Trigger legacy `com()`-style wrapper distribution natively
-		results = append(results, /* redis */(node))
-	}
-
-	// 4. Yield Unconditionally to the Results Tape
-	var res Value
-	switch len(results) {
-	case 0 : res = _null(_pos(s.Context))
-	case 1 : res = results[0]
-	default: res = &list{elements{results}}
-	}
-
-	if false && checkpoints {
-		if res.kind() != kind {
-			erro(pc(s.Context,res), "composed kind conflicts: %v != %v", res.kind(), kind)
-			s.operands = append(s.operands, track(callstack{num:5}))
-			s.ops = append(s.ops, opDebug)
-		}
-	}
-
-	s.results = append(s.results, res)
-}
-
-//////////////////////////////////////////////////////////////////////
-
 type ident_result struct { Value; name Symbol }
 type resolve_result struct { Value; obj Value }
+type loop_sep struct { posym }
 
 type restore_context struct { Context }
 func (c restore_context) String() string {
 	var b compactbuilds
-	b.writef("RestoreContext{%s}", typeof(c.Context))
+	if false {
+		b.writef("RestoreContext{%s}", typeof(c.Context))
+	} else {
+		b.writef("RestoreContext{%s", typeof(c.Context))
+		for i, in := 0, inner(c.Context); i < 3 && in != nil; i++{
+			b.writef("←%s", typeof(in))
+			in = inner(in)
+		}
+		b.write("}")
+	}
 	return b.shared()
 }
 
@@ -6596,109 +3373,21 @@ func (l *op_loop) String() string {
 	return b.shared()
 }
 
-func (s *symstr) opUnroll(l int) {
-	targetOp := s.operands[l-1].(evalop)
-	arg      := s.operands[l-2]
-	s.operands = s.operands[:l-2]
-
-	switch t := arg.(type) {
-	case *list:
-		if len(t.elems) == 0 { return }
-		s.ops = append(s.ops, opLoop)
-		s.operands = append(s.operands, &op_loop{t.elems, 1, 0, len(t.elems), targetOp, symSpace})
-
-	case *compound:
-		if len(t.elems) == 0 { return }
-		s.ops = append(s.ops, opLoop)
-		s.operands = append(s.operands, &op_loop{t.elems, 1, 0, len(t.elems), targetOp, symEmpty})
-
-	case *path:
-		if len(t.elems) == 0 { return }
-		s.ops = append(s.ops, opLoop)
-		s.operands = append(s.operands, &op_loop{t.elems, 1, 0, len(t.elems), targetOp, symSlash})
-
-	case *qualword:
-		if len(t.elems) == 0 { return }
-		s.ops = append(s.ops, opLoop)
-		s.operands = append(s.operands, &op_loop{t.elems, 1, 0, len(t.elems), targetOp, symDot})
-
-	// case *strlit:
-	// 	// 1. Push TAIL (Executes Last)
-	// 	s.ops = append(s.ops, targetOp)
-	// 	s.operands = append(s.operands, posym{NoPos, symApostrophe})
-
-	// 	// 2. Push LOOP (Executes Middle)
-	// 	if len(t.elems) > 0 {
-	// 		s.ops = append(s.ops, opCompound, opLoop) // Assumes strlit packs like compound
-	// 		s.operands = append(s.operands, len(t.elems), &op_loop{t.elems, 1, 0, len(t.elems), targetOp, symEmpty})
-	// 	}
-
-	// 	// 3. Push HEAD (Executes First)
-	// 	s.ops = append(s.ops, targetOp)
-	// 	s.operands = append(s.operands, posym{NoPos, symApostrophe})
-
-	// TODO: ... other AST cases
-
-	case Value: // SCALAR OPTIMIZATION
-		s.ops = append(s.ops, targetOp)
-		s.operands = append(s.operands, t)
-	}
-}
-
-func (s *symstr) opUnrollRev(l int) {
-	targetOp := s.operands[l-1].(evalop)
-	node     := s.operands[l-2]
-	s.operands = s.operands[:l-2]
-
-	switch t := node.(type) {
-	case *list:
-		if len(t.elems) == 0 { return }
-		s.ops = append(s.ops, opLoop)
-		s.operands = append(s.operands, &op_loop{t.elems, -1, len(t.elems) - 1, -1, targetOp, symSpace})
-
-	case *compound:
-		if len(t.elems) == 0 { return }
-		s.ops = append(s.ops, opLoop)
-		s.operands = append(s.operands, &op_loop{t.elems, -1, len(t.elems) - 1, -1, targetOp, symEmpty})
-
-	case *path:
-		if len(t.elems) == 0 { return }
-		s.ops = append(s.ops, opLoop)
-		s.operands = append(s.operands, &op_loop{t.elems, -1, len(t.elems) - 1, -1, targetOp, symSlash})
-
-	case *qualword:
-		if len(t.elems) == 0 { return }
-		s.ops = append(s.ops, opLoop)
-		s.operands = append(s.operands, &op_loop{t.elems, -1, len(t.elems) - 1, -1, targetOp, symDot})
-
-	// case *strlit:
-	// 	// 1. Push HEAD (Executes Last in Reverse)
-	// 	s.ops = append(s.ops, targetOp)
-	// 	s.operands = append(s.operands, posym{NoPos, symApostrophe})
-
-	// 	// 2. Push LOOP (Executes Middle)
-	// 	if len(t.elems) > 0 {
-	// 		s.ops = append(s.ops, opCompound, opLoop)
-	// 		s.operands = append(s.operands, len(t.elems), &op_loop{t.elems, -1, len(t.elems) - 1, -1, targetOp, symEmpty})
-	// 	}
-
-	// 	// 3. Push TAIL (Executes First in Reverse)
-	// 	s.ops = append(s.ops, targetOp)
-	// 	s.operands = append(s.operands, posym{NoPos, symApostrophe})
-
-	// TODO: ... other AST cases
-
-	case Value: // SCALAR OPTIMIZATION
-		s.ops = append(s.ops, targetOp)
-		s.operands = append(s.operands, t)
-	}
-}
-
-var d_step bool = checkpoints
-
 func (s *symstr) step() {
-	if checkpoints && d_step {
-		debug(s, "pc=%v stack={%v, %v, %v}, syms=%v stems=%v", s.opsDone, s.ops, s.operands, s.results, s.syms, s.stems) }
+	if checkpoints && d_step > 0 {
+		var f string
+		if d_step == 1 {
+			f = `pc=%[1]v %[2]v %[3]v %[4]v %[5]v %[6]v %[7]v`
+		} else {
+			f = `pc=%[1]v
+	   ops: %[2]v
+  operands: %[3]v
+   results: %[4]v
+	  syms: %[5]v
+	 stems: %[6]v`
+		}
+		debug(s, f, s.opsDone, s.ops, s.operands, s.results, s.syms, s.stems, s.values)
+	}
 
 	op := s.ops[len(s.ops)-1]
 	s.ops = s.ops[:len(s.ops)-1]
@@ -6706,9 +3395,6 @@ func (s *symstr) step() {
 
 _op_switch_:
 	switch l, rl := len(s.operands), len(s.results); op {
-	case opUnroll        : s.opUnroll(l)
-	case opUnrollRev     : s.opUnrollRev(l)
-
 	case opUnwind:
 		bt := s.operands[l-1].(*backtrack)
 		s.operands = s.operands[:l-1]
@@ -6743,7 +3429,7 @@ _op_switch_:
 		arr := make([]Value, n)
 		for i := 0; i < n; i++ {
 			// Slices the last N items from results and asserts them as AST Values
-			arr[i] = s.results[rl-n+i].(Value) 
+			arr[i] = s.results[rl-n+i].(Value)
 		}
 		s.results = append(s.results[:rl-n], arr)
 
@@ -6755,23 +3441,66 @@ _op_switch_:
 	case opYieldSym:
 		a := s.operands[l-1]
 		s.operands = s.operands[:l-1]
-
-		// Your existing shattering logic!
 		switch t := a.(type) {
 		case posym:
 			s.syms = append(s.syms, t)
 		case *word:
-			// If word contains a pre-shattered slice of posyms
 			s.syms = append(s.syms, posym{t.pos, t.s})
 		case *punct:
 			s.syms = append(s.syms, posym{t.pos, t.s})
-
-		// TODO: ... any other scalar types
-
+		case *decimal:
+			sym := t.sym; if sym == symEmpty { sym = intern(t.String()) }
+			s.syms = append(s.syms, posym{t.pos, sym})
+		case *float:
+			sym := t.sym; if sym == symEmpty { sym = intern(t.String()) }
+			s.syms = append(s.syms, posym{t.pos, sym})
+		case *answer:
+			sym := symEmpty; if t.bool { sym = symYes } else { sym = symNo }
+			s.syms = append(s.syms, posym{t.pos, sym})
+		case *boolean:
+			sym := symEmpty; if t.bool { sym = symTrue } else { sym = symFalse }
+			s.syms = append(s.syms, posym{t.pos, sym})
+		case *option:
+			sym := symEmpty; if t.bool { sym = symOn } else { sym = symOff }
+			s.syms = append(s.syms, posym{t.pos, sym})
+		case *escaped:
+			s.syms = append(s.syms, posym{t.pos, intern(t.s)})
+		case *raw:
+			s.syms = append(s.syms, posym{t.pos, __symbol(s.Context, t)})
+		case *defcaps:
+			s.syms = append(s.syms, posym{t.Pos(), __symbol(s.Context, t)})
+		case *def:
+			s.syms = append(s.syms, posym{t.pos, t.name})
+		case nil:
+			// Drop nils
 		default:
-			erro(pc(s,t), "FIXME: opYieldSym unhandled %T %v", t, t, unwind{})
+			erro(pc(s,t), "FIXME: opYieldSym unhandled %[1]T %[1]v", t, unwind{})
 		}
-		
+
+	case opFrame:
+		ctor := s.operands[l-1].(evalop)
+		s.operands = s.operands[:l-1]
+		s.frames = append(s.frames, frame{len(s.values), ctor})
+
+	case opShift:
+		val := s.operands[l-1].(Value)
+		s.operands = s.operands[:l-1]
+		s.values = append(s.values, val)
+
+	case opShiftResult:
+		val := s.results[rl-1].(Value)
+		s.results = s.results[:rl-1]
+		s.values = append(s.values, val)
+
+	case opReduce:
+		f := s.frames[len(s.frames)-1]
+		s.frames = s.frames[:len(s.frames)-1] // Pop the frame!
+
+		// Safe-copy the slice to prevent memory aliasing corruption!
+		s.operands = append(s.operands, append([]Value{}, s.values[f.i:]...))
+		s.ops = append(s.ops, f.ctor)
+		s.values = s.values[:f.i]
+
 	case opLoop:
 		// Notice we DO NOT pop s.operands here yet!
 		t := s.operands[l-1].(*op_loop)
@@ -6789,8 +3518,8 @@ _op_switch_:
 			// INJECT SEPARATOR
 			if t.sep != symEmpty {
 				s.ops = append(s.ops, t.op)
-				// Ensure the targetOp knows how to unpack a posym!
-				s.operands = append(s.operands, posym{NoPos, t.sep})
+				// Ensure the t.op knows how to unpack a posym!
+				s.operands = append(s.operands, loop_sep{posym{NoPos, t.sep}})
 			}
 		}
 
@@ -6829,7 +3558,7 @@ _op_switch_:
 			s.operands = append(s.operands, t, opIdent)
 			break _op_switch_ // Suspend current operation
 		default:
-			erro(pc(s.Context, x), "FIXME: opIdent unhandled %T %v", x, x, unwind{})
+			erro(pc(s.Context, x), "FIXME: opIdent unhandled %[1]T %[1]v", x, unwind{})
 		}
 
 		s.results = append(s.results, id)
@@ -6846,13 +3575,18 @@ _op_switch_:
 
 		var res Value
 		switch tok { // Fix: use `tok` instead of `p.l`
+		case SELECT_PROP, SELECT_PROG1, SELECT_PROG2:
+			erro(pc(s.Context,id.Pos()), "TODO: resolve_project: %v %v", id.Value, id.name)
 		case STRCOMP: // TODO: $"foo"
+			erro(pc(s.Context,id.Pos()), "TODO: %v %v", id.Value, id.name)
 		case STRING:  // TODO: $'foo'
+			erro(pc(s.Context,id.Pos()), "TODO: %v %v", id.Value, id.name)
 		case LPAREN:
 			if d := auto_find(s.Context, id.name); d != nil /* && d != x */ && d.value != nil {
 				res = d
 			} else {
 				res = project_resolve(s.Context, id.name)
+				debug(s, "%v %v %v", id.name, res, _fatpos(s.Context,res.Pos()))
 			}
 		case LBRACE:
 			if t := project_entry(s.Context, id.name); t.valid() { res = t }
@@ -6874,8 +3608,12 @@ _op_switch_:
 
 		var res Value
 		switch tok {
+		case SELECT_PROP, SELECT_PROG1, SELECT_PROG2:
+			erro(pc(s.Context,id.Pos()), "TODO: resolve_project: %v %v", id.Value, id.name)
 		case STRCOMP: // TODO: $"foo"
+			erro(pc(s.Context,id.Pos()), "TODO: %v %v", id.Value, id.name)
 		case STRING:  // TODO: $'foo'
+			erro(pc(s.Context,id.Pos()), "TODO: %v %v", id.Value, id.name)
 		case LPAREN:
 			if d := auto_find(s.Context, id.name); d != nil /* && d != x */ && d.value != nil {
 				res = d
@@ -6896,6 +3634,42 @@ _op_switch_:
 		// Future optimization: drop `x` if legacy funcs are updated to not require it
 		s.results = append(s.results, resolve_result{id.Value, res})
 
+	case opUnroll:
+		targetOp := s.operands[l-1].(evalop)
+		arg      := s.operands[l-2]
+		s.operands = s.operands[:l-2]
+
+		switch t := arg.(type) {
+		case *list:
+			if len(t.elems) == 0 { return }
+			s.ops = append(s.ops, opLoop)
+			s.operands = append(s.operands, &op_loop{t.elems, 1, 0, len(t.elems), targetOp, symSpace})
+
+		// TODO: Maybe *array, *tuple, or other generic data collections that need spreading
+
+		case Value: // SCALAR OPTIMIZATION
+			s.ops = append(s.ops, targetOp)
+			s.operands = append(s.operands, t)
+		}
+
+	case opUnrollRev:
+		targetOp := s.operands[l-1].(evalop)
+		arg      := s.operands[l-2]
+		s.operands = s.operands[:l-2]
+
+		switch t := arg.(type) {
+		case *list:
+			if len(t.elems) == 0 { return }
+			s.ops = append(s.ops, opLoop)
+			s.operands = append(s.operands, &op_loop{t.elems, -1, len(t.elems) - 1, -1, targetOp, symSpace})
+
+		// TODO: Maybe *array, *tuple, or other generic data collections that need spreading
+
+		case Value: // SCALAR OPTIMIZATION
+			s.ops = append(s.ops, targetOp)
+			s.operands = append(s.operands, t)
+		}
+		
 	case opExpand: // Designed for dynamic op (wrappers), e.g., opLoop.
 		s.ops = append(s.ops, opUnroll)
 		s.operands = append(s.operands, opEval)
@@ -6967,6 +3741,12 @@ _op_switch_:
 		case *rule: // opRule
 			erro(pc(s,arg), "VM execution trap: opEval unimplemented %T", arg, unwind{})
 
+		case *list:
+			if len(t.elems) > 0 {
+				s.ops = append(s.ops, opList, opSwap, opGroup, opLoop)
+				s.operands = append(s.operands, 1, len(t.elems), &op_loop{t.elems, 1, 0, len(t.elems), opExpand, symSpace})
+			}
+
 		case *compound, *qualword, *globbrace, *path:
 			var elems []Value
 			var composeOp evalop
@@ -6980,7 +3760,7 @@ _op_switch_:
 			// 1. Cartesian Composer (Executes Last)
 			// Reads s.results, matrix-expands, and pushes arrays to s.operands for the composeOp!
 			s.ops = append(s.ops, opCartesianCompose)
-			s.operands = append(s.operands, composeOp, len(elems))
+			s.operands = append(s.operands, len(elems), composeOp)
 
 			// 2. Evaluate Children (Executes First)
 			// Pushes evaluated components directly to s.results
@@ -6989,23 +3769,46 @@ _op_switch_:
 				s.operands = append(s.operands, &op_loop{elems, 1, 0, len(elems), opExpand, symEmpty})
 			}
 
-		case *list:
-			if len(t.elems) > 0 {
-				s.ops = append(s.ops, opList, opSwap, opGroup, opLoop)
-				s.operands = append(s.operands, 1, len(t.elems), &op_loop{t.elems, 1, 0, len(t.elems), opExpand, symSpace})
-			}
+		case *pair:
+			s.ops = append(s.ops, opCartesianCompose)
+			s.operands = append(s.operands, 2, opPair)
+			s.ops = append(s.ops, opLoop)
+			s.operands = append(s.operands, &op_loop{[]Value{t.key, t.val}, 1, 0, 2, opExpand, symEmpty})
+
+		case flag:
+			s.ops = append(s.ops, opCartesianCompose)
+			s.operands = append(s.operands, 1, opFlag)
+			s.ops = append(s.ops, opExpand)
+			s.operands = append(s.operands, t.Value)
 
 		case *conjunction:
+			elems := t.list.elems
+			s.ops = append(s.ops, opCartesianCompose)
+			s.operands = append(s.operands, len(elems)+1, opConjunct)
+
+			s.ops = append(s.ops, opExpand)
+			s.operands = append(s.operands, t.sep)
+
+			if len(elems) > 0 {
+				s.ops = append(s.ops, opLoop)
+				s.operands = append(s.operands, &op_loop{elems, 1, 0, len(elems), opExpand, symEmpty})
+			}
 
 		case *disjunction:
-			s.ops = append(s.ops, opUnroll)
-			s.operands = append(s.operands, opDisjunct, t.val)
+			s.ops = append(s.ops, opCartesianCompose)
+			s.operands = append(s.operands, 1, opDisjunct)
+			s.ops = append(s.ops, opExpand)
+			s.operands = append(s.operands, t.val)
 
-		case posym, Value:
+		case Value:
 			s.results = append(s.results, t)
 
 		case nil:
 			s.results = append(s.results, nil)
+
+		case loop_sep:
+			// Discard virtual separators injected by opLoop! They belong on the match tape, not the AST evaluation stack.
+			break _op_switch_
 
 		default:
 			erro(pc(s,arg), "VM execution trap: opEval unexpected %T", arg, unwind{})
@@ -7058,79 +3861,113 @@ _op_switch_:
 			res := s.builtin(t, o, a) // TODO: implement async_result and use goroutine
 			s.evoking = s.evoking[:len(s.evoking)-1]
 			s.results = append(s.results, res)
+		case Value: //*word, *raw, *strlit, *decimal, undef:
+			s.results = append(s.results, t)
 		default:
-			erro(pc(s,x), "opEvoke: unexpected %T %v", x.obj, x.obj, unwind{})
+			erro(pc(s,x), "opEvoke: unexpected %[1]T %[1]v", x.obj, unwind{})
 		}
 
 	case opCartesianCompose:
-		n := s.operands[l-1].(int)
-		constructOp := s.operands[l-2].(evalop)
+		constructOp := s.operands[l-1].(evalop)
+		n := s.operands[l-2].(int)
 		s.operands = s.operands[:l-2]
 
-		items := s.results[rl-n:]
-
-		var merge func(Value) []Value
-		merge = func(v Value) []Value {
-			if v == nil { return nil }
-			switch t := v.(type) {
-			case *loc:
-				elems := merge(t.Value)
-				for i, e := range elems { elems[i] = _loc(e, t.pos) }
-				return elems
-			case *list:
-				var elems []Value
-				for _, e := range t.elems { elems = append(elems, merge(e)...) }
-				return elems
-			}
-			return []Value{v}
-		}
-
 		var matrix [][]Value
-		for _, item := range items {
-			if item != nil {
-				matrix = append(matrix, merge(item.(Value)))
-			} else {
-				matrix = append(matrix, nil)
-			}
-		}
-
-		var cartesian func(int) [][]Value
-		cartesian = func(depth int) [][]Value {
-			if depth == len(matrix) { return [][]Value{{}} }
-			var res [][]Value
-			for _, v := range matrix[depth] {
-				for _, rest := range cartesian(depth+1) {
-					row := make([]Value, 0, 1+len(rest))
-					row = append(row, v)
-					row = append(row, rest...)
-					res = append(res, row)
-				}
-			}
-			return res
-		}
 
 		if n > 0 {
-			combinations := cartesian(0)
-			s.ops = append(s.ops, opCombineProduct)
-			s.operands = append(s.operands, combinations, constructOp)
+			// OPTIMIZATION 1: No intermediate array allocation.
+			// Read directly from s.results before popping!
+			matrix = make([][]Value, 0, n)
+
+			var merge func(Value) []Value
+			merge = func(v Value) []Value {
+				if v == nil { return nil }
+				switch t := v.(type) {
+				case *loc:
+					elems := merge(t.Value)
+					for i, e := range elems { elems[i] = _loc(e, t.pos) }
+					return elems
+				case *list:
+					var elems []Value
+					for _, e := range t.elems { elems = append(elems, merge(e)...) }
+					return elems
+				}
+				return []Value{v}
+			}
+
+			for i := rl - n; i < rl; i++ {
+				if item := s.results[i]; item != nil {
+					matrix = append(matrix, merge(item.(Value)))
+				} else {
+					matrix = append(matrix, nil)
+				}
+			}
+		}
+
+		// Pop the evaluated children safely now that we have our matrix
+		s.results = s.results[:rl-n]
+
+		if n > 0 {
+			// Calculate exact total size to pre-allocate memory
+			total := 1
+			for _, col := range matrix {
+				if len(col) == 0 {
+					total = 0
+					break
+				}
+				total *= len(col)
+			}
+
+			if total > 0 {
+				// OPTIMIZATION 2: Iterative Odometer Cartesian Product
+				// 0 Recursion, 0 Temporary Slices, Exactly 1 pre-allocated block.
+				combinations := make([][]Value, total)
+				indices := make([]int, n)
+
+				for i := 0; i < total; i++ {
+					row := make([]Value, n)
+					for j, idx := range indices {
+						row[j] = matrix[j][idx]
+					}
+					combinations[i] = row
+
+					// Increment the odometer (right-to-left)
+					for j := n - 1; j >= 0; j-- {
+						indices[j]++
+						if indices[j] < len(matrix[j]) {
+							break
+						}
+						indices[j] = 0
+					}
+				}
+
+				s.ops = append(s.ops, opCombineProduct)
+				s.operands = append(s.operands, combinations, constructOp)
+			}
 		}
 
 	case opCombineProduct:
 		constructOp := s.operands[l-1].(evalop)
 		combinations := s.operands[l-2].([][]Value)
+
 		switch n := len(combinations); n {
 		case 0:
 			s.operands = s.operands[:l-2]
 			break _op_switch_
 		case 1:
-			// Pop 'combinations' and 'constructOp', push the single '[]Value'
-			s.operands = append(s.operands[:l-2], combinations[0])
+			// Fast path: Reuse the slot, pop constructOp, push single arg
+			s.operands[l-2] = combinations[0]
+			s.operands = s.operands[:l-1]
 			s.ops = append(s.ops, constructOp)
 		default:
-			composed := combinations[0]
-			s.operands[l-1] = combinations[1:] // Keep combinations (reduced)
-			s.operands = append(s.operands, constructOp, composed) // Push the composed for the constructor
-			s.ops = append(s.ops, opCombineProduct, constructOp) // opCombineProduct loops for the next combination!
+			// OPTIMIZATION 3: In-Place Stack Mutation.
+			// s.operands expects: [ ..., combinations[1:], constructOp, combinations[0] ]
+
+			s.operands[l-2] = combinations[1:] // Overwrite with remaining combos
+			// s.operands[l-1] is ALREADY constructOp! Do not touch it!
+			s.operands = append(s.operands, combinations[0]) // Push the current payload on top
+
+			s.ops = append(s.ops, opCombineProduct, constructOp)
 		}
 
 	case opList:
@@ -7159,58 +3996,31 @@ _op_switch_:
 		s.results = append(s.results, &path{elements{elems}})
 
 	case opConjunct:
-		elems := s.operands[l-1].([]Value)
-		sep := s.operands[l-2].(Value)
-		s.operands = s.operands[:l-2]
-		s.results = append(s.results, &conjunction{list{elements{elems}}, sep})
-		/* FIXME: this algorithm must be fused into the new designed op set.
-		sep := cons[0].(Value)
-		var vals []Value
-		for i := 1; i < len(cons); i++ { vals = append(vals, cons[i].(Value)) }
-
-		_, dynamicVals := _redis_elems(vals)
-		_, dynamicSep := _redis(sep)
-
-		var res Value
-		if dynamicVals || dynamicSep {
-			res = &conjunction{list{elements{vals}}, sep}
-		} else {
-			var valid []Value
-			for _, val := range vals {
-				if !isEmpty(val) { valid = append(valid, val) }
-			}
-			if len(valid) == 0 {
-				res = _null(v.list.Pos())
-			} else {
-				c := &compound{}
-				c.app(valid[0])
-				if sep != nil {
-					for _, val := range valid[1:] { c.app(sep, val) }
-				} else {
-					for _, val := range valid[1:] { c.app(val) }
-				}
-				res = c
-			}
-		}
-		 */
-
-	case opDisjunct/*ion*/:
-		val := s.operands[l-1].(Value)
+		arr := s.operands[l-1].([]Value)
 		s.operands = s.operands[:l-1]
-		s.results = append(s.results, &disjunction{valbase{val.Pos()},val})
+
+		// Unpack elements and the trailing separator
+		sep := arr[len(arr)-1]
+		elems := arr[:len(arr)-1]
+
+		s.results = append(s.results, &conjunction{list{elements{elems}}, sep})
+
+	case opDisjunct:
+		arr := s.operands[l-1].([]Value)
+		s.operands = s.operands[:l-1]
+		s.results = append(s.results, &disjunction{valbase{arr[0].Pos()}, arr[0]})
 
 	case opPair:
-		key := s.operands[l-1].(Value)
-		val := s.operands[l-2].(Value)
-		s.operands = s.operands[:l-2]
-		s.results = append(s.results, &pair{key, val})
+		arr := s.operands[l-1].([]Value)
+		s.operands = s.operands[:l-1]
+		// arr[0] is key, arr[1] is val
+		s.results = append(s.results, &pair{arr[0], arr[1]})
 
 	case opFlag:
-		val := s.operands[l-1].(Value)
+		arr := s.operands[l-1].([]Value)
 		s.operands = s.operands[:l-1]
-		s.results = append(s.results, flag{val})
+		s.results = append(s.results, flag{arr[0]})
 
-	////////////////////////////////////////////////////////////////////////////////
 	case opDebug:
 		var trace string
 		var extra []any
@@ -7298,376 +4108,11 @@ _op_switch_:
 		args = append(args, extra...)
 		prompt(s.Context, format.shared(), args...)
 
-	////////////////////////////////////////////////////////////////////////////////
-	case opRegexMatch   : s.opRegexMatch(l)
-	case opRegexMatchRev: s.opRegexMatchRev(l)
-
-	case opMatchLiteral   : s.opMatchLiteral(l)
-	case opMatchLiteralRev: s.opMatchLiteralRev(l)
-
-	case opFallbackGlobSeg     : s.opFallbackGlobSeg(l)
-	case opFallbackGlobSegRev  : s.opFallbackGlobSegRev(l)
-	case opFallbackGlobGreed   : s.opFallbackGlobGreed(l)
-	case opFallbackGlobGreedRev: s.opFallbackGlobGreedRev(l)
-	case opFallbackGlobCross   : s.opFallbackGlobCross(l)
-	case opFallbackGlobCrossRev: s.opFallbackGlobCrossRev(l)
-
-	case opGlobQues:
-		if emitted := s.opGlobQues(l, opGlobQues); len(emitted) > 0 {
-			for i := len(emitted) - 1; i >= 0; i-- {
-				s.ops = append(s.ops, opPack)
-				s.operands = append(s.operands, emitted[i])
-			}
-		}
-	case opGlobQuesRev:
-		if emitted := s.opGlobQues(l, opGlobQuesRev); len(emitted) > 0 {
-			for _, ps := range emitted {
-				s.ops = append(s.ops, opPackRev)
-				s.operands = append(s.operands, ps)
-			}
-		}
-
-	case opGlobRange   : s.opGlobRange(l)
-	case opGlobRangeRev: s.opGlobRangeRev(l)
-
-	case opGlobSeg     : s.ops = append(s.ops, opConseqGlobSeg     ); s.stems = append(s.stems, capture{start:-1}); s.operands = append(s.operands, &op_glob{})
-	case opGlobSegRev  : s.ops = append(s.ops, opConseqGlobSegRev  ); s.stems = append(s.stems, capture{start:-1}); s.operands = append(s.operands, &op_glob{})
-	case opGlobGreed   : s.ops = append(s.ops, opConseqGlobGreed   ); s.stems = append(s.stems, capture{start:-1}); s.operands = append(s.operands, &op_glob{})
-	case opGlobGreedRev: s.ops = append(s.ops, opConseqGlobGreedRev); s.stems = append(s.stems, capture{start:-1}); s.operands = append(s.operands, &op_glob{})
-	case opGlobCross   : s.ops = append(s.ops, opConseqGlobCross   ); s.stems = append(s.stems, capture{start:-1}); s.operands = append(s.operands, &op_glob{})
-	case opGlobCrossRev: s.ops = append(s.ops, opConseqGlobCrossRev); s.stems = append(s.stems, capture{start:-1}); s.operands = append(s.operands, &op_glob{})
-
-	case opConseqGlobSeg     : s.opConseqGlobSeg(l)
-	case opConseqGlobSegRev  : s.opConseqGlobSegRev(l)
-	case opConseqGlobGreed   : s.opConseqGlobGreed(l)
-	case opConseqGlobGreedRev: s.opConseqGlobGreedRev(l)
-	case opConseqGlobCross   : s.opConseqGlobCross(l)
-	case opConseqGlobCrossRev: s.opConseqGlobCrossRev(l)
-
-	case opTryGlobSeg     : s.opTryGlobSeg(l)
-	case opTryGlobSegRev  : s.opTryGlobSegRev(l)
-	case opTryGlobGreed   : s.opTryGlobGreed(l)
-	case opTryGlobGreedRev: s.opTryGlobGreedRev(l)
-	case opTryGlobCross   : s.opTryGlobCross(l)
-	case opTryGlobCrossRev: s.opTryGlobCrossRev(l)
-
-	case opTryFallbackGlobSeg     : s.opTryFallbackGlobSeg(l)
-	case opTryFallbackGlobSegRev  : s.opTryFallbackGlobSegRev(l)
-	case opTryFallbackGlobGreed   : s.opTryFallbackGlobGreed(l)
-	case opTryFallbackGlobGreedRev: s.opTryFallbackGlobGreedRev(l)
-	case opTryFallbackGlobCross   : s.opTryFallbackGlobCross(l)
-	case opTryFallbackGlobCrossRev: s.opTryFallbackGlobCrossRev(l)
-
-	case opModify:
-		g := s.operands[l-1].(*group)
-		s.operands = s.operands[:l-1]
-		s.results = append(s.results, modify(s.Context, g, false))
-
-	case opValidate:
-		n := s.operands[l-1].(int)
-		items := make([]any, 0, n)
-		for _, item := range s.results[rl-n:] {
-			if item != nil && !isTrivial(item) { items = append(items, item) }
-		}
-		s.results = s.results[:rl-n]
-		s.operands[l-1] = items
-
-	case opCompactValid:
-		n := s.operands[l-1].(int)
-		items := make([]any, 0, n)
-		for _, item := range s.operands[l-n-1:l-1] {
-			if item != nil && !isTrivial(item) { items = append(items, item) }
-		}
-		s.operands = s.operands[:l-n]
-		s.operands[l-n-1] = items
-
-	case opEase:
-		num := s.operands[l-1].(int)
-		pos := s.operands[l-2].(Pos)
-		s.operands = s.operands[:l-2]
-
-		var elems []Value
-		for _, item := range s.results[rl-num:] {
-			if v, ok := item.(Value); ok { elems = append(elems, v) } else {
-				erro(s, "unexpected value: %[1]T %[1]v", item)
-			}
-		}
-		s.results = s.results[:rl-num]
-
-		var res Value
-		switch len(elems) {
-		case 0 : res = _null(pos)
-		case 1 : res = elems[0]
-		default: res = &list{elements{elems}}
-		}
-		s.results = append(s.results, res)
-
-	case opMerge:
-		if v, ok := s.results[rl-1].(Value); ok && v != nil {
-			var merge func(Value) []Value
-			merge = func(v Value) []Value {
-				if v == nil { return nil }
-				switch t := v.(type) {
-				case *loc:
-					elems := merge(t.Value)
-					for i, e := range elems { elems[i] = _loc(e, t.pos) }
-					return elems
-				case *list:
-					var elems []Value
-					for _, e := range t.elems { elems = append(elems, merge(e)...) }
-					return elems
-				}
-				return []Value{v}
-			}
-			s.results[rl-1] = merge(v)
-		} else {
-			s.results[rl-1] = []Value{}
-		}
-
-	case opPathStr:
-		isVal := s.operands[l-1].(bool)
-		v := s.operands[l-2].(Value)
-		s.operands = s.operands[:l-2]
-
-		var elemsLen int
-		if isVal { elemsLen = len(v.(*strval).v) } else { elemsLen = len(v.(*strcomp).elems) }
-
-		var elems []Value
-		for i := rl - elemsLen; i < rl; i++ { elems = append(elems, s.results[i].(Value)) }
-		s.results = s.results[:rl-elemsLen]
-
-		var res Value
-		if len(elems) == 0 { res = _null(v.Pos()) } else if len(elems) == 1 { res = elems[0] } else { res = &list{elements{elems}} }
-
-		if str := __string(s.Context, res); isVal {
-			res = &strval{v.(*strval).valbase, _pathStr(s.Context, str).elems}
-		} else {
-			res = &strcomp{elements{_pathStr(s.Context, str).elems}}
-		}
-		s.results = append(s.results, res)
-
-	case opReduce:
-		top := s.operands[l-1]
-		s.operands = s.operands[:l-1]
-
-		// Safe stack cast. Short-circuited or corrupted unrolls leave raw Values here.
-		snap, isSnap := top.([]any)
-		if !isSnap {
-			if v, isVal := top.(Value); isVal && v != nil {
-				s.results = append(s.results, v)
-			}
-			break _op_switch_
-		}
-
-		snap_pack := snap[0].(*vmpack)
-		snap_class := snap[1].(int)
-		snap_reslen := snap[2].(int)
-		snap_pos := snap[3].(Pos)
-
-		var res Value
-		if rl > snap_reslen {
-			res = s.results[rl-1].(Value)
-			s.results = s.results[:snap_reslen]
-		} else {
-			// Reduce the isolated frame!
-			subPack := s.vmpack
-			s.vmpack = snap_pack
-			if subPack != nil {
-				res = subPack.reduce(snap_pos)
-			} else {
-				res = _null(snap_pos)
-			}
-		}
-
-		s.results = append(s.results, res)
-		s.class = snap_class
-
-	case opReduceRev:
-		top := s.operands[l-1]
-		s.operands = s.operands[:l-1]
-
-		// Safe stack cast. Short-circuited or corrupted unrolls leave raw Values here.
-		snap, isSnap := top.([]any)
-		if !isSnap {
-			if v, isVal := top.(Value); isVal && v != nil {
-				s.results = append(s.results, v)
-			}
-			break _op_switch_
-		}
-
-		snap_pack := snap[0].(*vmpack)
-		snap_class := snap[1].(int)
-		snap_reslen := snap[2].(int)
-		snap_pos := snap[3].(Pos)
-
-		var res Value
-		if rl > snap_reslen {
-			res = s.results[rl-1].(Value)
-			s.results = s.results[:snap_reslen]
-		} else {
-			// Reduce the isolated frame!
-			subPack := s.vmpack
-			s.vmpack = snap_pack
-			if subPack != nil {
-				res = subPack.reduceRev(snap_pos)
-			} else {
-				res = _null(snap_pos)
-			}
-		}
-
-		s.results = append(s.results, res)
-		s.class = snap_class
-
-	case opFullname:
-		v := s.operands[l-1].(Value)
-		s.operands = s.operands[:l-1]
-
-		if !isTrivial(v) {
-			if f := as_file(s.Context, v); f != nil {
-				if truly(s.Context, wants_fullfile{}) {
-					s.results = append(s.results, _loc(fullfile{f}, v.Pos()))
-					break _op_switch_
-				}
-				s.results = append(s.results, _loc(fullname{f}, v.Pos()))
-				break _op_switch_
-			}
-		}
-		s.results = append(s.results, fullname{v})
-
-	case opRule:
-		target := s.operands[l-1].(Value)
-		r := s.operands[l-2].(*rule)
-		s.operands = s.operands[:l-2]
-		s.results = append(s.results, &rule{target, r.arged, r.program})
-
-	case opLocPack:
-		// You may also want to split this into opLocPackRev if `s.class&clsBackwards` is completely deleted.
-		// For now, removing `clsBackwards` requires mapping the positional context:
-		pos := s.operands[l-1].(Pos)
-		s.operands = s.operands[:l-1]
-		if s.vmpack != nil {
-			if elems := s.vmpack.comp.elems; len(elems) > 0 {
-				// We fall back to standard tail annotation if directionality is lost,
-				// or you can add opLocPackRev if needed!
-				last := len(elems) - 1
-				if _, isLoc := elems[last].(*loc); !isLoc { elems[last] = _loc(elems[last], pos) }
-			}
-		}
-
-	case opNegate:
-		vals := s.results[rl-1].([]Value)
-		var flags []Value
-		for _, v := range vals { flags = append(flags, negative{v}) }
-		switch len(flags) {
-		case 0 : s.results[rl-1] = nil
-		case 1 : s.results[rl-1] = flags[0]
-		default: s.results[rl-1] = &list{elements{flags}}
-		}
-
-	case opSelect: s.opSelect(l)
-
-	case opPack:
-		switch t := s.operands[l-1].(type) {
-		case posym:
-			s.operands = s.operands[:l-1]
-			if t.Symbol == symEmpty {
-				// Discarded
-			} else if t.Kind() == SymSeq {
-				vocab.seqmut.RLock()
-				seq := vocab.sequences[t.Idx()]
-				vocab.seqmut.RUnlock()
-
-				for i := len(seq) - 1; i >= 0; i-- {
-					s.ops = append(s.ops, opPack)
-					s.operands = append(s.operands, posym{t.Pos, seq[i]})
-				}
-				break _op_switch_
-			} else {
-				if s.vmpack == nil { s.vmpack = &vmpack{} }
-				s.pack(t)
-				if t.Symbol == symSlash { s.class &^= clsGlobChar | clsGlobAst }
-			}
-
-		case Value:
-			s.operands = s.operands[:l-1]
-			if s.vmpack == nil { s.vmpack = &vmpack{} }
-			s.vmpack.shift(t)
-
-		case []any:
-			s.operands = s.operands[:l-1]
-			switch len(t) {
-			case 0:
-				s.ops = append(s.ops, opPack)
-				s.operands = append(s.operands, _null(0))
-			case 1:
-				s.ops = append(s.ops, opPack)
-				s.operands = append(s.operands, t[0].(Value))
-			default:
-				lst := &list{}
-				for _, elem := range t { lst.append(elem.(Value)) }
-				s.ops = append(s.ops, opPack)
-				s.operands = append(s.operands, lst)
-			}
-
-		case nil:
-			s.operands = s.operands[:l-1]
-
-		default:
-			erro(s, "opPack: unexpected %[1]T %[1]v", t)
-		}
-
-	case opPackRev:
-		switch t := s.operands[l-1].(type) {
-		case posym:
-			s.operands = s.operands[:l-1]
-			if t.Symbol == symEmpty {
-				// Discarded
-			} else if t.Kind() == SymSeq {
-				vocab.seqmut.RLock()
-				seq := vocab.sequences[t.Idx()]
-				vocab.seqmut.RUnlock()
-
-				for _, sym := range seq {
-					s.ops = append(s.ops, opPackRev)
-					s.operands = append(s.operands, posym{t.Pos, sym})
-				}
-				break _op_switch_
-			} else {
-				if s.vmpack == nil { s.vmpack = &vmpack{} }
-				s.packRev(t)
-				if t.Symbol == symSlash { s.class &^= clsGlobChar | clsGlobAst }
-			}
-
-		case Value:
-			s.operands = s.operands[:l-1]
-			if s.vmpack == nil { s.vmpack = &vmpack{} }
-			s.vmpack.shiftRev(t)
-
-		case []any:
-			s.operands = s.operands[:l-1]
-			switch len(t) {
-			case 0:
-				s.ops = append(s.ops, opPackRev)
-				s.operands = append(s.operands, _null(0))
-			case 1:
-				s.ops = append(s.ops, opPackRev)
-				s.operands = append(s.operands, t[0].(Value))
-			default:
-				lst := &list{}
-				for _, elem := range t { lst.append(elem.(Value)) }
-				s.ops = append(s.ops, opPackRev)
-				s.operands = append(s.operands, lst)
-			}
-
-		case nil:
-			s.operands = s.operands[:l-1]
-
-		default:
-			erro(s, "opPackRev: unexpected %[1]T %[1]v", t)
-		}
-
 	case opEnd:
 		s.err = io.EOF
+
+	default:
+		erro(s, "VM execution trap: unimplemented op: %v", op, unwind{})
 	}
 }
 
@@ -7685,7 +4130,10 @@ func (s *symstr) checkpoint(kind uint32) backtrack {
 		if (kind & undoCtx) != 0 { bt.own.context = s.Context }
 		if (kind & undoStack) != 0 { bt.own.vmstack = s.vmstack.clone() }
 		if (kind & undoHead) != 0 { bt.own.vmhead = s.vmhead }
-		if (kind & undoPack) != 0 && s.vmpack != nil { bt.own.vmpack = s.vmpack.clone() }
+		if (kind & undoPack) != 0 {
+			bt.own.values = append([]Value(nil), s.values...)     // Safe Deep Copy
+			bt.own.frames = append([]frame(nil), s.frames...)   // Safe Deep Copy
+		}
 		if (kind & undoErr) != 0 { bt.own.err = s.err }
 		if (kind & undoTape) != 0 {
 			bt.own.loc = s.loc
@@ -7703,7 +4151,10 @@ func (s *symstr) checkpoint(kind uint32) backtrack {
 		if (kind & undoCtx) != 0 { bt.tie.context = s.tie.Context }
 		if (kind & undoStack) != 0 { bt.tie.vmstack = s.tie.vmstack.clone() }
 		if (kind & undoHead) != 0 { bt.tie.vmhead = s.tie.vmhead }
-		if (kind & undoPack) != 0 && s.tie.vmpack != nil { bt.tie.vmpack = s.tie.vmpack.clone() }
+		if (kind & undoPack) != 0 {
+			bt.tie.values = append([]Value(nil), s.tie.values...)     // Safe Deep Copy
+			bt.tie.frames = append([]frame(nil), s.tie.frames...)   // Safe Deep Copy
+		}
 		if (kind & undoErr) != 0 { bt.tie.err = s.tie.err }
 		if (kind & undoTape) != 0 {
 			bt.tie.loc = s.tie.loc
@@ -7744,7 +4195,10 @@ func (s *symstr) unwind(bt *backtrack) {
 	if (bt.kind & undoOwn) != 0 {
 		if (bt.kind & undoCtx) != 0 { s.Context = bt.own.context }
 		if (bt.kind & undoHead) != 0 { s.vmhead = bt.own.vmhead }
-		if (bt.kind & undoPack) != 0 { if bt.own.vmpack != nil { s.vmpack = bt.own.vmpack } else { s.vmpack = nil } }
+		if (bt.kind & undoPack) != 0 {
+			s.values = append([]Value(nil), bt.own.values...)     // Safe Deep Copy
+			s.frames = append([]frame(nil), bt.own.frames...)   // Safe Deep Copy
+		}
 		if (bt.kind & undoStack) != 0 { s.vmstack = bt.own.vmstack }
 		if (bt.kind & undoErr) != 0 { s.err = bt.own.err }
 		if (bt.kind & undoTape) != 0 {
@@ -7763,7 +4217,10 @@ func (s *symstr) unwind(bt *backtrack) {
 	if (bt.kind & undoTie) != 0 && s.tie != nil {
 		if (bt.kind & undoCtx) != 0 { s.tie.Context = bt.tie.context }
 		if (bt.kind & undoHead) != 0 { s.tie.vmhead = bt.tie.vmhead }
-		if (bt.kind & undoPack) != 0 { if bt.tie.vmpack != nil { s.tie.vmpack = bt.tie.vmpack } else { s.tie.vmpack = nil } }
+		if (bt.kind & undoPack) != 0 {
+			s.tie.values = append([]Value(nil), bt.tie.values...)     // Safe Deep Copy
+			s.tie.frames = append([]frame(nil), bt.tie.frames...)   // Safe Deep Copy
+		}
 		if (bt.kind & undoStack) != 0 { s.tie.vmstack = bt.tie.vmstack }
 		if (bt.kind & undoErr) != 0 { s.tie.err = bt.tie.err }
 		if (bt.kind & undoTape) != 0 {
@@ -7858,649 +4315,6 @@ func (st vmstack) clone() vmstack {
 		evoking:  append([]Value(nil), st.evoking...),
 	}
 }
-
-func (p *vmpack) String() string { // For debug!
-	if p == nil {
-		return "<nil-vmpack>"
-	}
-
-	var fields []string
-
-	// 1. State Tracking
-	if p.closer != 0 { // Assuming 0 is symEmpty
-		fields = append(fields, fmt.Sprintf("closer:%v", p.closer))
-	}
-	if p.pairKey != nil {
-		fields = append(fields, fmt.Sprintf("pairLHS:%v", p.pairKey))
-	}
-	if p.arrowObj != nil {
-		fields = append(fields, fmt.Sprintf("arrowLHS:%v", p.arrowObj))
-	}
-	if p.flag != 0 {
-		fields = append(fields, fmt.Sprintf("flag:%v", p.flag))
-	}
-
-	// 2. Element Buffers (Safely skipping empty structural tapes)
-	if len(p.comp.elems) > 0 {
-		fields = append(fields, fmt.Sprintf("comp:%v", p.comp.elems))
-	}
-	if len(p.qual.elems) > 0 {
-		fields = append(fields, fmt.Sprintf("qual:%v", p.qual.elems))
-	}
-	if len(p.path.elems) > 0 {
-		fields = append(fields, fmt.Sprintf("path:%v", p.path.elems))
-	}
-	if len(p.list.elems) > 0 {
-		fields = append(fields, fmt.Sprintf("list:%v", p.list.elems))
-	}
-
-	// 3. Format the current scope layer
-	var layer string
-	if len(fields) == 0 {
-		layer = "{empty}"
-	} else {
-		layer = "{" + strings.Join(fields, " | ") + "}"
-	}
-
-	// 4. Cascade to the parent scope recursively
-	if p.parent != nil {
-		return layer + " ⮌ " + p.parent.String()
-	}
-
-	return layer
-}
-
-// clone safely snapshots the AST state machine against time-traveling backtracks.
-func (p *vmpack) clone() *vmpack {
-	if p == nil { return nil }
-	if p.parent == p { panic("looping vmpack linkage") }
-	return &vmpack{
-		parent:   p.parent.clone(),
-		closer:   p.closer,
-		flag:     p.flag,
-		pairKey:  p.pairKey,   // AST nodes are immutable once reduced, safe to pass reference
-		arrowObj: p.arrowObj,
-		comp:     p.comp.copy(), // Natively isolates active slices!
-		qual:     p.qual.copy(),
-		path:     p.path.copy(),
-		list:     p.list.copy(),
-	}
-}
-
-func (p *vmpack) shift(val Value) {
-	p.comp.append(val)
-}
-
-func (p *vmpack) reduceQual(pos Pos) {
-	var v Value
-
-	if p.comp.len() > 0 {
-		if p.comp.len() == 1 {
-			v = p.comp.elems[0]
-		} else {
-			v = &compound{p.comp.copy()}
-		}
-		p.comp.clear()
-	}
-
-	if v == nil {
-		p.qual.append(valbase{pos})
-	} else {
-		p.qual.append(v)
-	}
-}
-
-func (p *vmpack) reducePath(pos Pos) {
-	p.reduceQual(pos)
-
-	var res Value
-	if p.qual.len() == 1 {
-		res = p.qual.elems[0]
-	} else if p.qual.len() > 1 {
-		res = &qualword{p.qual.copy()}
-	}
-
-	p.qual.clear()
-
-	// Arrow Wrapping
-	if p.arrowObj != nil {
-		if res == nil { res = valbase{pos} }
-		res = &arrow{valbase: valbase{pos}, o: p.arrowObj, s: res}
-		p.arrowObj = nil
-	}
-
-	// Flag Wrapping
-	if p.flag != 0 {
-		if res == nil { res = valbase{p.flag} }
-		res = flag{res}
-		p.flag = 0
-	}
-
-	// Native Prepending PTAIL Validation
-	if res != nil {
-		if _, isEmpty := res.(valbase); isEmpty {
-			if p.path.len() > 0 {
-				if pct, ok := p.path.elems[p.path.len()-1].(*punct); ok && pct.s == symEmptySuffix {
-					res = nil
-				}
-			}
-		}
-	}
-
-	if res != nil {
-		p.path.append(res)
-	}
-}
-
-func (p *vmpack) reduceList(pos Pos) {
-	p.reducePath(pos)
-
-	var res Value
-	if p.path.len() == 1 {
-		res = p.path.elems[0]
-	} else if p.path.len() > 1 {
-		res = &path{p.path.copy()}
-	}
-
-	p.path.clear()
-
-	// Pair Wrapping
-	if p.pairKey != nil {
-		if res == nil { res = valbase{pos} }
-		res = &pair{key: p.pairKey, val: res}
-		p.pairKey = nil
-	}
-
-	if res != nil {
-		p.list.append(res)
-	}
-}
-
-// reduce finalizes the current state (called on EOF or closing punctuation)
-func (p *vmpack) reduce(pos Pos) Value {
-	p.reduceList(pos) // Cascade all the way up
-
-	var res Value
-	if p.list.len() == 1 {
-		res = p.list.elems[0]
-	} else if p.list.len() > 1 {
-		res = &list{p.list.copy()}
-	} else if pos != NoPos {
-		res = valbase{pos}
-	}
-
-	p.list.clear()
-
-	return res
-}
-
-// pack evaluates a single posym and shapes it into the AST state machine (Forward).
-func (s *symstr) pack(ps posym) {
-	popFlags := func() {
-		for s.vmpack != nil && s.vmpack.parent != nil && s.vmpack.closer == 0 && s.vmpack.flag != 0 {
-			inner := s.vmpack.reduce(ps.Pos)
-			s.vmpack = s.vmpack.parent
-			s.vmpack.shift(inner)
-		}
-	}
-
-	switch ps.Symbol {
-	case symDash:
-		if ps.Pos == NoPos {
-			if true { warn(pc(s, ps.Pos), "NoPos `flag` forced @%d (synthesized node)", ps.Pos, callstack{num:5}) }
-		}
-		s.vmpack = &vmpack{parent: s.vmpack, flag: ps.Pos}
-		return
-
-	case symDot:
-		s.vmpack.reduceQual(ps.Pos)
-		return
-
-	case symSlash:
-		popFlags()
-
-		isLeading := s.vmpack.comp.len() == 0 && s.vmpack.qual.len() == 0 && s.vmpack.path.len() == 0
-
-		if isLeading {
-			s.vmpack.path.append(_punct(ps.Pos, symEmptyPrefix))
-		} else {
-			s.vmpack.reducePath(ps.Pos)
-		}
-		return
-
-	case symEmpty:
-		if s.vmpack.path.len() > 0 && s.vmpack.comp.len() == 0 && s.vmpack.qual.len() == 0 {
-			s.vmpack.path.append(_punct(ps.Pos, symEmptySuffix))
-			return
-		}
-		s.vmpack.shift(_word(ps.Pos, ps.Symbol))
-		return
-
-	case symSpace:
-		popFlags()
-		s.vmpack.reduceList(ps.Pos)
-		return
-
-	case symEqualSign:
-		popFlags()
-		s.vmpack.reducePath(ps.Pos)
-
-		var key Value
-		if s.vmpack.path.len() == 1 {
-			key = s.vmpack.path.elems[0]
-		} else if s.vmpack.path.len() > 1 {
-			key = &path{s.vmpack.path.copy()}
-		} else {
-			key = valbase{ps.Pos}
-		}
-		s.vmpack.path.clear()
-
-		if s.vmpack.pairKey != nil {
-			key = &pair{key: s.vmpack.pairKey, val: key}
-		}
-		s.vmpack.pairKey = key
-		return
-
-	case symArrow:
-		popFlags()
-		s.vmpack.reduceQual(ps.Pos)
-
-		var obj Value
-		if s.vmpack.qual.len() == 1 {
-			obj = s.vmpack.qual.elems[0]
-		} else if s.vmpack.qual.len() > 1 {
-			obj = &qualword{s.vmpack.qual.copy()}
-		} else {
-			obj = valbase{ps.Pos}
-		}
-		s.vmpack.qual.clear()
-
-		if s.vmpack.arrowObj != nil {
-			obj = &arrow{valbase: valbase{ps.Pos}, o: s.vmpack.arrowObj, s: obj}
-		}
-		s.vmpack.arrowObj = obj
-		return
-
-	case symQuotation:
-		isClosing := false
-		for p := s.vmpack; p != nil; p = p.parent {
-			if p.closer == symQuotation { isClosing = true; break }
-		}
-
-		if isClosing {
-			popFlags()
-			if s.vmpack.closer == symQuotation {
-				inner := s.vmpack.reduce(ps.Pos)
-				s.vmpack = s.vmpack.parent
-				s.vmpack.shift(&strcomp{elements{[]Value{inner}}})
-			}
-		} else {
-			s.vmpack = &vmpack{parent: s.vmpack, closer: symQuotation}
-		}
-		return
-
-	case symLparen:
-		s.vmpack = &vmpack{parent: s.vmpack, closer: symRparen}
-		return
-	case symLbrace:
-		s.vmpack = &vmpack{parent: s.vmpack, closer: symRbrace}
-		return
-	case symLbrack:
-		s.vmpack = &vmpack{parent: s.vmpack, closer: symRbrack}
-		return
-	case symCornerTL:
-		s.vmpack = &vmpack{parent: s.vmpack, closer: symCornerBR}
-		return
-	case symCornerBL:
-		s.vmpack = &vmpack{parent: s.vmpack, closer: symCornerTR}
-		return
-
-	case symRparen, symRbrace, symRbrack, symCornerTR, symCornerBR:
-		popFlags()
-		if s.vmpack.closer == ps.Symbol {
-			inner := s.vmpack.reduce(ps.Pos)
-			s.vmpack = s.vmpack.parent
-			if s.vmpack != nil {
-				s.vmpack.shift(inner)
-			} else {
-				s.operands = append(s.operands, inner)
-			}
-		}
-		return
-	}
-
-	// 2. Raw Symbol Shifting
-	switch ps.Kind() {
-	case SymRaw, SymInl, SymEph, SymSeq:
-		s.vmpack.shift(_word(ps.Pos, ps.Symbol))
-	case SymInt:
-		vocab.nummut.RLock()
-		i := int64(vocab.numbers[ps.Idx()])
-		vocab.nummut.RUnlock()
-		s.vmpack.shift(_decimal(ps.Pos, i, ps.Symbol))
-	case SymFlt:
-		vocab.nummut.RLock()
-		f := math.Float64frombits(vocab.numbers[ps.Idx()])
-		vocab.nummut.RUnlock()
-		s.vmpack.shift(_float(ps.Pos, f, ps.Symbol))
-	case SymPct:
-		switch ps.Symbol {
-		case symQues, symAsterisk, symAsteriskAst, symAsteriskQues:
-			s.vmpack.shift(_globmeta(ps.Pos, ps.Symbol))
-		default:
-			// STRUCTURAL ISOLATION: Unhandled punctuation symbols (<, >, +, ,, etc.)
-			// must be shifted distinctly as *punct nodes, preventing the packer from
-			// collapsing them into adjacent *word constituents within compounds.
-			s.vmpack.shift(&punct{valbase{ps.Pos}, ps.Symbol})
-		}
-	}
-}
-
-func (p *vmpack) shiftRev(val Value) {
-	p.comp.prepend(val)
-}
-
-func (p *vmpack) reduceQualRev(pos Pos) {
-	var v Value
-
-	if p.comp.len() > 0 {
-		if p.comp.len() == 1 {
-			v = p.comp.elems[0]
-		} else {
-			v = &compound{p.comp.copy()}
-		}
-		p.comp.clear()
-	}
-
-	if v == nil {
-		p.qual.prepend(valbase{pos})
-	} else {
-		p.qual.prepend(v)
-	}
-}
-
-func (p *vmpack) reducePathRev(pos Pos) {
-	p.reduceQualRev(pos)
-
-	var res Value
-	if p.qual.len() == 1 {
-		res = p.qual.elems[0]
-	} else if p.qual.len() > 1 {
-		res = &qualword{p.qual.copy()}
-	}
-
-	p.qual.clear()
-
-	// Arrow Wrapping
-	if p.arrowObj != nil {
-		if res == nil { res = valbase{pos} }
-		res = &arrow{valbase: valbase{pos}, o: p.arrowObj, s: res}
-		p.arrowObj = nil
-	}
-
-	// Flag Wrapping
-	if p.flag != 0 {
-		if res == nil { res = valbase{p.flag} }
-		res = flag{res}
-		p.flag = 0
-	}
-
-	// Native Prepending PTAIL Validation
-	if res != nil {
-		if _, isEmpty := res.(valbase); isEmpty {
-			if p.path.len() > 0 {
-				// In reverse, the "tail" of the path buffer is actually at index 0 because we prepend!
-				if pct, ok := p.path.elems[0].(*punct); ok && pct.s == symEmptyPrefix {
-					res = nil
-				}
-			}
-		}
-	}
-
-	if res != nil {
-		p.path.prepend(res)
-	}
-}
-
-func (p *vmpack) reduceListRev(pos Pos) {
-	p.reducePathRev(pos)
-
-	var res Value
-	if p.path.len() == 1 {
-		res = p.path.elems[0]
-	} else if p.path.len() > 1 {
-		res = &path{p.path.copy()}
-	}
-
-	p.path.clear()
-
-	// Pair Wrapping
-	if p.pairKey != nil {
-		if res == nil { res = valbase{pos} }
-		res = &pair{key: p.pairKey, val: res}
-		p.pairKey = nil
-	}
-
-	if res != nil {
-		p.list.prepend(res)
-	}
-}
-
-// reduceRev finalizes the current state in reverse mode
-func (p *vmpack) reduceRev(pos Pos) Value {
-	p.reduceListRev(pos) // Cascade all the way up
-
-	var res Value
-	if p.list.len() == 1 {
-		res = p.list.elems[0]
-	} else if p.list.len() > 1 {
-		res = &list{p.list.copy()}
-	} else if pos != NoPos {
-		res = valbase{pos}
-	}
-
-	p.list.clear()
-
-	return res
-}
-
-// reduce finalizes the packer stack at EOF
-func (s *symstr) reduce(pos Pos) Value {
-	if s.vmpack == nil { return nil }
-
-	// Flush any open flag or bracket states up to the root
-	for s.vmpack != nil && s.vmpack.parent != nil {
-		inner := s.vmpack.reduce(pos)
-		s.vmpack = s.vmpack.parent
-		s.vmpack.shift(inner)
-	}
-
-	return s.vmpack.reduce(pos)
-}
-
-// reduceRev finalizes the packer stack at EOF in reverse
-func (s *symstr) reduceRev(pos Pos) Value {
-	if s.vmpack == nil { return nil }
-
-	// Flush any open flag or bracket states up to the root
-	for s.vmpack != nil && s.vmpack.parent != nil {
-		inner := s.vmpack.reduceRev(pos)
-		s.vmpack = s.vmpack.parent
-		s.vmpack.shiftRev(inner)
-	}
-
-	return s.vmpack.reduceRev(pos)
-}
-
-// packRev evaluates a single posym and shapes it into the AST state machine (Reverse).
-func (s *symstr) packRev(ps posym) {
-	popFlags := func() {
-		for s.vmpack != nil && s.vmpack.parent != nil && s.vmpack.closer == 0 && s.vmpack.flag != 0 {
-			inner := s.vmpack.reduceRev(ps.Pos)
-			s.vmpack = s.vmpack.parent
-			s.vmpack.shiftRev(inner)
-		}
-	}
-
-	switch ps.Symbol {
-	case symDash:
-		if ps.Pos == NoPos {
-			if true { warn(pc(s, ps.Pos), "NoPos `flag` forced @%d (synthesized node)", ps.Pos, callstack{num:5}) }
-		}
-		s.vmpack = &vmpack{parent: s.vmpack, flag: ps.Pos}
-		return
-
-	case symDot:
-		s.vmpack.reduceQualRev(ps.Pos)
-		return
-
-	case symSlash:
-		popFlags()
-
-		isLeading := s.vmpack.comp.len() == 0 && s.vmpack.qual.len() == 0 && s.vmpack.path.len() == 0
-
-		if isLeading {
-			// The first slash encountered in reverse with empty buffers is PTAIL!
-			s.vmpack.path.prepend(_punct(ps.Pos, symEmptySuffix))
-		} else {
-			s.vmpack.reducePathRev(ps.Pos)
-
-			// THE DOD FIX: If this is the LAST slash in the reversed string, it's PROOT!
-			// Without boundary math, we know it's the root if the evaluation tape is exhausted.
-			if len(s.ops) == 0 && len(s.syms) == 0 {
-				s.vmpack.path.prepend(_punct(ps.Pos, symEmptyPrefix))
-			}
-		}
-		return
-
-	case symEmpty:
-		if s.vmpack.path.len() > 0 && s.vmpack.comp.len() == 0 && s.vmpack.qual.len() == 0 {
-			s.vmpack.path.prepend(_punct(ps.Pos, symEmptyPrefix))
-			return
-		}
-		s.vmpack.shiftRev(_word(ps.Pos, ps.Symbol))
-		return
-
-	case symSpace:
-		popFlags()
-		s.vmpack.reduceListRev(ps.Pos)
-		return
-
-	case symEqualSign:
-		popFlags()
-		s.vmpack.reducePathRev(ps.Pos)
-
-		var key Value
-		if s.vmpack.path.len() == 1 {
-			key = s.vmpack.path.elems[0]
-		} else if s.vmpack.path.len() > 1 {
-			key = &path{s.vmpack.path.copy()}
-		} else {
-			key = valbase{ps.Pos}
-		}
-		s.vmpack.path.clear()
-
-		if s.vmpack.pairKey != nil {
-			key = &pair{key: s.vmpack.pairKey, val: key}
-		}
-		s.vmpack.pairKey = key
-		return
-
-	case symArrow:
-		popFlags()
-		s.vmpack.reduceQualRev(ps.Pos)
-
-		var obj Value
-		if s.vmpack.qual.len() == 1 {
-			obj = s.vmpack.qual.elems[0]
-		} else if s.vmpack.qual.len() > 1 {
-			obj = &qualword{s.vmpack.qual.copy()}
-		} else {
-			obj = valbase{ps.Pos}
-		}
-		s.vmpack.qual.clear()
-
-		if s.vmpack.arrowObj != nil {
-			obj = &arrow{valbase: valbase{ps.Pos}, o: s.vmpack.arrowObj, s: obj}
-		}
-		s.vmpack.arrowObj = obj
-		return
-
-	case symQuotation:
-		isClosing := false
-		for p := s.vmpack; p != nil; p = p.parent {
-			if p.closer == symQuotation { isClosing = true; break }
-		}
-
-		if isClosing {
-			popFlags()
-			if s.vmpack.closer == symQuotation {
-				inner := s.vmpack.reduceRev(ps.Pos)
-				s.vmpack = s.vmpack.parent
-				s.vmpack.shiftRev(&strcomp{elements{[]Value{inner}}})
-			}
-		} else {
-			s.vmpack = &vmpack{parent: s.vmpack, closer: symQuotation}
-		}
-		return
-
-	case symLparen:
-		s.vmpack = &vmpack{parent: s.vmpack, closer: symRparen}
-		return
-	case symLbrace:
-		s.vmpack = &vmpack{parent: s.vmpack, closer: symRbrace}
-		return
-	case symLbrack:
-		s.vmpack = &vmpack{parent: s.vmpack, closer: symRbrack}
-		return
-	case symCornerTL:
-		s.vmpack = &vmpack{parent: s.vmpack, closer: symCornerBR}
-		return
-	case symCornerBL:
-		s.vmpack = &vmpack{parent: s.vmpack, closer: symCornerTR}
-		return
-
-	case symRparen, symRbrace, symRbrack, symCornerTR, symCornerBR:
-		popFlags()
-		if s.vmpack.closer == ps.Symbol {
-			inner := s.vmpack.reduceRev(ps.Pos)
-			s.vmpack = s.vmpack.parent
-			if s.vmpack != nil {
-				s.vmpack.shiftRev(inner)
-			} else {
-				s.operands = append(s.operands, inner)
-			}
-		}
-		return
-	}
-
-	// 2. Raw Symbol Shifting
-	switch ps.Kind() {
-	case SymRaw, SymInl, SymEph, SymSeq:
-		s.vmpack.shiftRev(_word(ps.Pos, ps.Symbol))
-	case SymInt:
-		vocab.nummut.RLock()
-		i := int64(vocab.numbers[ps.Idx()])
-		vocab.nummut.RUnlock()
-		s.vmpack.shiftRev(_decimal(ps.Pos, i, ps.Symbol))
-	case SymFlt:
-		vocab.nummut.RLock()
-		f := math.Float64frombits(vocab.numbers[ps.Idx()])
-		vocab.nummut.RUnlock()
-		s.vmpack.shiftRev(_float(ps.Pos, f, ps.Symbol))
-	case SymPct:
-		switch ps.Symbol {
-		case symQues, symAsterisk, symAsteriskAst, symAsteriskQues:
-			s.vmpack.shiftRev(_globmeta(ps.Pos, ps.Symbol))
-		default:
-			// STRUCTURAL ISOLATION: Unhandled punctuation symbols (<, >, +, ,, etc.)
-			// must be shifted distinctly as *punct nodes, preventing the packer from
-			// collapsing them into adjacent *word constituents within compounds.
-			s.vmpack.shiftRev(&punct{valbase{ps.Pos}, ps.Symbol})
-		}
-	}
-}
-
 // symsmem memorize symstr syms while reading runes
 type symsmem struct {
 	*symstr
@@ -8760,70 +4574,71 @@ func (s *symstr) match(pattern, target Value) (matched bool, res, rem Value, ste
 	matched = s.err == io.EOF && s.exhausted()
 
 	// 1. Extract `res` directly from the Matcher's internal packer
-	if s.vmpack != nil {
-		if trail {
-			res = s.reduceRev(NoPos)
-		} else {
-			res = s.reduce(NoPos)
-		}
-	}
+	// if s.vmpack != nil {
+	// 	if trail {
+	// 		res = s.reduceRev(NoPos)
+	// 	} else {
+	// 		res = s.reduce(NoPos)
+	// 	}
+	// }
+	// FIXME: reduce s.values/s.frames
 
 	// 2. Extract `rem` by natively flushing whatever is left on the Generator tape!
-	var remPopped bool
-	gen.vmpack = &vmpack{}
+	// var remPopped bool
+	// gen.vmpack = &vmpack{}
 
-	var pack func(posym)
-	var reduce func(Pos) Value
-	if trail {
-		pack, reduce = gen.packRev, gen.reduceRev
-	} else {
-		pack, reduce = gen.pack, gen.reduce
-	}
+	// var pack func(posym)
+	// var reduce func(Pos) Value
+	// if trail {
+	// 	pack, reduce = gen.packRev, gen.reduceRev
+	// } else {
+	// 	pack, reduce = gen.pack, gen.reduce
+	// }
 
-	// ALWAYS drain leftover target symbols so gen.pack() can dynamically reshape the AST
-	for gen.ensure_syms() {
-		for _, ps := range gen.syms {
-			pack(ps)
-			remPopped = true
-		}
-		gen.syms = nil
-	}
+	// // ALWAYS drain leftover target symbols so gen.pack() can dynamically reshape the AST
+	// for gen.ensure_syms() {
+	// 	for _, ps := range gen.syms {
+	// 		pack(ps)
+	// 		remPopped = true
+	// 	}
+	// 	gen.syms = nil
+	// }
 
-	if remPopped { rem = reduce(NoPos) }
+	// if remPopped { rem = reduce(NoPos) }
 
-	// Stream Termination Symmetry Checks
-	if force_full_match_anchor { matched = matched && gen.exhausted() }
+	// // Stream Termination Symmetry Checks
+	// if force_full_match_anchor { matched = matched && gen.exhausted() }
 
-	gen.vmpack = nil // Clean up
+	// gen.vmpack = nil // Clean up
 
-	// 3. Extract `stems` natively from the Matcher's captures
-	if numStems := len(s.stems); numStems > 0 {
-		stems = make([]Value, numStems)
-		for i, capture := range s.stems {
-			var stem Value
-			if len(capture.syms) > 0 {
-				gen.vmpack = &vmpack{} // Borrow the generator to pack the stems!
+	// // 3. Extract `stems` natively from the Matcher's captures
+	// if numStems := len(s.stems); numStems > 0 {
+	// 	stems = make([]Value, numStems)
+	// 	for i, capture := range s.stems {
+	// 		var stem Value
+	// 		if len(capture.syms) > 0 {
+	// 			gen.vmpack = &vmpack{} // Borrow the generator to pack the stems!
 
-				for _, ps := range capture.syms {
-					// Perfectly feed the captured posym structs back into the AST packer
-					pack(ps)
-				}
+	// 			for _, ps := range capture.syms {
+	// 				// Perfectly feed the captured posym structs back into the AST packer
+	// 				pack(ps)
+	// 			}
 
-				// ALWAYS call reduce to capture fractional/reshaped regex substrings!
-				stem = reduce(NoPos)
+	// 			// ALWAYS call reduce to capture fractional/reshaped regex substrings!
+	// 			stem = reduce(NoPos)
 
-				if capture.name.Symbol != symEmpty && stem != nil {
-					stem = &named_stem{stem, capture.name.Symbol}
-				}
-			}
+	// 			if capture.name.Symbol != symEmpty && stem != nil {
+	// 				stem = &named_stem{stem, capture.name.Symbol}
+	// 			}
+	// 		}
 
-			if trail {
-				stems[numStems-1-i] = stem
-			} else {
-				stems[i] = stem
-			}
-		}
-	}
+	// 		if trail {
+	// 			stems[numStems-1-i] = stem
+	// 		} else {
+	// 			stems[i] = stem
+	// 		}
+	// 	}
+	// }
 
 	// Sanity Warnings
 	if checkpoints {
@@ -8859,7 +4674,7 @@ func match(ctx Context, pattern, target Value) (matched bool, res, rem Value, st
 		// case "{glob *.c} foo/bar.c":
 		case "foo/b*?y foo/bar/x/y/xx/yy":
 			debug(ctx, "match: %v %v", pattern, target)
-			d_step = true; defer func() { d_step = false } ()
+			d_step = 2; defer func(i int) { d_step = i } (d_step)
 		}
 	}
 
@@ -8922,9 +4737,7 @@ func (s *symstr) evals(nodes ...Value) (res []Value) {
 	if s.err != nil && s.err != io.EOF { erro(s.Context, "%v", s.err) }
 
 	if len(s.operands) > len(bt.own.operands) {
-		erro(pc(s.Context,nodes),
-			"remained operands: %v", s.operands[len(bt.own.operands):],
-			callstack{num:5})
+		erro(pc(s.Context,nodes), "remained operands: %v", s.operands[len(bt.own.operands):], callstack{num:5})
 		s.operands = s.operands[:len(bt.own.operands)]
 	}
 
@@ -8979,11 +4792,11 @@ func (s *symstr) evoke(x Value, o, a []Value) (res Value) {
 	// 2. Context Wrapping
 	s.ops = append(s.ops, opRestoreContext)
 	s.operands = append(s.operands, restore_context{s.Context})
-	
+
 	s.Context = &delegate_ctx{collapse_ctx{Context: s.Context, good_to_collapse: true}}
 
 	// 3. JIT Instructions (Executed LIFO)
-	
+
 	// Evoke (Executes 4th / LAST)
 	s.ops = append(s.ops, opEvoke, opCons)
 	s.operands = append(s.operands, 3)
@@ -10412,34 +6225,43 @@ func symbolize_string(ctx Context, str string) (res []Symbol) {
 }
 
 func splitPathStr(ctx Context, str string) (segments []Value) {
-    var pos = _pos(ctx)
-    var a = strings.Split(str, pathSep)
-    for i, s := range a {
-        // TODO: calculate position for each segment
-        var v Value
-        if i == 0 {
-            switch s {
-            case ""  : v = makePunct(pos, symEmptyPrefix)
-            case "~" : v = makePunct(pos, symTilde)
-            case "." : v = makePunct(pos, symDot)
-            case "..": v = makePunct(pos, symDotDot)
-				default  : v = _rw(pos, s)
-            }
-        } else if s == "" {
-            if i+1 == len(a) {
-                v = makePunct(pos, symEmptySuffix)
-            } else if false {
-                v = makePunct(pos, symSlash) // PCON
-            } else {
-                debug(ctx, "%s: %v[%d]: empty path seg", str, a, i)
-                continue
-            }
-        } else {
-            v = _rw(pos, s)
-        }
-        segments = append(segments, v)
-    }
-    return
+	var pos = _pos(ctx)
+	var a = strings.Split(str, pathSep)
+	var sepLen = Pos(len(pathSep)) // Assumes pathSep is a string (e.g., "/")
+
+	for i, s := range a {
+		var v Value
+
+		if i == 0 {
+			switch s {
+			case ""  : v = makePunct(pos, symEmptyPrefix)
+			case "~" : v = makePunct(pos, symTilde)
+			case "." : v = makePunct(pos, symDot)
+			case "..": v = makePunct(pos, symDotDot)
+			default  : v = _rw(pos, s)
+			}
+		} else if s == "" {
+			if i+1 == len(a) {
+				v = makePunct(pos, symEmptySuffix)
+			} else if false {
+				v = makePunct(pos, symSlash) // PCON
+			} else {
+				debug(ctx, "%s: %v[%d]: empty path seg", str, a, i)
+				// We don't assign 'v', letting it skip insertion.
+			}
+		} else {
+			v = _rw(pos, s)
+		}
+
+		if v != nil {
+			segments = append(segments, v)
+		}
+
+		// Advance position by the length of this segment + the separator.
+		// (len(s) works perfectly because Pos is typically a byte offset).
+		pos += Pos(len(s)) + sepLen
+	}
+	return
 }
 
 func splitFileName(ctx Context, val Value) (dir, name Symbol) {
@@ -12537,8 +8359,8 @@ func (s *scanstate) String() string {
 	case '}': t = "\\}"
 	default: t = string(s.ch)
 	}
-	return fmt.Sprintf("{scanstate '%s' {%v %v %v} %016b %016b {tok=%v pos=%v sym=%v lit=%s}}",
-		t, s.offsetLine, s.offset, s.offsetRead, s.bitss, s.bits, s.tok, s.pos, s.sym, s.lit)
+	return fmt.Sprintf("{scanstate %s {%v %v %v} %016b %016b step={pos=%v tok=%v sym=%v lit=%s}}",
+		t, s.offsetLine, s.offset, s.offsetRead, s.bitss, s.bits, s.pos, s.tok, s.sym, s.lit)
 }
 
 func (s *scanstate) push(bits scanbits) (prev scanbits) {
@@ -13836,8 +9658,8 @@ func (p *compiler) copystate() *compilestate {
 
 func (p *compiler) trace(a ...any) { l_traverse.traceAt(p.Position(), a...) }
 func (p *compiler) filename() Symbol { return p.scanner.file.name }
-func (p *compiler) loc(a Pos) Position { return p.scanner.file.Position(a) }
-func (p *compiler) Position() (r Position) { return p.loc(p.pos) }
+func (p *compiler) filepos(a Pos) Position { return p.scanner.file.Position(a) }
+func (p *compiler) Position() (r Position) { return p.filepos(p.pos) }
 
 func (p *compiler) scan() {
 	// Because of one-token look-ahead, print the previous token
@@ -14402,22 +10224,22 @@ func (p *compiler) call(name Symbol, args []Value) (result bool) {
 	return
 }
 
-func (p *compiler) arrow(lhs Value, isClosure bool) (res Value) {
-	if l_traverse.enabled { defer un(l_trace(l_traverse, "arrow")) }
+// func (p *compiler) arrow(lhs Value, isClosure bool) (res Value) {
+// 	if l_traverse.enabled { defer un(l_trace(l_traverse, "arrow")) }
 
-	pos, tok := lhs.Pos(), p.tok // the arrow '->', '=>', etc.
-	p.step() // consume '->'
+// 	pos, tok := lhs.Pos(), p.tok // the arrow '->', '=>', etc.
+// 	p.step() // consume '->'
 
-	// THE DOD FIX: Pure AST Construction!
-	// Do NOT call p.resolve here. We must wait for runtime to evaluate LHS,
-	// especially for dynamic variables like `$_`!
+// 	// THE DOD FIX: Pure AST Construction!
+// 	// Do NOT call p.resolve here. We must wait for runtime to evaluate LHS,
+// 	// especially for dynamic variables like `$_`!
 
-	rhs := p.expr()
+// 	rhs := p.expr()
 
-	// If lhs is already an arrow, this builds a left-associative tree:
-	// A -> B -> C  becomes  arrow(arrow(A, B), C)
-	return _arrow(pos, tok, lhs, rhs)
-}
+// 	// If lhs is already an arrow, this builds a left-associative tree:
+// 	// A -> B -> C  becomes  arrow(arrow(A, B), C)
+// 	return _arrow(pos, tok, lhs, rhs)
+// }
 
 func (p *compiler) word() *word {
 	w := _word(p.pos, p.sym)
@@ -14705,8 +10527,6 @@ func (p *compiler) braced_elems() (elems []Value) {
 			p.spaces()
 		case LBRACE:
 			elems = append(elems, p.braced())
-		case RAW:
-			elems = append(elems, p.literal())
 		default:
 			elems = append(elems, p.expr())
 		}
@@ -14834,8 +10654,7 @@ func (p *compiler) values() (values []Value) {
 	for p.spaces(); !p.is_list_term(); p.spaces() {
 		var prev = p.pos
 		if values = append(values, p.expr()); p.pos == prev {
-			erro(p, "bad: %v %v; values: %v", p.tok, p.lit, ts(values,p),
-				callstack{num:10}, unwind{})
+			erro(p, "bad: %v, values: %v", &p.scanstate, ts(values,p), callstack{num:10}, unwind{})
 		}
 
 		// If there's a comment right after the parsed expression, we break
@@ -15433,32 +11252,6 @@ func (p *compiler) escape() *escaped {
 	return v
 }
 
-func (p *compiler) literal() Value {
-	tok, sym, lit, pos := p.tok, p.sym, p.lit, p.pos
-
-	p.step()
-
-	// ESCAPE is handled in value.EscapeChar
-	switch tok {
-	case BAR: erro(p, "`|` is deprecated, change the modifiers!")
-	case BINARY:      return ParseBinary(pos, lit, sym)
-	case OCTAL:       return ParseOctal(pos, lit, sym)
-	case INTEGER:     return ParseDecimal(pos, lit, sym)
-	case HEXADECIMAL: return ParseHexadecimal(pos, lit, sym)
-	case DATETIME:    return ParseDateTime(pos, lit)
-	case DATE:        return ParseDate(pos, lit)
-	case TIME:        return ParseTime(pos, lit)
-	case URL:         return ParseURL(pos, lit)
-	case FLOATING:    return parseFloat(pos, lit, sym)
-	case WORD:        return _word(pos, sym)
-	case RAW:         return _raw(pos, lit)
-	case STRING:      return _strlit(pos, lit)
-	}
-
-	unreachable()
-	return nil
-}
-
 type is_strcomp_parser struct{}
 type parse_strcomp_ctx struct{ Context }
 func (p parse_strcomp_ctx) do(ctx Context, op any) (_ any) {
@@ -15472,6 +11265,7 @@ func (p parse_strcomp_ctx) do(ctx Context, op any) (_ any) {
 func (p *compiler) strcomp() *strcomp {
 	var elems []Value
 
+	pos := p.pos
 	p.step()
 
 	cc := parse_strcomp_ctx{p.Context}; defer func() { p.Context = cc.Context } ()
@@ -15479,17 +11273,13 @@ func (p *compiler) strcomp() *strcomp {
 
 	for p.tok != EOF && p.tok != COMPOSED && p.tok != LINEND {
 		var pos = p.pos
-		if p.tok == RAW {
-			elems = append(elems, p.literal())
-		} else {
-			elems = append(elems, p.expr())
-		}
-		if p.pos == pos { erro(p, "syntax error") }
+		elems = append(elems, p.expr())
+		if p.pos == pos { erro(p, "syntax error", unwind{}) }
 	}
 
 	p.expect(COMPOSED)
 
-	return _strcomp(elems...)
+	return &strcomp{valbase{pos}, elements{elems}}
 }
 
 func (p *compiler) is_dot_term() bool {
@@ -15566,9 +11356,9 @@ func (p *compiler) path(start Value) (res *path) {
 	switch t := start.(type) {
 	case *path: res = t
 	case *strlit:
-		res = makePath(splitPathStr(pc(p,t.pos), t.s)...)
+		res = makePath(splitPathStr(pc(p,t.pos+Pos(1)), t.s)...)
 	case *strcomp:
-		res = makePath(splitPathStr(pc(p,t.Pos()), __string(p,t))...) // FIXME: dont final here
+		res = makePath(splitPathStr(pc(p,t.pos), __string(p,t))...) // FIXME: optimize to avoid direct __string(...)
 	default:
 		res = makePath(start)
 	}
@@ -15928,7 +11718,11 @@ func (p *compiler) resolve(pos Pos, sym Symbol, isClosure bool) (result Value) {
 	}
 
 	if truly(p, is_config_mode{}) {
-		return scope.def(p, defVoid, sym)
+		if false {
+			return scope.def(p, defVoid, sym)
+		} else {
+			warn(p, "%v", sym)
+		}
 	}
 	return
 }
@@ -16439,7 +12233,7 @@ func (p *compiler) calling() (result Value) {
 		if tok == LPAREN { p.expect(RPAREN) } else { p.expect(RBRACE) }
 
 	case BINARY, OCTAL, INTEGER, HEXADECIMAL, FLOATING:
-		tok, name = p.tok, p.literal() // $0, $1, $(1.2), $(0x1)...
+		tok, name = p.tok, p.expr() // $0, $1, $(1.2), $(0x1)...
 		sym = __symbol(p, name)
 		obj = p.resolve(name.Pos(), sym, closure)
 
@@ -16455,7 +12249,7 @@ func (p *compiler) calling() (result Value) {
 
 	case STRING, STRCOMP:
 		tok = p.tok
-		if tok == STRING { name = p.literal() } else { name = p.strcomp() }
+		name = p.expr()
 		obj, sym, opts = p.identity(tok, name, closure)
 
 	case WORD:
@@ -16511,223 +12305,163 @@ func (c *compiler) expr() (x Value) {
 	if l_traverse.enabled { defer un(l_trace(l_traverse, "expr")) }
 
 	// 1. Atomic Transaction Start
-	bt := c.checkpoint(undoOwn | undoCtx | undoStack | undoHead | undoPack)
-
-	c.vmpack = &vmpack{} // Native Synchronous Packer
-
-	// Primer: Ensure the scanner is initialized
-	if c.tok == ILLEGAL && c.lit == "" {
-		c.next(true)
-		if c.tok == EOF {
-			c.unwind(&bt)
-			return _null(c.pos)
-		}
-	}
+	defer func(bt backtrack) { c.unwind(&bt) } (
+		c.checkpoint(undoOwn | undoCtx | undoStack | undoPack | undoHead))
 
 	startOps := len(c.ops)
-	reverse := truly(c.Context, propReversal)
+	execute := func() { for len(c.ops) > startOps && c.err == nil { c.symstr.step() } }
 
-	// Dynamically bind the unswitched packer pipelines via closures so
-	// they always evaluate against the *current* c.vmpack pointer.
-	var shift func(Value)
-	var reduce func(Pos) Value
-	var packOp evalop
-	if reverse {
-		packOp = opPackRev
-		shift = func(v Value) { c.vmpack.shiftRev(v) }
-		reduce = func(pos Pos) Value { return c.vmpack.reduceRev(pos) }
-	} else {
-		packOp = opPack
-		shift = func(v Value) { c.vmpack.shift(v) }
-		reduce = func(pos Pos) Value { return c.vmpack.reduce(pos) }
-	}
-
-	// Safe PDA Lookbehind Helpers
-	peekLHS := func() Value {
-		if c.vmpack == nil { return nil }
-		return reduce(c.pos)
-	}
-	restoreLHS := func(v Value) {
-		c.vmpack = &vmpack{}
-		if v != nil && !isEmpty(v) { shift(v) }
-	}
-
-	isUrlCtx := truly(c.Context, is_url_parser{})
+	// Initialize the root parsing boundary with opRet
+	c.ops = append(c.ops, opFrame)
+	c.operands = append(c.operands, opRet)
+	execute()
 
 expr_loop:
 	for c.tok != EOF && c.err == nil {
-		pos := c.pos
+		c.loc = c.pos
+		sym, lit, tok := c.sym, c.lit, c.tok
 		var val Value
-		var sym Symbol
 
-		// Break only if we are at the root level (not inside a nested PDA delimiter)
-		if c.vmpack.parent == nil {
-			isLHS := truly(c.Context, left_hand_side{})
-			if isLHS && c.tok.is_assign() { break }
+		switch tok {
+		case SPACE, LINEND, RPAREN, RBRACK, RBRACE, RBOT_CORNER, RTOP_CORNER, RCHEVRON, COMPOSED, SEMICOLON, EOF:
+			break expr_loop
 
-			isStop := false
-			switch c.tok {
-			case COLON:
-				// URL Lookbehind Interceptor
-				lhs := peekLHS()
-				if w, ok := lhs.(*word); ok && isKnownScheme(w.s) && (!isLHS || truly(c.Context, is_recipe_parser{false})) {
-					val = c.url(lhs)
-					c.vmpack = &vmpack{}
-					goto push_val
-				}
-				restoreLHS(lhs)
-				isStop = true // COLON terminates expr if not a URL
+		case BAR:
+			erro(c, "`|` is deprecated, change the modifiers!", unwind{})
+			break expr_loop
 
-			case COMPOSED, RPAREN, RBRACK, RBRACE, RBOT_CORNER, RTOP_CORNER, RCHEVRON, RAW, SPACE, SEMICOLON, LINEND, EOF:
-				isStop = true
-			case COMMA:
-				if truly(c.Context, aware_token{COMMA}) { isStop = true }
-
-			// Strictly enforce URL loop boundaries
-			case CLOSURE:
-				if truly(c.Context, is_url_query_parser{}) { isStop = true }
-			case HASH:
-				if isUrlCtx { isStop = true }
-			}
-
-			if isStop { break expr_loop }
-			if truly(c.Context, is_strcomp_parser{}) { break expr_loop }
-		}
-
-		// Parse atomic context nodes or map composition operators to the PDA
-		switch c.tok {
-		// PDA NATIVE COMPOSITION OPERATORS (Bypassing recursive dot/path/arrow logic)
+		case BINARY: if i, e := strconv.ParseInt(lit[2:], 2, 64); e == nil { val = _binary(c.loc, i, sym) } else { erro(c, "%v", e, unwind{}); break expr_loop }
+		case OCTAL: if i, e := strconv.ParseInt(lit[1:], 8, 64); e == nil { val = _octal(c.loc, i, sym) } else { erro(c, "%v", e, unwind{}); break expr_loop }
+		case INTEGER: if i, e := strconv.ParseInt(lit, 10, 64); e == nil { val = _decimal(c.loc, i, sym) } else { erro(c, "%v", e, unwind{}); break expr_loop }
+		case HEXADECIMAL: if i, e := strconv.ParseInt(lit[2:], 16, 64); e == nil { val = _hexadecimal(c.loc, i, sym) } else { erro(c, "%v", e, unwind{}); break expr_loop }
+		case FLOATING: if f, e := strconv.ParseFloat(strings.Replace(lit,"_","",-1), 64); e == nil { val = _float(c.loc, f, sym) } else { erro(c, "%v", e, unwind{}); break expr_loop }
+		case URL: if u, e := neturl.Parse(lit); e == nil { val = makeUrl(c.loc, u) } else { erro(c, "URL: %v", e, unwind{}) }
+		case DATETIME: val = ParseDateTime(c.loc, lit)
+		case DATE: val = ParseDate(c.loc, lit)
+		case TIME: val = ParseTime(c.loc, lit)
+		case WORD: val = &word{valbase{c.loc}, sym}
+		case RAW: if lit == "" { val = &valbase{c.loc} } else { val = &raw{valbase{c.loc}, lit} }
+		case STRING: val = &strlit{valbase{c.loc}, lit}
+		case SAST, DAST, ASTQ: val = &globmeta{valbase{c.loc}, tok2sym[tok]}
 		case QUE:
-			if isUrlCtx { break expr_loop }
-			sym = symQues; c.step()
+			if truly(c.Context, is_url_parser{}) { break expr_loop }
+			val = &globmeta{valbase{c.loc}, tok2sym[tok]} // NOTE: via tok2sym as sym is symEmpty; scanner didn't assign it to symQues!
 
-		case PCON:
-			if isUrlCtx { break expr_loop }
-			sym = symSlash; c.step()
-
+		case DOTDOT: val = &punct{valbase{c.loc}, tok2sym[tok]}
 		case DOT:
-			if isUrlCtx { break expr_loop }
-			sym = symDot; c.step()
+			val = valbase{c.loc}
+			c.symstr.frames[len(c.symstr.frames)-1].ctor = opQualword
+		case PROOT:
+			val = &punct{valbase{c.loc}, symEmptyPrefix}
+			c.symstr.frames[len(c.symstr.frames)-1].ctor = opPath
+		case PTAIL:
+			val = &punct{valbase{c.loc}, symEmptySuffix}
+			c.symstr.frames[len(c.symstr.frames)-1].ctor = opPath
+		case PCON:
+			val = valbase{c.loc}
+			c.symstr.frames[len(c.symstr.frames)-1].ctor = opPath
 
-		// Map wildcard operators natively so the PDA can compose them accurately!
-		case SAST:
-			sym = symAsterisk; c.step()
-
-		case DAST:
-			sym = symAsteriskAst; c.step()
-
-		case ASTQ:
-			sym = symAsteriskQues; c.step()
-
-		case SELECT_PROP, SELECT_PROG1, SELECT_PROG2:
-			if truly(c.Context, selection{}) {
-				lhs := peekLHS()
-				val = c.arrow(lhs, truly(c.Context, closure_selection{}))
-				c.vmpack = &vmpack{}
-				goto push_val
-			}
-			sym = symArrow; c.step()
-
-		case ASSIGN:
-			sym = symEqualSign; c.step()
-
-		case LPAREN:
-			if !truly(c.Context, parse_no_argumented{}) {
-				lhs := peekLHS()
-				if lhs != nil && !isEmpty(lhs) {
-					val = c.argumented(lhs)
-					c.vmpack = &vmpack{}
-					goto push_val
-				}
-				restoreLHS(lhs)
-			}
-			val = c.group()
-
-		// ATOMIC VALUES (Parsed via specific functions to preserve Context semantics)
-		case WORD:
-			val = c.word()
-			if c.tok == PERC && truly(c.Context, is_url_query_parser{}) {
-				comp := _compound(val)
-				for c.tok == PERC {
-					comp.elems = append(comp.elems, c.punct())
-				urlpercloop:
-					for c.tok != PERC {
-						switch c.tok {
-						case BINARY, OCTAL, INTEGER, HEXADECIMAL, WORD:
-							comp.elems = append(comp.elems, c.literal())
-						case HASH, CLOSURE, SPACE, EOF:
-							break urlpercloop
-						default:
-							erro(c, "bad url token: %v %v", c.tok, c.lit)
-							break urlpercloop
-						}
-					}
-				}
-				val = comp
-			}
-
-		case BINARY, OCTAL, INTEGER, HEXADECIMAL, FLOATING, DATETIME, DATE, TIME, URL, STRING:
-			val = c.literal()
-		case STRCOMP:       val = c.strcomp()
-		case ESCAPE:        val = c.escape()
-		case LBRACE:        val = c.braced()
-		case LBOT_CORNER, LTOP_CORNER: val = c.corner_list()
-		case LANGLE, RANGLE: val = c.punct()
-		case DELEGATE: val = c.calling()
+		case STRCOMP: val = c.strcomp(); goto skip_step
+		case ESCAPE: val = c.escape(); goto skip_step
+		case LBRACE: val = c.braced(); goto skip_step
+		case LBRACK: val = c.glob(nil); goto skip_step
+		case LBOT_CORNER, LTOP_CORNER: val = c.corner_list(); goto skip_step
+		case LANGLE, RANGLE: val = c.punct(); goto skip_step
+		case DELEGATE: val = c.calling(); goto skip_step
 		case CLOSURE:
-			if truly(c.Context, is_url_query_parser{}) {
-				val = c.punct()
-			} else {
-				val = c.calling()
-			}
-		case MINUS:        val = c.flag()
-		case EXC:          val = c.negative()
-		case TILDE, AT, BAR, PLUS, SEMICOLON, COMMA: val = c.punct()
-		case DOTDOT:       val = &punct{valbase{pos}, tok2sym[c.tok]}; c.step()
+			if truly(c.Context, is_url_query_parser{}) { val = c.punct() } else { val = c.calling() }
+			goto skip_step
+		case MINUS: val = c.flag(); goto skip_step
+		case EXC: val = c.negative(); goto skip_step
+		case TILDE, AT, PLUS, COMMA: val = c.punct(); goto skip_step
 		case PERC:
 			if truly(c.Context, is_url_query_parser{}) { val = c.punct() } else { val = c.perc(nil) }
-		case LBRACK:
-			val = c.glob(nil) // LBRACK remains delegated as it encompasses dynamic range logic
+			goto skip_step
 
 		default:
-			if c.tok.is_keyword() {
-				val = c.word()
+			if tok.is_keyword() {
+				val = _word(c.loc, sym)
 			} else {
-				erro(pc(c,pos), _f("unexpected {tok=%v sym=%s lit=%s}", c.tok, c.sym, c.lit), callstack{num: 16}, unwind{})
-				c.step()
-				continue expr_loop
+				erro(c, "Unhandled token breaking expression loop: %v", &c.scanstate, unwind{})
+				break expr_loop
 			}
 		}
 
-	push_val:
-		// 3. Drive the State Machine
+		c.step()
+
+	skip_step:
 		if val != nil {
-			c.ops = append(c.ops, packOp)
+			c.ops = append(c.ops, opShift)
 			c.operands = append(c.operands, val)
-		} else if sym != 0 {
-			c.ops = append(c.ops, packOp)
-			c.operands = append(c.operands, posym{pos, sym})
+			execute()
+
+			fi := len(c.frames) - 1
+
+			switch c.tok {
+			case SPACE, LINEND, RPAREN, RBRACK, RBRACE, RBOT_CORNER, RTOP_CORNER, RCHEVRON, COMPOSED, SEMICOLON, EOF:
+				break expr_loop
+			case BAR:
+				erro(c, "`|` is deprecated, change the modifiers!", unwind{})
+				break expr_loop
+			case HASH:
+				if truly(c.Context, is_url_parser{}) { break expr_loop }
+			case COMMA:
+				if truly(c.Context, aware_token{COMMA}) { break expr_loop }
+			case CLOSURE:
+				if truly(c.Context, is_url_query_parser{}) { break expr_loop }
+
+			case DOT:
+				c.step()
+				if c.frames[fi].ctor == opRet {
+					c.frames[fi].ctor = opQualword
+				} else if c.frames[fi].ctor != opQualword {
+					c.ops = append(c.ops, opShiftResult, opFrame, opReduce)
+					c.operands = append(c.operands, opQualword)
+					execute()
+				}
+
+			case PCON:
+				c.step()
+				if c.frames[fi].ctor == opRet {
+					c.frames[fi].ctor = opPath
+				} else if c.frames[fi].ctor != opPath {
+					c.ops = append(c.ops, opShiftResult, opFrame, opReduce)
+					c.operands = append(c.operands, opPath)
+					execute()
+				}
+
+			case SELECT_PROP, SELECT_PROG1, SELECT_PROG2:
+				c.step()
+				if c.frames[fi].ctor == opRet {
+					c.frames[fi].ctor = opCompound
+				}
+				c.ops = append(c.ops, opShiftResult, opResolve, opSwap, opIdent, opSwap, opFrame, opReduce)
+				c.operands = append(c.operands, c.tok, 1, 1, opSelect)
+				execute()
+
+			default:
+				if c.frames[fi].ctor == opRet {
+					c.frames[fi].ctor = opCompound
+				}
+			}
 		}
-
-		for len(c.ops) > startOps && c.err == nil { c.symstr.step() }
 	}
 
-	if c.err != nil && c.err != io.EOF { erro(c, "%[1]T %[1]v", c.err) }
+	c.ops = append(c.ops, opReduce)
+	execute()
 
-	// 4. Finalize the AST and Commit Transaction
-	for c.vmpack != nil && c.vmpack.parent != nil {
-		inner := reduce(c.pos)
-		c.vmpack = c.vmpack.parent
-		shift(inner)
-	}
+	if rl := len(c.results); rl > 0 {
+		top := c.results[rl-1]
+		c.results = c.results[:rl-1]
 
-	if c.vmpack != nil {
-		x = reduce(c.pos)
+		switch t := top.(type) {
+		case []Value: if len(t) > 0 { x = t[len(t)-1] }
+		case   Value: x = t
+		}
 	}
 
 	if x == nil { x = _null(c.pos) }
-
-	c.unwind(&bt)
+	if checkpoints { c.check_expr(x) }
 	return x
 }
 
@@ -16963,18 +12697,20 @@ func (p *compiler) braced_word() (res Value) {
 }
 
 func (p *compiler) braced_words() (res Value) {
+	pos := p.pos
 	p.next(true) // resumes 'word'
 
 	cc := final{p.Context}; defer func() { p.Context = cc.Context } ()
 	p.Context = cc
 
-	var pos = p.pos
-	var elems = p.evals(p.braced_elems()...)
+	elems := p.braced_elems()
 
 	p.expect(RBRACE)
 
+	elems = p.evals(elems...)
+
 	for i, v := range elems {
-		elems[i] = &word{valbase{pos}, __symbol(p, v)}
+		elems[i] = &word{valbase{v.Pos()}, __symbol(p, v)}
 	}
 
 	switch len(elems) {
@@ -17164,6 +12900,7 @@ func (p *compiler) braced_file() (res Value) {
 	p.spaces()
 
 	var elems []Value
+
 	for _, elem := range p.braced_elems() {
 		var pos = elem.Pos()
 		if f := p.project.file(p, elem); f.exists() { // NOTE: (*file).exists checks for `f != nil`
@@ -17334,9 +13071,9 @@ func (p *compiler) braced_none() (x Value) {
 }
 
 func (p *compiler) braced_null() (x Value) {
+	pos := p.pos
 	p.next(true)
-
-	x = &null{valbase{p.pos}}
+	x = &null{valbase{pos}}
 	p.spaces()
 	p.expect(RBRACE)
 	return
@@ -17701,12 +13438,7 @@ func (p *compiler) recipe() (recipes []Value) {
 
 		c.builtin = false
 		for !p.is_end_of_line() {
-			var x Value
-			if p.tok == RAW {
-				x = p.literal()
-			} else {
-				x = p.expr()
-			}
+			var x = p.expr()
 			if c.lines == nil {
 				c.elems = append(c.elems, x)
 			}
@@ -17735,7 +13467,7 @@ func (p *compiler) recipe() (recipes []Value) {
 	} else if isPlainline {
 		return []Value{ &plainline{elements{merge(elems...)}} }
 	} else {
-		return []Value{ &recipe{strcomp{elements{elems}}} }
+		return []Value{ &recipe{strcomp{valbase{pos}, elements{elems}}} }
     }
 }
 
@@ -23399,7 +19131,7 @@ func _redis(v Value) (Value, bool) {
 		}
 	case *strcomp:
 		if e, dis := _redis_elems(t.elems); dis {
-			return &strcomp{elements{e}}, true
+			return &strcomp{t.valbase,elements{e}}, true
 		}
 	}
 
@@ -24072,58 +19804,7 @@ func (p *path) String() (s string) {
     return
 }
 func (p *path) isAbs() bool { x, y := p.elems[0].(*punct); return y && x.s == symEmptyPrefix }
-func _pathStr(ctx Context, str string) *path { return &path{elements{splitPathStr(ctx, str)}} }
-func _pathSym_OBSOLETE(pos Pos, sym Symbol) Value { // NOTE: OBSOLETED by __symPath!!
-	if sym == symEmpty {
-		return nil
-	}
-
-	// A path symbol is a flatten sequence, e.g. [foobar / a . def . am]
-	seq := __symSeq(sym)
-	if len(seq) == 0 {
-		return _word(pos, sym)
-	}
-
-	var p = new(path)
-	var current []Value
-
-	for i, part := range seq {
-		if part == symSlash {
-			if l := len(current); l > 1 {
-				p.elems = append(p.elems, &compound{elements{current}})
-			} else if l == 1 {
-				p.elems = append(p.elems, current[0])
-			}
-
-			// THE DOD FIX: Restore Absolute Roots and Trailing Slashes!
-			// If the slash is at index 0, it is PROOT (absolute path).
-			// If the slash is at the very end, it is PTAIL (directory boundary).
-			if i == 0 {
-				p.elems = append(p.elems, &punct{valbase{pos}, symEmptyPrefix})
-			} else if i == len(seq)-1 {
-				p.elems = append(p.elems, &punct{valbase{pos}, symEmptySuffix})
-			}
-
-			current = nil // Reset and detach memory for the next directory
-		} else if part != symEmpty {
-			current = append(current, _word(pos, part))
-		}
-	}
-
-	// Flush the final segment
-	if current != nil {
-		if l := len(current); l > 1 {
-			p.elems = append(p.elems, &compound{elements{current}})
-		} else if l == 1 {
-			p.elems = append(p.elems, current[0])
-		}
-	}
-
-	if len(p.elems) == 1 {
-		return p.elems[0]
-	}
-	return p // can be empty path (e.g., if sym was exclusively symEmpty)
-}
+func makePathFromString(ctx Context, str string) *path { return &path{elements{splitPathStr(ctx, str)}} }
 
 type fullfile struct{ *file }
 func (o fullfile) String() string {
@@ -24609,8 +20290,9 @@ func (p flag) opt(ctx Context, name string) (res string, match bool) {
 	return
 }
 
-type strcomp struct{ elements } // "string compound"
+type strcomp struct{ valbase; elements } // "string compound elements"
 func (_ *strcomp) kind() Kind { return KindStrcomp }
+func (p *strcomp) Pos() Pos { return p.pos }
 func (p *strcomp) String() (s string) { return `"` + p.src() + `"` }
 func (p *strcomp) src() (s string) {
     for _, elem := range p.elems { s += elem.String() }
@@ -29262,7 +24944,7 @@ func _hexadecimal(pos Pos, i int64, sym Symbol) *hexadecimal { return &hexadecim
 func _float(pos Pos, f float64, sym Symbol) *float  { return &float{valbase{pos},f,sym} }
 func _strlit(pos Pos, s string) *strlit { return &strlit{valbase{pos},s} }
 func _strval(pos Pos, elems ...Value) *strval { return &strval{valbase{pos},elems} }
-func _strcomp(elems ...Value) *strcomp { return &strcomp{elements{elems}} }
+func _strcomp(elems ...Value) *strcomp { var pos Pos; if len(elems) > 0 { pos = elems[0].Pos() - Pos(1) }; return &strcomp{valbase{pos},elements{elems}} }
 func _qualword(elems ...Value) *qualword { return &qualword{elements{elems}} }
 func _compound(elems ...Value) *compound { return &compound{elements{elems}} }
 func _list(elems ...Value) *list { return &list{elements{elems}} }
@@ -29380,55 +25062,6 @@ func makeClosure(pos Pos, tok token, obj Value, opts []Value, args ...Value) Val
 //     }
 //     return
 // }
-
-func ParseBinary(pos Pos, s string, sym Symbol) *binary {
-    if strings.HasPrefix(s, "0b") || strings.HasPrefix(s, "0B") {
-        s = s[2:]
-    }
-    if i, e := strconv.ParseInt(s, 2, 64); e == nil {
-        return _binary(pos, i, sym)
-    } else {
-        panic(e)
-    }
-}
-
-func ParseOctal(pos Pos, s string, sym Symbol) *octal {
-    if strings.HasPrefix(s, "0") {
-        s = s[1:]
-    }
-    if i, e := strconv.ParseInt(s, 8, 64); e == nil {
-        return _octal(pos, i, sym)
-    } else {
-        panic(e)
-    }
-}
-
-func ParseDecimal(pos Pos, s string, sym Symbol) *decimal {
-	if i, e := strconv.ParseInt(s, 10, 64); e == nil {
-		return _decimal(pos, i, sym)
-	} else {
-		panic(e)
-	}
-}
-
-func ParseHexadecimal(pos Pos, s string, sym Symbol) *hexadecimal {
-	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
-		s = s[2:]
-	}
-	if i, e := strconv.ParseInt(s, 16, 64); e == nil {
-		return _hexadecimal(pos, i, sym)
-	} else {
-		panic(e)
-	}
-}
-
-func parseFloat(pos Pos, s string, sym Symbol) *float {
-	if f, e := strconv.ParseFloat(strings.Replace(s, "_", "", -1), 64); e == nil {
-		return _float(pos, f, sym)
-	} else {
-		panic(e)
-	}
-}
 
 // time_pkg.RFC3339Nano
 func parseDateTime(s string) (time_pkg.Time, error) { return time_pkg.Parse("2006-01-02T15:04:05.999999999Z07:00", s) }
@@ -32646,8 +28279,8 @@ func walkFileInfos(ctx Context, root Symbol, pats []Value, fn filepath.WalkFunc)
     ForPats:
         for _, p := range pats {
             var matched bool
-            if matched, _, _, _ = match(ctx, p, _pathStr(ctx, path)); !matched {
-                matched, _, _, _ = match(ctx, p, _pathStr(ctx, filepath.Base(path)))
+            if matched, _, _, _ = match(ctx, p, makePathFromString(ctx, path)); !matched {
+                matched, _, _, _ = match(ctx, p, makePathFromString(ctx, filepath.Base(path)))
             }
             if matched {
                 if err = fn(path, info, err); err != nil {
@@ -36894,7 +32527,7 @@ func (ctx *modifier_updatefile) x(exe *execution, args ...Value) (result any) {
 			}
 			if e := os.MkdirAll(p, os.FileMode(0755)); e != nil {
 				if proj := _project(ctx); proj != nil {
-					info(ctx, "%v: %v %v", filename, proj, unmap_files(ctx, proj, _pathStr(ctx, filename), nil))
+					info(ctx, "%v: %v %v", filename, proj, unmap_files(ctx, proj, makePathFromString(ctx, filename), nil))
 					info(ctx, "%v: %v %v", filename, proj, proj.file(ctx, filename))
 					erro(ctx, "%v: %v (%v)", filename, e, ts(target))
 				}
@@ -39741,7 +35374,7 @@ func (ctx *__path) x0() any {
         if x, y := a.(*path); y {
             res = append(res, x)
         } else {
-            res = append(res, _pathStr(ctx, __string(ctx, a)))
+            res = append(res, makePathFromString(ctx, __string(ctx, a)))
         }
     }
     return res
@@ -40299,12 +35932,12 @@ func (ctx *__patsubst) x0() (_ any) {
 				case *strlit, *strcomp:
 					v = _strlit(_pos(ctx), str)
 				case *path:
-					v = _pathStr(ctx, str)
+					v = makePathFromString(ctx, str)
 				case *file, fullfile:
 					// REFINED: Treat files as paths if they contain slashes, otherwise words.
-					if strings.Contains(str, pathSep) { v = _pathStr(ctx, str) } else { v = _rw(_pos(ctx), str) }
+					if strings.Contains(str, pathSep) { v = makePathFromString(ctx, str) } else { v = _rw(_pos(ctx), str) }
 				default:
-					if strings.Contains(str, pathSep) { v = _pathStr(ctx, str) } else { v = _rw(_pos(ctx), str) }
+					if strings.Contains(str, pathSep) { v = makePathFromString(ctx, str) } else { v = _rw(_pos(ctx), str) }
 				}
 				res = append(res, v)
 			}
@@ -40347,7 +35980,7 @@ func (ctx *__patsubst) x() (_ any) {
 			// THE DOD FIX: Pure Symbol Domain Evaluation!
 			// By using __symbol, the sequence (including symSlash) is preserved.
 			// _pathSym natively unrolls it into _word elements, completely
-			// bypassing _pathStr, splitPathStr, and the _rw raw fallback!
+			// bypassing makePathFromString, splitPathStr, and the _rw raw fallback!
 			// =========================================================
 			} else if sym := __symbol(ctx, val); sym != symEmpty {
 				var v Value
@@ -40689,9 +36322,9 @@ func (ctx *__gitdir) x() (_ any) {
             s = filepath.Join(s, ".git")
         }
         if i, e := os.Stat(s); e != nil {
-            a = _pathStr(pc(ctx, a), s) // CRITICAL FIX
+            a = makePathFromString(pc(ctx, a), s) // CRITICAL FIX
         } else if m := i.Mode(); m.IsDir() {
-            a = _pathStr(pc(ctx, a), s) // CRITICAL FIX
+            a = makePathFromString(pc(ctx, a), s) // CRITICAL FIX
         } else if m.IsRegular() {
             if b, e := ioutil.ReadFile(s); e != nil {
                 erro(ctx, "%v", e)
@@ -40700,7 +36333,7 @@ func (ctx *__gitdir) x() (_ any) {
             } else {
                 t := string(bytes.TrimSpace(b[7:]))
                 s = filepath.Join(filepath.Dir(s), t)
-                a = _pathStr(pc(ctx, a), s) // CRITICAL FIX
+                a = makePathFromString(pc(ctx, a), s) // CRITICAL FIX
             }
         } else {
             erro(pc(ctx,a), "%v", s)
@@ -42406,7 +38039,7 @@ func (ctx *__glob) x() (_ any) {
         }
         for _, name := range names {
             // TODO: ctx.dir, ctx.file, ctx.symbol
-            res = append(res, _pathStr(ctx, name))
+            res = append(res, makePathFromString(ctx, name))
         }
     }
     return res
