@@ -2937,17 +2937,17 @@ const (
 	// 1. MISC (System, Control & Stack Manipulation)
 	// General VM routing, debugging, and memory stack alignments.
 	// ============================================================================
-	opEnd                evalop = iota // 0 - Halts VM execution
-	opRet
-	opUnwind                           // 1 - Restores a previously saved backtracking checkpoint
-	opDebug                            // 2 - Prints debugging telemetry
-	opRestoreContext                   // 3 - Restores the previous context environment
-	opSwap                             // 4 - Swap N results to operands
-	opCons                             // 5 - Consolidate N results to 1 operand (Variadic Swap)
-	opCompact                          // 6 - Consolidate N operands to 1 operand
-	opGroup /* Values */
-	opValidate                         // 7 - Validate N results and swap to operands if valid
-	opCompactValid                     // 8 - Validate N operands and consolidate valid items back
+	opEnd evalop = iota // Halts VM execution
+	opRet               // Pops top operand to results stack
+	opUnwind            // Restores a previously saved backtracking checkpoint
+	opDebug             // Prints debugging telemetry
+	opRestoreContext    // Restores the previous context environment
+	opSwap              // Swaps N results to operands
+	opCons              // Consolidates N results to 1 operand (Variadic Swap)
+	opCompact           // Consolidates N operands to 1 operand
+	opGroup             // Bundles N results into []Value slice
+	opValidate          // Validates N results and swaps to operands if valid
+	opCompactValid      // Validates N operands and consolidates valid items back
 
 	// ============================================================================
 	// 2. EVALUATOR (AST -> AST)
@@ -2955,112 +2955,67 @@ const (
 	// Primary stack: s.results
 	// ============================================================================
 	// -- Execution & Resolution --
-	opExpand
-	opEval                             // 9 - Evaluates an AST node
-	_                          // 10 - Evaluates an AST node (reversed direction)
-	opEvoke                            // 11 - Evokes a callable/function
-	_                         // 12 - Finalizes an evoke call and yields the result
-	opIdent // identifier
-	opResolve                          // 13 - Resolves a symbol/variable
-	opResolveClosure                          // 13 - Resolves a symbol/variable
-	_                       // 14 - Expands variadic arguments
-	_                    // 15 - Expands variadic arguments (reversed direction)
-	opSelect                           // 16 - Executes a select/match branch evaluation
+	opExpand            // Dynamic op wrapper expansion
+	opEval              // Evaluates an AST node
+	opEvoke             // Evokes a callable/function
+	opIdent             // Resolves an identifier node
+	opResolve           // Resolves a symbol/variable in standard context
+	opResolveClosure    // Resolves a symbol/variable in closure context
+	opSelect            // Executes a select/match branch evaluation
 
 	// -- Transformers --
-	opEase                             // 17 - Eases N results into a single list or scalar result
-	opMerge                            // 18 - Recursively merges one result into elements of []Value
-	opModify                           // 19 - Applies AST modification/mutation
-	opPathStr                          // 20 - Converts path components to string equivalents
-	opFullname                         // 21 - Resolves absolute path values
+	opEase              // Eases N results into a single list or scalar result
+	opMerge             // Recursively merges one result into elements of []Value
+	opModify            // Applies AST modification/mutation
+	opPathStr           // Converts path components to string equivalents
+	opFullname          // Resolves absolute path values
 
 	// -- AST Constructors --
-	opList
-	opCompound                         // 22 - Combines N results into a compound node
-	opQualword                         // 23 - Combines N results into a qualword node
-	opGlobbrace                        // 24 - Combines N results into a globbrace node
-	opPath                             // 25 - Combines N results into a path node
-	opConjunct                         // 26 - Merges results into a logical AND node
-	opDisjunct                         // 27 - Merges results into a logical OR node
-	opNegate                           // 28 - Applies logical negation wrapping
-	opFlag                             // 29 - Applies flag wrapping
-	opPair                             // 30 - Combines results into key-value pairs
-	opRule                             // 31 - Instantiates a rule AST
-	_ // TODO: Upgrade opCompose?                          // 32 - Composes complex element constructs
-	opCartesianCompose
-	opCombineProduct
+	opList              // Constructs a list AST node
+	opCompound          // Combines N results into a compound node
+	opQualword          // Combines N results into a qualword node
+	opGlobbrace         // Combines N results into a globbrace node
+	opPath              // Combines N results into a path node
+	opConjunct          // Merges results into a logical AND node
+	opDisjunct          // Merges results into a logical OR node
+	opNegate            // Applies logical negation wrapping
+	opFlag              // Applies flag wrapping
+	opPair              // Combines results into key-value pairs
+	opRule              // Instantiates a rule AST
+	opCartesianCompose  // Matrix Cartesian product composer
+	opCartesianTick     // Generator tick for iterative Cartesian expansion
 
 	// ============================================================================
 	// 3. SYMBOLIZE (AST -> Symbols)
-	// Flattens ASTs into strings or consumes them against the NFA tape (Match).
-	// Primary stacks: s.syms, s.tie
+	// Flattens ASTs into strings.
+	// Primary stacks: s.syms
 	// ============================================================================
-	opUnroll                           // 33 - Unrolls a value onto the stack dynamically
-	opUnrollRev                        // 34 - Unrolls a value onto the stack dynamically (reversed)
-	opLoop                             // 35 - Lazy stateful iterator for dynamic unrolling
-	opYieldSym                         // 36 - Yields a scalar value into raw symbols on the tape
-	_                      // 37 - Yields a scalar value into raw symbols on the tape (reversed)
-	opMatchLiteral                     // 38 - Matches a string literal
-	opMatchLiteralRev                  // 39 - Matches a string literal (reversed direction)
-	opRegexMatch                       // 40 - Executes a regex match
-	opRegexMatchRev                    // 41 - Executes a regex match (reversed direction)
-	opRegexCon                         // 42 - Consumes matching regex literals
-
-	opFallbackGlobSeg                  // 43 - Fallback-matches a string literal
-	opFallbackGlobSegRev               // 44 - Fallback-matches a string literal (reversed direction)
-	opFallbackGlobGreed                // 45 - Fallback-matches a string literal
-	opFallbackGlobGreedRev             // 46 - Fallback-matches a string literal (reversed direction)
-	opFallbackGlobCross                // 47 - Fallback-matches a string literal
-	opFallbackGlobCrossRev             // 48 - Fallback-matches a string literal (reversed direction)
-
-	opGlobQues                         // 49 - Matches a single '?' wildcard
-	opGlobQuesRev                      // 50 - Matches a single '?' wildcard (reversed direction)
-	opGlobRange                        // 51 - Matches a character range
-	opGlobRangeRev                     // 52 - Matches a character range (reversed direction)
-	opGlobSeg                          // 53 - Matches a segment '*' wildcard
-	opGlobSegRev                       // 54 - Matches a segment '*' wildcard (reversed direction)
-	opGlobGreed                        // 55 - Matches a greedy '**' wildcard
-	opGlobGreedRev                     // 56 - Matches a greedy '**' wildcard (reversed direction)
-	opGlobCross                        // 57 - Matches a reluctant cross '**?' wildcard
-	opGlobCrossRev                     // 58 - Matches a reluctant cross '**?' wildcard (reversed direction)
-
-	opTryGlobSeg                       // 59 - Implements try-catch fallback for segment wildcards
-	opTryGlobSegRev                    // 60 - Implements try-catch fallback for segment wildcards (reversed)
-	opTryGlobGreed                     // 61 - Implements try-catch fallback for greedy wildcards
-	opTryGlobGreedRev                  // 62 - Implements try-catch fallback for greedy wildcards (reversed)
-	opTryGlobCross                     // 63 - Implements try-catch fallback for reluctant wildcards
-	opTryGlobCrossRev                  // 64 - Implements try-catch fallback for reluctant wildcards (reversed)
-
-	opTryFallbackGlobSeg               // 65 - Implements try-catch fallback for trapped segment wildcards
-	opTryFallbackGlobSegRev            // 66 - Implements try-catch fallback for trapped segment wildcards (reversed)
-	opTryFallbackGlobGreed             // 67 - Implements try-catch fallback for trapped greedy wildcards
-	opTryFallbackGlobGreedRev          // 68 - Implements try-catch fallback for trapped greedy wildcards (reversed)
-	opTryFallbackGlobCross             // 69 - Implements try-catch fallback for trapped reluctant wildcards
-	opTryFallbackGlobCrossRev          // 70 - Implements try-catch fallback for trapped reluctant wildcards (reversed)
-
-	opConseqGlobSeg                    // 71 - Resolves consecutive segment asterisks
-	opConseqGlobSegRev                 // 72 - Resolves consecutive segment asterisks (reversed direction)
-	opConseqGlobGreed                  // 73 - Resolves consecutive greedy asterisks
-	opConseqGlobGreedRev               // 74 - Resolves consecutive greedy asterisks (reversed direction)
-	opConseqGlobCross                  // 75 - Resolves consecutive reluctant asterisks
-	opConseqGlobCrossRev               // 76 - Resolves consecutive reluctant asterisks (reversed direction)
+	opUnroll            // Unrolls a collection onto the stack dynamically
+	opUnrollRev         // Unrolls a collection onto the stack dynamically (reversed)
+	opLoop              // Lazy stateful iterator for dynamic unrolling
+	opYieldSym          // Yields a scalar value into raw symbols on the tape
 
 	// ============================================================================
-	// 4. STRUCTURALIZE (Symbols -> AST)
-	// Accumulates raw symbols and packs them back into concrete AST boundaries.
-	// Primary stack: s.vmpack
+	// 4. PATTERN MATCHING (Symbol-Based NFA)
+	// Consumes target symbols from `s.tie` and leverages `s.backtracks` for forks.
 	// ============================================================================
-	_                             // 77 - Yields and packs a value into the buffer
-	_                          // 78 - Yields and packs a value into the buffer (reversed)
-	opFrame
-	opShift
-	opShiftResult                           // 79 - Reduces a scoped expansion buffer into a concrete result
-	opReduce                        // 80 - Reduces a scoped expansion buffer into a concrete result (reversed)
-	// opReduceCompound
-	// opReduceQualword
-	// opReduceGlobbrace
-	// opReducePath
-	_                          // 81 - Annotates packed buffer elements with location metadata
+	opMatchExact        // Consumes a specific posym, string, or rune from `s.tie`
+	opMatchClass        // Consumes exactly 1 rune from `s.tie` satisfying a condition
+	opMatchAnchor       // Zero-width assertion (^, $, \b). Fails if unmet.
+	opMatchFork         // Splits execution (Alternation). Pushes Alt to backtracks, runs Primary.
+	opMatchRep          // Repetition Generator (*, +). Pushes loop/stop branches natively.
+	opMatchCapStart     // Marks the start of a capture group in `s.stems`
+	opMatchCapEnd       // Finalizes a capture group in `s.stems`
+
+	// ============================================================================
+	// 5. STRUCTURALIZE (Frame Stack Shift-Reduce)
+	// Manages boundary frames and shifts parsed values onto the AST tape.
+	// Primary stacks: s.values, s.frames
+	// ============================================================================
+	opFrame             // Pushes a frame boundary marker with constructor
+	opShift             // Shifts an operand value onto s.values
+	opShiftResult       // Shifts top result value onto s.values
+	opReduce            // Reduces values in current frame boundary using constructor
 )
 
 var evalopNames = [...]string{
@@ -3080,14 +3035,10 @@ var evalopNames = [...]string{
 	// 2. EVALUATOR
 	"opExpand",
 	"opEval",
-	"", // FIXME: No more opEvalRev!
 	"opEvoke",
-	"", // FIXME: No more opEvokeRet!
 	"opIdent",
 	"opResolve",
 	"opResolveClosure",
-	"", // FIXME: No more opExpandArgs!
-	"", // FIXME: No more opExpandArgsRev!
 	"opSelect",
 	"opEase",
 	"opMerge",
@@ -3105,68 +3056,29 @@ var evalopNames = [...]string{
 	"opFlag",
 	"opPair",
 	"opRule",
-	"", // FIXME: No more opCompose!
 	"opCartesianCompose",
-	"opCombineProduct",
+	"opCartesianTick",
 
 	// 3. SYMBOLIZE
 	"opUnroll",
 	"opUnrollRev",
 	"opLoop",
 	"opYieldSym",
-	"", // FIXME: No more opYieldSymRev!
-	"opMatchLiteral",
-	"opMatchLiteralRev",
-	"opRegexMatch",
-	"opRegexMatchRev",
-	"opRegexCon",
-	"opFallbackGlobSeg",
-	"opFallbackGlobSegRev",
-	"opFallbackGlobGreed",
-	"opFallbackGlobGreedRev",
-	"opFallbackGlobCross",
-	"opFallbackGlobCrossRev",
-	"opGlobQues",
-	"opGlobQuesRev",
-	"opGlobRange",
-	"opGlobRangeRev",
-	"opGlobSeg",
-	"opGlobSegRev",
-	"opGlobGreed",
-	"opGlobGreedRev",
-	"opGlobCross",
-	"opGlobCrossRev",
-	"opTryGlobSeg",
-	"opTryGlobSegRev",
-	"opTryGlobGreed",
-	"opTryGlobGreedRev",
-	"opTryGlobCross",
-	"opTryGlobCrossRev",
-	"opTryFallbackGlobSeg",
-	"opTryFallbackGlobSegRev",
-	"opTryFallbackGlobGreed",
-	"opTryFallbackGlobGreedRev",
-	"opTryFallbackGlobCross",
-	"opTryFallbackGlobCrossRev",
-	"opConseqGlobSeg",
-	"opConseqGlobSegRev",
-	"opConseqGlobGreed",
-	"opConseqGlobGreedRev",
-	"opConseqGlobCross",
-	"opConseqGlobCrossRev",
 
-	// 4. STRUCTURALIZE
-	"", // FIXME: No more opPack!
-	"", // FIXME: No more opPackRev!
+	// 4. PATTERN MATCHING
+	"opMatchExact",
+	"opMatchClass",
+	"opMatchAnchor",
+	"opMatchFork",
+	"opMatchRep",
+	"opMatchCapStart",
+	"opMatchCapEnd",
+
+	// 5. STRUCTURALIZE
 	"opFrame",
 	"opShift",
 	"opShiftResult",
 	"opReduce",
-	// "opReduceCompound",
-	// "opReduceQualword",
-	// "opReduceGlobbrace",
-	// "opReducePath",
-	"", // FIXME: No more opLocPack!
 }
 
 // String implements the fmt.Stringer interface for evalop,
@@ -3181,6 +3093,7 @@ func (op evalop) String() string {
 const (
 	clsMatcher = 1 << iota
 	clsPacker
+	clsReverse
 	clsArgument
 	clsRegex
 	clsGlobChar      // ?, []
@@ -3371,6 +3284,21 @@ func (l *op_loop) String() string {
 	}
 	b.write("}")
 	return b.shared()
+}
+
+type cartesian_iter struct {
+	matrix      [][]Value
+	indices     []int
+	constructOp evalop
+	total       int
+	count       int
+}
+
+type match_rep_iter struct {
+	min, max int
+	count    int
+	greedy   bool
+	payload  Value // The AST node to repeat (e.g., regexclass, exact string, etc.)
 }
 
 func (s *symstr) step() {
@@ -3669,7 +3597,7 @@ _op_switch_:
 			s.ops = append(s.ops, targetOp)
 			s.operands = append(s.operands, t)
 		}
-		
+
 	case opExpand: // Designed for dynamic op (wrappers), e.g., opLoop.
 		s.ops = append(s.ops, opUnroll)
 		s.operands = append(s.operands, opEval)
@@ -3872,103 +3800,97 @@ _op_switch_:
 		n := s.operands[l-2].(int)
 		s.operands = s.operands[:l-2]
 
-		var matrix [][]Value
-
-		if n > 0 {
-			// OPTIMIZATION 1: No intermediate array allocation.
-			// Read directly from s.results before popping!
-			matrix = make([][]Value, 0, n)
-
-			var merge func(Value) []Value
-			merge = func(v Value) []Value {
-				if v == nil { return nil }
-				switch t := v.(type) {
-				case *loc:
-					elems := merge(t.Value)
-					for i, e := range elems { elems[i] = _loc(e, t.pos) }
-					return elems
-				case *list:
-					var elems []Value
-					for _, e := range t.elems { elems = append(elems, merge(e)...) }
-					return elems
-				}
-				return []Value{v}
-			}
-
-			for i := rl - n; i < rl; i++ {
-				if item := s.results[i]; item != nil {
-					matrix = append(matrix, merge(item.(Value)))
-				} else {
-					matrix = append(matrix, nil)
-				}
-			}
-		}
-
-		// Pop the evaluated children safely now that we have our matrix
+		items := append([]any{}, s.results[rl-n:]...)
 		s.results = s.results[:rl-n]
 
-		if n > 0 {
-			// Calculate exact total size to pre-allocate memory
-			total := 1
-			for _, col := range matrix {
-				if len(col) == 0 {
-					total = 0
+		matrix := make([][]Value, n)
+
+		// 1. ITERATIVE FLATTENING (No Recursion!)
+		// We use a local queue to flatten lists and propagate *loc positions natively.
+		type qnode struct { v Value; p Pos }
+
+		for i, item := range items {
+			var flat []Value
+			queue := []qnode{{item.(Value), NoPos}}
+
+			for len(queue) > 0 {
+				curr := queue[0]
+				queue = queue[1:] // Pop front
+				if curr.v == nil { continue }
+
+				switch t := curr.v.(type) {
+				case *loc:
+					// Propagate the location downward without recursion
+					queue = append([]qnode{{t.Value, t.pos}}, queue...)
+				case *list:
+					// Unroll the list into the queue, preserving the current location wrapper
+					nodes := make([]qnode, len(t.elems))
+					for j, e := range t.elems { nodes[j] = qnode{e, curr.p} }
+					queue = append(nodes, queue...)
+				default:
+					if curr.p != NoPos {
+						flat = append(flat, _loc(curr.v, curr.p))
+					} else {
+						flat = append(flat, curr.v)
+					}
+				}
+			}
+			matrix[i] = flat
+		}
+
+		// Calculate total combinations
+		total := 1
+		for _, col := range matrix {
+			if len(col) == 0 {
+				total = 0
+				break
+			}
+			total *= len(col)
+		}
+
+		// 2. SEED THE VM GENERATOR
+		if total > 0 {
+			s.ops = append(s.ops, opCartesianTick)
+			s.operands = append(s.operands, &cartesian_iter{
+				matrix:      matrix,
+				indices:     make([]int, n),
+				constructOp: constructOp,
+				total:       total,
+				count:       0,
+			})
+		}
+
+	case opCartesianTick:
+		iter := s.operands[l-1].(*cartesian_iter)
+		n := len(iter.indices)
+
+		// A. Build the current combination row
+		row := make([]Value, n)
+		for i, idx := range iter.indices {
+			row[i] = iter.matrix[i][idx]
+		}
+
+		// B. Advance the odometer indices for the next tick
+		iter.count++
+		if iter.count < iter.total {
+			for j := n - 1; j >= 0; j-- {
+				iter.indices[j]++
+				if iter.indices[j] < len(iter.matrix[j]) {
 					break
 				}
-				total *= len(col)
+				iter.indices[j] = 0
 			}
-
-			if total > 0 {
-				// OPTIMIZATION 2: Iterative Odometer Cartesian Product
-				// 0 Recursion, 0 Temporary Slices, Exactly 1 pre-allocated block.
-				combinations := make([][]Value, total)
-				indices := make([]int, n)
-
-				for i := 0; i < total; i++ {
-					row := make([]Value, n)
-					for j, idx := range indices {
-						row[j] = matrix[j][idx]
-					}
-					combinations[i] = row
-
-					// Increment the odometer (right-to-left)
-					for j := n - 1; j >= 0; j-- {
-						indices[j]++
-						if indices[j] < len(matrix[j]) {
-							break
-						}
-						indices[j] = 0
-					}
-				}
-
-				s.ops = append(s.ops, opCombineProduct)
-				s.operands = append(s.operands, combinations, constructOp)
-			}
-		}
-
-	case opCombineProduct:
-		constructOp := s.operands[l-1].(evalop)
-		combinations := s.operands[l-2].([][]Value)
-
-		switch n := len(combinations); n {
-		case 0:
-			s.operands = s.operands[:l-2]
-			break _op_switch_
-		case 1:
-			// Fast path: Reuse the slot, pop constructOp, push single arg
-			s.operands[l-2] = combinations[0]
+			// Keep opCartesianTick and the iterator on the stack for the next loop!
+			s.ops = append(s.ops, opCartesianTick)
+		} else {
+			// Iterator is exhausted. Pop the iterator state off the operands stack.
 			s.operands = s.operands[:l-1]
-			s.ops = append(s.ops, constructOp)
-		default:
-			// OPTIMIZATION 3: In-Place Stack Mutation.
-			// s.operands expects: [ ..., combinations[1:], constructOp, combinations[0] ]
-
-			s.operands[l-2] = combinations[1:] // Overwrite with remaining combos
-			// s.operands[l-1] is ALREADY constructOp! Do not touch it!
-			s.operands = append(s.operands, combinations[0]) // Push the current payload on top
-
-			s.ops = append(s.ops, opCombineProduct, constructOp)
 		}
+
+		// C. Push the payload and constructOp to execute IMMEDIATELY
+		// Because the VM executes LIFO, constructOp runs, then it returns to opCartesianTick!
+		s.operands = append(s.operands, row)
+		s.ops = append(s.ops, iter.constructOp)
 
 	case opList:
 		elems := s.operands[l-1].([]Value)
@@ -4020,6 +3942,96 @@ _op_switch_:
 		arr := s.operands[l-1].([]Value)
 		s.operands = s.operands[:l-1]
 		s.results = append(s.results, flag{arr[0]})
+
+	// ============================================================================
+	// 4. PATTERN MATCHING (Symbol-Based NFA)
+	// ============================================================================
+	case opMatchExact:
+		_ = s.operands[l-1] // val
+		s.operands = s.operands[:l-1]
+
+		// TODO: Read from s.tie.vmhead and s.tie.syms.
+		// If `val` matches the tape, advance s.tie.vmhead/syms.
+		// If it fails:
+		// s.err = errMatchFailed (This will natively trigger the VM to unwind!)
+
+	case opMatchClass:
+		_ = s.operands[l-1] // classNode
+		s.operands = s.operands[:l-1]
+
+		// TODO: Decode exactly ONE rune from s.tie.
+		// Check if it satisfies classNode (e.g., regexclass, AnyRune).
+		// If it fails: s.err = errMatchFailed
+
+	case opMatchAnchor:
+		_ = s.operands[l-1] // anchor
+		s.operands = s.operands[:l-1]
+
+		// TODO: Check s.tie state (e.g., is it at BOF, EOF, or a Word Boundary?)
+		// Do NOT consume any characters.
+		// If unmet: s.err = errMatchFailed
+
+	case opMatchFork:
+		// opMatchFork expects the Alternate branch on the stack.
+		// (The Primary branch should already be unrolled prior to this op).
+		alt := s.operands[l-1]
+		s.operands = s.operands[:l-1]
+
+		// 1. Snapshot the universe (Tape, Stems, and Errors)
+		bt := s.checkpoint(undoTape | undoStems | undoErr | undoHead)
+
+		// 2. Set the alternate timeline instructions
+		// When the VM unwinds here, it will unroll the 'alt' node to match.
+		bt.altOps = []evalop{opUnroll}
+		bt.altOpn = []any{alt, opEval} // e.g., Unroll `alt` and Evaluate it
+
+		// 3. Register the backtrack fork
+		s.backtracks = append(s.backtracks, bt)
+
+		// The VM naturally continues executing the Primary branch!
+
+	case opMatchRep:
+		// We use a stateful iterator struct for repetitions, just like opLoop!
+		// Expected on stack: *match_rep_iter { min, max, count, greedy, payload }
+		iter := s.operands[l-1].(*match_rep_iter)
+
+		if iter.max != -1 && iter.count >= iter.max {
+			// Max reached. Force STOP.
+			s.operands = s.operands[:l-1]
+			break _op_switch_
+		}
+
+		iter.count++
+
+		// Create the alternate timeline
+		bt := s.checkpoint(undoTape | undoStems | undoErr | undoHead)
+
+		if iter.greedy {
+			// GREEDY: Active = Loop, Alternate = Stop
+			bt.altOps = []evalop{} // Stop means do nothing, just let VM continue!
+			bt.altOpn = []any{}
+
+			// Push Loop to active stack (Execute Payload, then opMatchRep again)
+			s.ops = append(s.ops, opMatchRep, opEval)
+			s.operands = append(s.operands, iter.payload) // payload evaluates to match ops
+		} else {
+			// RELUCTANT: Active = Stop, Alternate = Loop
+			bt.altOps = []evalop{opMatchRep, opEval}
+			bt.altOpn = []any{iter, iter.payload}
+
+			// Active stack does nothing (Stop looping and continue pattern)
+			s.operands = s.operands[:l-1]
+		}
+
+		s.backtracks = append(s.backtracks, bt)
+
+	case opMatchCapStart:
+		// Mark the start of a capture group using the current tape offset
+		// TODO: Calculate current byte offset from `s.tie` and push to `s.stems`
+
+	case opMatchCapEnd:
+		// Mark the end of the most recent open capture group in `s.stems`
+		// TODO: Finalize the byte offset for the active stem
 
 	case opDebug:
 		var trace string
@@ -4547,19 +4559,20 @@ func (s *symstr) match(pattern, target Value) (matched bool, res, rem Value, ste
 	trail := truly(s.Context, propReversal)
 
 	// LAYER 0: Bootstrap the Matcher (Unrolls the PATTERN AST into execution instructions)
-	var unrollOp, matchOp evalop
+	var unrollOp evalop
 	if trail {
 		unrollOp = opUnrollRev
-		matchOp = opMatchLiteralRev
+		s.class |= clsReverse // Set direction natively!
 	} else {
 		unrollOp = opUnroll
-		matchOp = opMatchLiteral
+		s.class &^= clsReverse // Forward
 	}
 
 	s.ops = append(s.ops, opEnd, unrollOp) // CRITICAL: Bootstrap with opEnd to guarantee io.EOF
-	// Push BOTH the AST node and the dynamic target operation
-	s.operands = append(s.operands, pattern, matchOp)
+	// Push BOTH the AST node and the dynamic target operation (the new exact match primitive)
+	s.operands = append(s.operands, pattern, opMatchExact)
 
+	// LAYER 1: Bootstrap the Target Tape
 	gen := &symstr{Context: s.Context}
 	gen.ops = append(gen.ops, opEnd, unrollOp)
 	// Push BOTH the target AST node and the dynamic yield operation
@@ -4573,72 +4586,57 @@ func (s *symstr) match(pattern, target Value) (matched bool, res, rem Value, ste
 
 	matched = s.err == io.EOF && s.exhausted()
 
-	// 1. Extract `res` directly from the Matcher's internal packer
-	// if s.vmpack != nil {
-	// 	if trail {
-	// 		res = s.reduceRev(NoPos)
-	// 	} else {
-	// 		res = s.reduce(NoPos)
-	// 	}
-	// }
-	// FIXME: reduce s.values/s.frames
+	// Helper to dynamically rebuild raw symbol tapes back into AST structures
+	rebuild := func(syms []posym) Value {
+		if len(syms) == 0 { return nil }
+		if len(syms) == 1 { return _word(syms[0].Pos, syms[0].Symbol) }
+
+		var elems []Value
+		for _, ps := range syms { elems = append(elems, _word(ps.Pos, ps.Symbol)) }
+		return _compound(elems...)
+	}
+
+	// 1. Extract `res` directly from the Matcher's active frame/results
+	if rl := len(s.results); rl > 0 {
+		res = s.results[rl-1].(Value)
+	}
 
 	// 2. Extract `rem` by natively flushing whatever is left on the Generator tape!
-	// var remPopped bool
-	// gen.vmpack = &vmpack{}
+	var remSyms []posym
+	for gen.ensure_syms() {
+		remSyms = append(remSyms, gen.syms...)
+		gen.syms = nil
+	}
 
-	// var pack func(posym)
-	// var reduce func(Pos) Value
-	// if trail {
-	// 	pack, reduce = gen.packRev, gen.reduceRev
-	// } else {
-	// 	pack, reduce = gen.pack, gen.reduce
-	// }
+	if len(remSyms) > 0 {
+		rem = rebuild(remSyms)
+	}
 
-	// // ALWAYS drain leftover target symbols so gen.pack() can dynamically reshape the AST
-	// for gen.ensure_syms() {
-	// 	for _, ps := range gen.syms {
-	// 		pack(ps)
-	// 		remPopped = true
-	// 	}
-	// 	gen.syms = nil
-	// }
+	// Stream Termination Symmetry Checks
+	if force_full_match_anchor { matched = matched && gen.exhausted() }
 
-	// if remPopped { rem = reduce(NoPos) }
+	// 3. Extract `stems` natively from the Matcher's captures
+	if numStems := len(s.stems); numStems > 0 {
+		stems = make([]Value, numStems)
+		for i, capture := range s.stems {
+			var stem Value
+			if len(capture.syms) > 0 {
 
-	// // Stream Termination Symmetry Checks
-	// if force_full_match_anchor { matched = matched && gen.exhausted() }
+				// Rebuild the captured fragment into an AST natively
+				stem = rebuild(capture.syms)
 
-	// gen.vmpack = nil // Clean up
+				if capture.name.Symbol != symEmpty && stem != nil {
+					stem = &named_stem{stem, capture.name.Symbol}
+				}
+			}
 
-	// // 3. Extract `stems` natively from the Matcher's captures
-	// if numStems := len(s.stems); numStems > 0 {
-	// 	stems = make([]Value, numStems)
-	// 	for i, capture := range s.stems {
-	// 		var stem Value
-	// 		if len(capture.syms) > 0 {
-	// 			gen.vmpack = &vmpack{} // Borrow the generator to pack the stems!
-
-	// 			for _, ps := range capture.syms {
-	// 				// Perfectly feed the captured posym structs back into the AST packer
-	// 				pack(ps)
-	// 			}
-
-	// 			// ALWAYS call reduce to capture fractional/reshaped regex substrings!
-	// 			stem = reduce(NoPos)
-
-	// 			if capture.name.Symbol != symEmpty && stem != nil {
-	// 				stem = &named_stem{stem, capture.name.Symbol}
-	// 			}
-	// 		}
-
-	// 		if trail {
-	// 			stems[numStems-1-i] = stem
-	// 		} else {
-	// 			stems[i] = stem
-	// 		}
-	// 	}
-	// }
+			if trail {
+				stems[numStems-1-i] = stem
+			} else {
+				stems[i] = stem
+			}
+		}
+	}
 
 	// Sanity Warnings
 	if checkpoints {
