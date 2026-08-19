@@ -2985,7 +2985,12 @@ const (
 	opNegate            // Applies logical negation wrapping
 	opFlag              // Applies flag wrapping
 	opPair              // Combines results into key-value pairs
+	opURL
+	opURLAuth
+	opURLQuery
+	opURLFragment
 	opRule              // Instantiates a rule AST
+	opFoldDisjunct
 	opCartesianCompose  // Matrix Cartesian product composer
 	opCartesianTick     // Generator tick for iterative Cartesian expansion
 
@@ -2994,6 +2999,8 @@ const (
 	// Flattens ASTs into strings.
 	// Primary stacks: s.syms
 	// ============================================================================
+	opWalk
+	opCallback
 	opUnroll            // Unrolls a collection onto the stack dynamically
 	opUnrollRev         // Unrolls a collection onto the stack dynamically (reversed)
 	opLoop              // Lazy stateful iterator for dynamic unrolling
@@ -3063,11 +3070,18 @@ var evalopNames = [...]string{
 	"opNegate",
 	"opFlag",
 	"opPair",
+	"opURL",
+	"opURLAuth",
+	"opURLQuery",
+	"opURLFragment",
 	"opRule",
+	"opFoldDisjunct",
 	"opCartesianCompose",
 	"opCartesianTick",
 
 	// 3. SYMBOLIZE
+	"opWalk",
+	"opCallback",
 	"opUnroll",
 	"opUnrollRev",
 	"opLoop",
@@ -3484,7 +3498,7 @@ _op_switch_:
 			id = ident_result{resolve_result{t,t},t.name}
 		case resolve_result:
 			// 🟢 SAFE FALLBACK: Extract name safely, don't double-wrap, no panic!
-			var name Symbol 
+			var name Symbol
 			switch o := t.obj.(type) {
 			case *def: name = o.name
 			case *auto: name = o.name
@@ -3577,6 +3591,40 @@ _op_switch_:
 		// Push both the callee node and the resolved value to results
 		// Future optimization: drop `x` if legacy funcs are updated to not require it
 		s.results = append(s.results, resolve_result{id.Value, res})
+
+	case opCallback:
+		callback := s.operands[l-1].(func(*symstr, Value))
+		arg      := s.operands[l-2].(Value)
+		s.operands = s.operands[:l-2]
+
+		callback(s, arg)
+
+	case opWalk:
+		targetOp := s.operands[l-1].(evalop)
+		arg      := s.operands[l-2]
+		s.operands = s.operands[:l-2]
+
+		switch t := arg.(type) {
+		case *compound:
+			s.ops = append(s.ops, opLoop)
+			s.operands = append(s.operands, &op_loop{t.elems, 1, 0, len(t.elems), targetOp, symEmpty})
+		case *qualword:
+			s.ops = append(s.ops, opLoop)
+			s.operands = append(s.operands, &op_loop{t.elems, 1, 0, len(t.elems), targetOp, symEmpty})
+		case *path:
+			s.ops = append(s.ops, opLoop)
+			s.operands = append(s.operands, &op_loop{t.elems, 1, 0, len(t.elems), targetOp, symEmpty})
+		case *list:
+			s.ops = append(s.ops, opLoop)
+			s.operands = append(s.operands, &op_loop{t.elems, 1, 0, len(t.elems), targetOp, symSpace})
+		case *disjunction:
+			s.ops = append(s.ops, opWalk)
+			s.operands = append(s.operands, t.val, targetOp)
+		default:
+			// SCALAR / LEAF NODE
+			s.ops = append(s.ops, targetOp)
+			s.operands = append(s.operands, t)
+		}
 
 	case opUnroll:
 		targetOp := s.operands[l-1].(evalop)
@@ -3672,40 +3720,56 @@ _op_switch_:
 			if truly(s.Context, ex_delegate{}) {
 				s.ops = append(s.ops, opEvoke, opCons)
 				s.operands = append(s.operands, 3)
-			} else {
-				s.ops = append(s.ops, opDelegate, opCons, opRet, opRet)
-				s.operands = append(s.operands, 5, t.pos, t.l)
-			}
 
-			// Consolidates N evaluated arguments into 1 slice on operands, then opRet moves it to results
-			s.ops = append(s.ops, opGroup)
-			s.operands = append(s.operands, len(t.a))
-			if len(t.a) > 0 {
-				s.ops = append(s.ops, opLoop)
-				s.operands = append(s.operands, &op_loop{t.a, 1, 0, len(t.a), opExpand, symEmpty})
-			}
+				s.ops = append(s.ops, opGroup)
+				s.operands = append(s.operands, len(t.a))
+				if len(t.a) > 0 {
+					s.ops = append(s.ops, opLoop)
+					s.operands = append(s.operands, &op_loop{t.a, 1, 0, len(t.a), opExpand, symEmpty})
+				}
 
-			s.ops = append(s.ops, opGroup)
-			s.operands = append(s.operands, len(t.o))
-			if len(t.o) > 0 {
-				s.ops = append(s.ops, opLoop)
-				s.operands = append(s.operands, &op_loop{t.o, 1, 0, len(t.o), opExpand, symEmpty})
-			}
+				s.ops = append(s.ops, opGroup)
+				s.operands = append(s.operands, len(t.o))
+				if len(t.o) > 0 {
+					s.ops = append(s.ops, opLoop)
+					s.operands = append(s.operands, &op_loop{t.o, 1, 0, len(t.o), opExpand, symEmpty})
+				}
 
-			if t.x != nil {
-				// 🟢 OPTIMIZATION: If already resolved, bypass opResolve & opIdent!
-				if rr, ok := t.x.(resolve_result); ok {
-					s.ops = append(s.ops, opRet)
-					s.operands = append(s.operands, rr)
+				if t.x != nil {
+					if rr, ok := t.x.(resolve_result); ok {
+						s.ops = append(s.ops, opRet)
+						s.operands = append(s.operands, rr)
+					} else {
+						s.ops = append(s.ops, opResolve, opSwap, opIdent, opSwap, opUnroll)
+						s.operands = append(s.operands, t.l, 1, 1, t.x, opEval)
+					}
 				} else {
-					// FIXME: t.x can eval to N values, that case it leaks
-					s.ops = append(s.ops, opResolve, opSwap, opIdent, opSwap, opUnroll)
-					s.operands = append(s.operands, t.l, 1, 1, t.x, opEval)
+					s.ops = append(s.ops, opRet)
+					s.operands = append(s.operands, nil)
 				}
 			} else {
-				// Guarantee a nil placeholder is pushed to results to maintain exactly 3 items
+				// 🟢 STATIC/RAW EXPR MODE: Do NOT resolve t.x! Maintain clean AST node.
+				s.ops = append(s.ops, opDelegate, opCons, opRet, opRet)
+				s.operands = append(s.operands, 5, t.pos, t.l)
+
+				// Group arguments and options as-is
+				s.ops = append(s.ops, opGroup)
+				s.operands = append(s.operands, len(t.a))
+				if len(t.a) > 0 {
+					s.ops = append(s.ops, opLoop)
+					s.operands = append(s.operands, &op_loop{t.a, 1, 0, len(t.a), opExpand, symEmpty})
+				}
+
+				s.ops = append(s.ops, opGroup)
+				s.operands = append(s.operands, len(t.o))
+				if len(t.o) > 0 {
+					s.ops = append(s.ops, opLoop)
+					s.operands = append(s.operands, &op_loop{t.o, 1, 0, len(t.o), opExpand, symEmpty})
+				}
+
+				// Push raw t.x without opResolve!
 				s.ops = append(s.ops, opRet)
-				s.operands = append(s.operands, nil)
+				s.operands = append(s.operands, t.x)
 			}
 
 		case *closure:
@@ -3856,9 +3920,8 @@ _op_switch_:
 			}
 
 		case *disjunction:
-			s.ops = append(s.ops, opCartesianCompose)
-			s.operands = append(s.operands, 1, opDisjunct)
-			s.ops = append(s.ops, opExpand)
+			// Evaluate the inner value (yields 1 result), then fold it!
+			s.ops = append(s.ops, opFoldDisjunct, opEval)
 			s.operands = append(s.operands, t.val)
 
 		case Value:
@@ -3879,13 +3942,17 @@ _op_switch_:
 		cons := s.operands[l-1].([]any)
 		s.operands = s.operands[:l-1]
 
-		x := cons[0].(resolve_result)
+		x := cons[0].(Value)
 		o := cons[1].([]Value)
 		a := cons[2].([]Value)
 		tok := cons[3].(token)
 		pos := cons[4].(Pos)
 
-		if x.obj == nil { x.obj = x.Value }
+		// Clean up resolve_result if it was leaked in without an obj
+		if rr, ok := x.(resolve_result); ok && rr.obj == nil {
+			rr.obj = rr.Value
+			x = rr
+		}
 
 		var res Value
 		if op == opClosure {
@@ -3968,15 +4035,13 @@ _op_switch_:
 
 			for len(queue) > 0 {
 				curr := queue[0]
-				queue = queue[1:] // Pop front
+				queue = queue[1:]
 				if curr.v == nil { continue }
 
 				switch t := curr.v.(type) {
 				case *loc:
-					// Propagate the location downward without recursion
 					queue = append([]qnode{{t.Value, t.pos}}, queue...)
 				case *list:
-					// Unroll the list into the queue, preserving the current location wrapper
 					nodes := make([]qnode, len(t.elems))
 					for j, e := range t.elems { nodes[j] = qnode{e, curr.p} }
 					queue = append(nodes, queue...)
@@ -4053,7 +4118,11 @@ _op_switch_:
 	case opCompound:
 		elems := s.operands[l-1].([]Value)
 		s.operands = s.operands[:l-1]
-		s.results = append(s.results, &compound{elements{elems}})
+		if len(elems) == 1 {
+			s.results = append(s.results, elems[0])
+		} else {
+			s.results = append(s.results, &compound{elements{elems}})
+		}
 
 	case opQualword:
 		elems := s.operands[l-1].([]Value)
@@ -4080,29 +4149,69 @@ _op_switch_:
 
 		s.results = append(s.results, &conjunction{list{elements{elems}}, sep})
 
+	case opFoldDisjunct:
+		// Pop the EXACTLY 1 evaluated item from s.results
+		val := s.results[rl-1].(Value)
+		s.results = s.results[:rl-1]
+
+		// 🟢 DEEP CHECK: Ensure no closures/delegates are hidden inside
+		var isDynamic func(Value) bool
+		isDynamic = func(v Value) bool {
+			switch x := v.(type) {
+			case *delegate, *closure: return true
+			case *disjunction: return isDynamic(x.val)
+			case *compound:
+				for _, elem := range x.elems { if isDynamic(elem) { return true } }
+			case *qualword:
+				for _, elem := range x.elems { if isDynamic(elem) { return true } }
+			case *path:
+				for _, elem := range x.elems { if isDynamic(elem) { return true } }
+			case *list:
+				for _, elem := range x.elems { if isDynamic(elem) { return true } }
+			}
+			return false
+		}
+
+		if isDynamic(val) {
+			s.results = append(s.results, &disjunction{valbase{s.loc}, val})
+		} else {
+			// CONSTANT FOLDING: Yield the inner list!
+			s.results = append(s.results, val)
+		}
+
 	case opDisjunct:
 		arr := s.operands[l-1].([]Value)
 		s.operands = s.operands[:l-1]
-		if len(arr) > 0 {
+		if n := len(arr); n > 0 {
 			// 🟢 DEEP CHECK: Ensure no closures/delegates are hidden inside compounds or paths
 			var isDynamic func(Value) bool
 			isDynamic = func(v Value) bool {
 				switch x := v.(type) {
-				case *delegate, *closure: 
+				case *delegate, *closure:
 					return true
-				case *compound: 
+				case *disjunction:
+					return isDynamic(x.val)
+				case *compound:
 					for _, elem := range x.elems { if isDynamic(elem) { return true } }
-				case *qualword: 
+				case *qualword:
 					for _, elem := range x.elems { if isDynamic(elem) { return true } }
-				case *path: 
+				case *path:
 					for _, elem := range x.elems { if isDynamic(elem) { return true } }
-				case *list: 
+				case *list:
 					for _, elem := range x.elems { if isDynamic(elem) { return true } }
 				}
 				return false
 			}
 
-			if res := arr[0]; isDynamic(res) {
+			// 🟢 FIX: Bundle arrays so no data is lost!
+			var res Value
+			if n == 1 {
+				res = arr[0]
+			} else {
+				res = &list{elements{arr}}
+			}
+
+			if isDynamic(res) {
 				s.results = append(s.results, &disjunction{valbase{s.loc}, res})
 			} else {
 				s.results = append(s.results, res)
@@ -4131,6 +4240,51 @@ _op_switch_:
 		arr := s.operands[l-1].([]Value)
 		s.operands = s.operands[:l-1]
 		s.results = append(s.results, flag{arr[0]})
+
+	case opURLAuth:
+		// Bundles the Auth prefix
+		elems := s.operands[l-1].([]Value)
+		s.operands = s.operands[:l-1]
+		s.results = append(s.results, &url_auth{valbase{s.loc}, elements{elems}})
+
+	case opURLQuery:
+		// Bundles the Query parameters
+		elems := s.operands[l-1].([]Value)
+		s.operands = s.operands[:l-1]
+		s.results = append(s.results, &url_query{valbase{s.loc}, elements{elems}})
+
+	case opURLFragment:
+		// Bundles the fragment
+		elems := s.operands[l-1].([]Value)
+		s.operands = s.operands[:l-1]
+		s.results = append(s.results, &url_fragment{valbase{s.loc}, elements{elems}})
+
+	case opURL:
+		// Master assembler!
+		elems := s.operands[l-1].([]Value)
+		s.operands = s.operands[:l-1]
+		
+		u := &url{Scheme: elems[0]} // Scheme is always first
+		
+		for _, elem := range elems[1:] {
+			switch x := elem.(type) {
+			case *url_auth:
+				if len(x.elems) > 0 { u.Username = x.elems[0] }
+				if len(x.elems) > 1 { u.Password = x.elems[1] }
+			case *qualword:
+				u.Host = x
+			case *path:
+				u.Path = x
+			case *url_query:
+				u.Query = x.elems
+			case *url_fragment:
+				if len(x.elems) > 0 { u.Fragment = x.elems[0] }
+			default:
+				// Bare string fallback
+				u.Host = x
+			}
+		}
+		s.results = append(s.results, u)
 
 	// ============================================================================
 	// 4. PATTERN MATCHING (Symbol-Based NFA)
@@ -4480,7 +4634,7 @@ func (s *symstr) decodeRuneRev() (r rune, size int) {
 }
 
 // push is a parallel array pushing to ops and operands!
-func (s *symstr) push(op evalop, a ...any) {
+func (s *symstr) _push(op evalop, a ...any) {
 	if  s.ops = append(s.ops, op); len(a) > 0 {
 		s.operands = append(s.operands, a...) // Pushed bottom-to-top
 	}
@@ -11707,7 +11861,7 @@ func (p *compiler) dot(x Value) (_ Value) {
 }
 
 type parse_path_ctx struct{ Context }
-func (p *compiler) path(start Value) (res *path) {
+func (p *compiler) obsolete_path(start Value) (res *path) {
 	if l_traverse.enabled { defer un(l_trace(l_traverse, "path")) }
 	if start == nil { erro(p, "nil path starter") }
 
@@ -11760,36 +11914,6 @@ func (p *compiler) path(start Value) (res *path) {
 	return
 }
 
-var schemeNames = []string{"file", "http", "https", "ftp", "ftps", "mailto"}
-var schemes = []Symbol{symFile, symHttp, symHttps, symFtp, symFtps, symMailto}
-
-func isKnownScheme(s Symbol) bool {
-	// 2. FAST PATH: Zero-allocation integer comparison.
-	// (A slice of 6 integers fits neatly in a single CPU cache line,
-	// making this loop actually faster than a map lookup!)
-	for _, scheme := range schemes {
-		if scheme == s { return true }
-	}
-
-	// 3. SLOW PATH: Case-insensitive fallback
-	// Cross the boundary to string, but ONLY if we absolutely have to.
-	str := s.String()
-	lower := strings.ToLower(str)
-
-	// OPTIMIZATION: If the string was already entirely lowercase,
-	// we know it didn't match the fast-path, so it's definitely not a scheme.
-	// This saves a useless loop execution for normal unknown words (like "compile").
-	if str == lower {
-		return false
-	}
-
-	for _, name := range schemeNames {
-		if name == lower { return true }
-	}
-
-	return false
-}
-
 type is_url_parser          struct{}
 type is_url_query_parser    struct{}
 type is_url_fragment_parser struct{}
@@ -11824,7 +11948,7 @@ func (u parse_url_fragment_ctx) do(ctx Context, op any) (_ any) {
 	return u.Context.do(ctx, op)
 }
 
-func (p *compiler) url(scheme Value) (res Value) {
+func (p *compiler) obsolete_url(scheme Value) (res Value) {
 	if l_traverse.enabled { defer un(l_trace(l_traverse, "url")) }
 
 	var u = &url{Scheme:scheme}
@@ -12690,13 +12814,9 @@ func (c *compiler) expr() (x Value) {
 		c.checkpoint(undoOwn | undoCtx | undoStack | undoPack | undoHead))
 
 	startOps := len(c.ops)
+	startFrames := len(c.frames)
 	execute := func() { for len(c.ops) > startOps && c.err == nil { c.symstr.step() } }
 
-	c.ops = append(c.ops, opFrame)
-	c.operands = append(c.operands, opRet)
-	execute()
-
-	// 🟢 AUTO-CLASSIFIERS
 	isRegex := truly(c.Context, is_regex_parser{})
 	isGlob := truly(c.Context, is_glob_parser{})
 
@@ -12709,15 +12829,79 @@ func (c *compiler) expr() (x Value) {
 		if !isGlob { c.Context = parse_glob_ctx{c.Context}; isGlob = true }
 	}
 
+	c.ops = append(c.ops, opFrame)
+	c.operands = append(c.operands, opRet)
+	execute()
+
 expr_loop:
 	for c.tok != EOF && c.err == nil {
 		isLHS := truly(c.Context, left_hand_side{})
 
 		if isLHS && c.tok.is_assign() { break expr_loop }
 
+		c.loc = c.pos
+		sym, lit, tok := c.sym, c.lit, c.tok
+
+		var val Value
+
 		switch c.tok {
 		case SPACE, LINEND, RPAREN, RBRACK, RBRACE, RBOT_CORNER, RTOP_CORNER, RCHEVRON, COMPOSED, SEMICOLON, EOF:
 			break expr_loop
+		case HASH:
+			if truly(c.Context, is_url_parser{}) { break expr_loop }
+		case COMMA:
+			if truly(c.Context, aware_token{COMMA}) { break expr_loop }
+			val = &punct{valbase{c.loc}, symComma}
+		case COLON:
+			if len(c.values) > 0 {
+				if w, ok := c.values[len(c.values)-1].(*word); ok && (!isLHS || truly(c.Context, is_recipe_parser{false})) {
+					switch w.s {
+					// URL Schemes: file, http, https, ftp, ftps, mailto
+					case symFile, symHttp, symHttps, symFtp, symFtps, symMailto:
+						// Lookahead: Check for `//`
+						snap := c.scanner.scanstate
+						c.step() // Eat `:`
+						if c.tok == PCON {
+							c.step() // Eat first `/`
+							if c.tok == PCON {
+								// 🟢 IT IS A NATIVE URL!
+								c.step() // Eat second `/`
+
+								// Pop the scheme ('https') from values
+								c.values = c.values[:len(c.values)-1]
+								
+								// Switch into URL parsing context!
+								c.Context = parse_url_ctx{c.Context}
+
+								// Setup the URL frame
+								c.ops = append(c.ops, opFrame)
+								c.operands = append(c.operands, opURL)
+								execute()
+
+								// Shift the scheme in as the first element of the URL
+								c.ops = append(c.ops, opShift)
+								c.operands = append(c.operands, w)
+								execute()
+
+								continue expr_loop
+							}
+						}
+						// Not `://`! Rewind scanner time.
+						c.scanner.scanstate = snap
+					}
+				}
+			}
+			break expr_loop
+
+		case MINUS:
+			// If MINUS appears at the start of a frame, it's a prefix flag (e.g. `-name`)
+			if len(c.values) == c.frames[len(c.frames)-1].i {
+				c.frames[len(c.frames)-1].ctor = opFlag
+				c.step()
+				continue expr_loop
+			}
+			// Otherwise, it's an infix minus. Let it fall down to the precedence switch!
+
 		case BAR:
 			setRegex() // `|` natively forces Regex Alternation context
 			c.step()
@@ -12730,35 +12914,7 @@ expr_loop:
 			c.operands = append(c.operands, opRet)
 			execute()
 			continue expr_loop
-		case HASH:
-			if truly(c.Context, is_url_parser{}) { break expr_loop }
-		case COMMA:
-			if truly(c.Context, aware_token{COMMA}) { break expr_loop }
-		case CLOSURE:
-			if truly(c.Context, is_url_query_parser{}) { break expr_loop }
-		case RAW:
-			if c.lit == "" { break expr_loop }
-		case COLON:
-			if len(c.values) > 0 {
-				if w, ok := c.values[len(c.values)-1].(*word); ok && isKnownScheme(w.s) && (!isLHS || truly(c.Context, is_recipe_parser{false})) {
-					c.values = c.values[:len(c.values)-1]
-					val := c.url(w)
-					c.ops = append(c.ops, opShift)
-					c.operands = append(c.operands, val)
-					execute()
-					fi := len(c.frames) - 1
-					if c.frames[fi].ctor == opRet { c.frames[fi].ctor = opCompound }
-					continue expr_loop
-				}
-			}
-			break expr_loop
-		}
 
-		c.loc = c.pos
-		sym, lit, tok := c.sym, c.lit, c.tok
-		var val Value
-
-		switch tok {
 		case BINARY: if i, e := strconv.ParseInt(lit[2:], 2, 64); e == nil { val = _binary(c.loc, i, sym) } else { erro(c, "%v", e, unwind{}); break expr_loop }
 		case OCTAL: if i, e := strconv.ParseInt(lit[1:], 8, 64); e == nil { val = _octal(c.loc, i, sym) } else { erro(c, "%v", e, unwind{}); break expr_loop }
 		case INTEGER: if i, e := strconv.ParseInt(lit, 10, 64); e == nil { val = _decimal(c.loc, i, sym) } else { erro(c, "%v", e, unwind{}); break expr_loop }
@@ -12771,11 +12927,6 @@ expr_loop:
 		case WORD: val = &word{valbase{c.loc}, sym}
 		case RAW: if lit == "" { val = &valbase{c.loc} } else { val = &raw{valbase{c.loc}, lit} }
 		case STRING: val = &strlit{valbase{c.loc}, lit}
-
-		// 🟢 STRONG GLOB SIGNALS
-		case DAST, ASTQ:
-			setGlob()
-			val = &globmeta{valbase{c.loc}, tok2sym[tok]}
 
 		// 🟢 STRONG REGEX SIGNALS
 		case TILDE:
@@ -12818,6 +12969,11 @@ expr_loop:
 			setRegex()
 			val = &regexmeta{valbase{c.loc}, regex_syntax.OpEndLine}
 
+		// 🟢 STRONG GLOB SIGNALS
+		case DAST, ASTQ:
+			setGlob()
+			val = &globmeta{valbase{c.loc}, tok2sym[tok]}
+
 		// 🟢 AMBIGUOUS POSTFIX MODIFIERS (*, ?, +)
 		case SAST, QUE, PLUS:
 			if !isRegex {
@@ -12848,7 +13004,7 @@ expr_loop:
 			if prev != nil { c.values = c.values[:lastIdx] }
 			val = &undetermined{valbase{c.loc}, tok, tok2sym[tok], prev}
 
-		case DOTDOT: val = &punct{valbase{c.loc}, tok2sym[tok]}
+		case DOTDOT: val = &punct{valbase{c.loc}, symDotDot}
 		case DOT:
 			if isRegex {
 				val = &regexmeta{valbase{c.loc}, regex_syntax.OpAnyCharNotNL}
@@ -12892,13 +13048,16 @@ expr_loop:
 			val = c.glob(nil); goto skip_step
 		case LBOT_CORNER, LTOP_CORNER: val = c.corner_list(); goto skip_step
 		case LANGLE, RANGLE: val = c.punct(); goto skip_step
+		case AT: val = c.punct(); goto skip_step
+		case EXC: val = c.negative(); goto skip_step
 		case DELEGATE: val = c.calling(); goto skip_step
 		case CLOSURE:
-			if truly(c.Context, is_url_query_parser{}) { val = c.punct() } else { val = c.calling() }
+			if truly(c.Context, is_url_query_parser{}) {
+				break expr_loop //val = c.punct()
+			} else {
+				val = c.calling()
+			}
 			goto skip_step
-		case MINUS: val = c.flag(); goto skip_step
-		case EXC: val = c.negative(); goto skip_step
-		case AT, COMMA: val = c.punct(); goto skip_step
 		case PERC:
 			if truly(c.Context, is_url_query_parser{}) { val = c.punct() } else { val = c.perc(nil) }
 			goto skip_step
@@ -12925,35 +13084,143 @@ expr_loop:
 			break expr_loop
 		}
 
-		switch fi := len(c.frames)-1; c.tok {
+		fi := len(c.frames)-1
+		
+		switch c.tok {
 		case SPACE, LINEND, RPAREN, RBRACK, RBRACE, RBOT_CORNER, RTOP_CORNER, RCHEVRON, COMPOSED, SEMICOLON, EOF:
 			break expr_loop
-		case HASH: if truly(c.Context, is_url_parser{}) { break expr_loop }
-		case COMMA: if truly(c.Context, aware_token{COMMA}) { break expr_loop }
-		case CLOSURE: if truly(c.Context, is_url_query_parser{}) { break expr_loop }
+
+		case COMMA:
+			if truly(c.Context, aware_token{COMMA}) { break expr_loop }
 
 		case TILDE:
 			val = &punct{valbase{c.pos}, symTilde}
 			c.step()
 			goto skip_step
+
 		case DOT:
 			c.step()
-			if c.frames[fi].ctor == opRet {
+			if c.frames[fi].ctor == opRet || c.frames[fi].ctor == opURL {
 				c.frames[fi].ctor = opQualword
+			} else if c.frames[fi].ctor == opPath || c.frames[fi].ctor == opPair || c.frames[fi].ctor == opFlag {
+				// 🟢 RIGHT-DEEP PRECEDENCE: '.' binds tighter
+				last := c.values[len(c.values)-1]
+				c.values = c.values[:len(c.values)-1]
+				c.ops = append(c.ops, opFrame)
+				c.operands = append(c.operands, opQualword)
+				execute()
+				c.ops = append(c.ops, opShift)
+				c.operands = append(c.operands, last)
+				execute()
 			} else if c.frames[fi].ctor != opQualword {
 				c.ops = append(c.ops, opShiftResult, opFrame, opReduce)
 				c.operands = append(c.operands, opQualword)
 				execute()
 			}
+			continue
+
 		case PCON:
 			c.step()
-			if c.frames[fi].ctor == opRet {
+			if c.frames[fi].ctor == opRet || c.frames[fi].ctor == opURL {
 				c.frames[fi].ctor = opPath
+			} else if c.frames[fi].ctor == opPair || c.frames[fi].ctor == opFlag {
+				// 🟢 RIGHT-DEEP PRECEDENCE: '/' binds tighter
+				last := c.values[len(c.values)-1]
+				c.values = c.values[:len(c.values)-1]
+				c.ops = append(c.ops, opFrame)
+				c.operands = append(c.operands, opPath)
+				execute()
+				c.ops = append(c.ops, opShift)
+				c.operands = append(c.operands, last)
+				execute()
 			} else if c.frames[fi].ctor != opPath {
 				c.ops = append(c.ops, opShiftResult, opFrame, opReduce)
 				c.operands = append(c.operands, opPath)
 				execute()
 			}
+			continue
+
+		case MINUS:
+			c.step()
+			if c.frames[fi].ctor == opRet {
+				c.frames[fi].ctor = opCompound // Fallback to compound if no other math context
+			} else {
+				// Reduce left side and open a new frame for the right side
+				c.ops = append(c.ops, opShiftResult, opFrame, opReduce)
+				c.operands = append(c.operands, opCompound) // Or opMathMinus if you have it!
+				execute()
+			}
+			continue
+
+		case ASSIGN: // key=val
+			c.step()
+			if c.frames[fi].ctor == opRet {
+				c.frames[fi].ctor = opPair
+			} else if c.frames[fi].ctor == opPair {
+				// 🟢 RIGHT-ASSOCIATIVE PRECEDENCE: a=b=c parses as a=(b=c)
+				last := c.values[len(c.values)-1]
+				c.values = c.values[:len(c.values)-1]
+
+				c.ops = append(c.ops, opFrame)
+				c.operands = append(c.operands, opPair)
+				execute()
+
+				c.ops = append(c.ops, opShift)
+				c.operands = append(c.operands, last)
+				execute()
+			} else {
+				// 🟢 REDUCTION: '=' binds weaker than path/qualword.
+				// Close the left side entirely and shift it into a new Pair frame!
+				c.ops = append(c.ops, opShiftResult, opFrame, opReduce)
+				c.operands = append(c.operands, opPair)
+				execute()
+			}
+			continue
+		
+		// 🟢 URL NATIVE COMPONENTS
+		case AT:
+			if truly(c.Context, is_url_parser{}) {
+				c.step() // Eat `@`
+				// Everything before `@` is user:pass. Reduce the left side and flag it.
+				c.ops = append(c.ops, opShiftResult, opFrame, opReduce)
+				c.operands = append(c.operands, opURLAuth)
+				execute()
+				continue
+			}
+		case QUE:
+			if truly(c.Context, is_url_parser{}) {
+				c.step() // Eat `?`
+				// Start query parsing context
+				c.Context = parse_url_query_ctx{c.Context}
+				c.ops = append(c.ops, opShiftResult, opFrame, opReduce)
+				c.operands = append(c.operands, opURLQuery)
+				execute()
+				continue
+			}
+		case CLOSURE:
+			if truly(c.Context, is_url_query_parser{}) {
+				c.step() // Eat `&`
+				// `&` inside a query acts as a compound separator
+				if c.frames[fi].ctor != opCompound {
+					c.ops = append(c.ops, opShiftResult, opFrame, opReduce)
+					c.operands = append(c.operands, opCompound)
+					execute()
+				}
+				continue
+			}
+		case HASH:
+			if truly(c.Context, is_url_parser{}) {
+				c.step() // Eat `#`
+				// Disable comments temporarily so `#` acts as fragment!
+				c.scanner.setBits(c.scanner.commentsOff())
+				c.Context = parse_url_fragment_ctx{c.Context}
+				c.ops = append(c.ops, opShiftResult, opFrame, opReduce)
+				c.operands = append(c.operands, opURLFragment)
+				execute()
+				continue
+			}
+
+		// 🟢 Arrow selection
 		case SELECT_PROP, SELECT_PROG1, SELECT_PROG2:
 			c.step()
 			if c.frames[fi].ctor == opRet {
@@ -12962,14 +13229,19 @@ expr_loop:
 			c.ops = append(c.ops, opShiftResult, opResolve, opSwap, opIdent, opSwap, opFrame, opReduce)
 			c.operands = append(c.operands, c.tok, 1, 1, opSelect)
 			execute()
-		default:
-			if c.frames[fi].ctor == opRet {
-				c.frames[fi].ctor = opCompound
-			}
+			continue
 		}
+
+		if c.frames[fi].ctor == opRet { c.frames[fi].ctor = opCompound }
 	}
 
-	c.ops = append(c.ops, opEvalResult, opReduce)
+	// 🟢 Fold any remaining right-deep sub-frames back into their parents
+	for len(c.frames) > startFrames+1 {
+		c.ops = append(c.ops, opShiftResult, opReduce)
+		execute()
+	}
+
+	c.ops = append(c.ops, opReduce) // 🟢 Notice NO opEvalResult! We want the RAW AST!
 	execute()
 
 	if rl := len(c.results); rl > 0 {
@@ -13602,13 +13874,14 @@ func (p *compiler) braced_null() (x Value) {
 
 func (p *compiler) braced_path() (x Value) {
 	p.next(true)
-	if v := p.expr(); v != nil {
-		if t, y := v.(*path); !y {
-			x = p.path(v)
-		} else {
-			x = t
-		}
-	}
+	// if v := p.expr(); v != nil {
+	// 	if t, y := v.(*path); !y {
+	// 		x = p.path(v)
+	// 	} else {
+	// 		x = t
+	// 	}
+	// }
+	x = p.expr()
 	p.spaces()
 	p.expect(RBRACE)
 	return
@@ -19429,6 +19702,24 @@ func (p *time) String() string { return time_pkg.Time(p.t).Format("15:04:05.9999
 // ▶▶─<scheme>─(:)┬──────────────────────────────────────┬<path>┬───────────┬┬──────────────┬─▶◀
 //                └(//)┬──────────────┬<host>┬──────────┬┘      └(?)─<query>┘└(#)─<fragment>┘
 //                     └<userinfo>─(@)┘      └(:)─<port>┘
+type url_auth struct { valbase; elements }
+func (u *url_auth) kind() Kind { return 0 }
+func (u *url_auth) Pos() Pos { return u.valbase.Pos() }
+func (u *url_auth) String() string { return "<url_auth>" }
+func (u *url_auth) build(b *compactbuilds) {}
+
+type url_query struct { valbase; elements }
+func (u *url_query) kind() Kind { return 0 }
+func (u *url_query) Pos() Pos { return u.valbase.Pos() }
+func (u *url_query) String() string { return "<url_query>" }
+func (u *url_query) build(b *compactbuilds) {}
+
+type url_fragment struct { valbase; elements }
+func (u *url_fragment) kind() Kind { return 0 }
+func (u *url_fragment) Pos() Pos { return u.valbase.Pos() }
+func (u *url_fragment) String() string { return "<url_fragment>" }
+func (u *url_fragment) build(b *compactbuilds) {}
+
 type url struct{ // scheme://user:pass@host:port/path?query#fragment
     Scheme Value
     Username Value
@@ -19525,25 +19816,25 @@ func (p *word) String() string { return p.s.String() }
 type qualword struct{ elements }
 func (_ *qualword) kind() Kind { return KindQualword } // Behaves like a word/compound
 func (p *qualword) String() string {
-	var b strings.Builder
+	var b compactbuilds
 	for i, elem := range p.elems {
-		if i > 0 { b.WriteByte('.') }
+		if i > 0 { b.writeByte('.') }
 		if elem == nil {
-			b.WriteString("{}")
+			b.write("{}")
 		} else if e, ok := elem.(*list); ok {
 			switch len(e.elems) {
 			case 0: continue
-			case 1: b.WriteString(elem.String())
+			case 1: b.write(elem.String())
 			default:
-				b.WriteString("⌜")
-				b.WriteString(elem.String())
-				b.WriteString("⌟")
+				b.write("⌜")
+				b.write(elem.String())
+				b.write("⌟")
 			}
 		} else {
-			b.WriteString(elem.String())
+			b.write(elem.String())
 		}
 	}
-	return b.String()
+	return b.shared()
 }
 
 type slicer interface{ slice(...int) []Value }
