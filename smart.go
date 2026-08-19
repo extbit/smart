@@ -3024,8 +3024,6 @@ const (
 	// Primary stacks: s.values, s.frames
 	// ============================================================================
 	opFrame             // Pushes a frame boundary marker with constructor
-	opShift             // Shifts an operand value onto s.values
-	opShiftResult       // Shifts top result value onto s.values
 	opReduce            // Reduces values in current frame boundary using constructor
 )
 
@@ -3098,8 +3096,6 @@ var evalopNames = [...]string{
 
 	// 5. STRUCTURALIZE
 	"opFrame",
-	"opShift",
-	"opShiftResult",
 	"opReduce",
 }
 
@@ -3204,7 +3200,6 @@ type snapshot struct {
 	context Context
 	vmhead                 // Physical tape head (boundary, str)
 	vmstack                // Execution instructions
-	values     []Value     // The flat compile-time parsing tape
 	frames     []frame     // Indices marking the start of each nested boundary in `pack`
 	syms       []posym     // O(1) slice header (restores pop_head mutations!)
 	stems      []capture   // O(1) slice header
@@ -3238,7 +3233,6 @@ type symstr struct {
 	vmstack              // Execution instructions and operands
 
 	// 3. AST Construction Stack
-	values []Value // The flat compile-time parsing tape (pack values)
 	frames []frame // Indices marking the start of each nested boundary in `pack`
 
 	// 4. Match Stack
@@ -3327,7 +3321,7 @@ func (s *symstr) step() {
 	if checkpoints && d_step > 0 {
 		var f string
 		if d_step == 1 {
-			f = `pc=%[1]v %[2]v %[3]v %[4]v %[5]v %[6]v %[7]v`
+			f = `pc=%[1]v %[2]v %[3]v %[4]v %[5]v %[6]v`
 		} else {
 			f = `pc=%[1]v
 	   ops: %[2]v
@@ -3336,7 +3330,7 @@ func (s *symstr) step() {
 	  syms: %[5]v
 	 stems: %[6]v`
 		}
-		debug(s, f, s.opsDone, s.ops, s.operands, s.results, s.syms, s.stems, s.values)
+		debug(s, f, s.opsDone, s.ops, s.operands, s.results, s.syms, s.stems)
 	}
 
 	op := s.ops[len(s.ops)-1]
@@ -3429,27 +3423,26 @@ _op_switch_:
 
 	case opFrame:
 		ctor := s.operands[l-1].(evalop)
-		s.operands = s.operands[:l-1]
-		s.frames = append(s.frames, frame{len(s.values), ctor})
-
-	case opShift:
-		val := s.operands[l-1].(Value)
-		s.operands = s.operands[:l-1]
-		s.values = append(s.values, val)
-
-	case opShiftResult:
-		val := s.results[rl-1].(Value)
-		s.results = s.results[:rl-1]
-		s.values = append(s.values, val)
+		pull := s.operands[l-2].(int) // 🟢 Number of existing results to absorb
+		s.operands = s.operands[:l-2]
+		s.frames = append(s.frames, frame{rl - pull, ctor})
 
 	case opReduce:
 		f := s.frames[len(s.frames)-1]
 		s.frames = s.frames[:len(s.frames)-1] // Pop the frame!
 
-		// Safe-copy the slice to prevent memory aliasing corruption!
-		s.operands = append(s.operands, append([]Value{}, s.values[f.i:]...))
+		// Extract AST elements directly from results stack
+		n := rl - f.i
+		elems := make([]Value, n)
+		for i := 0; i < n; i++ {
+			elems[i] = s.results[f.i+i].(Value)
+		}
+
+		s.results = s.results[:f.i] // Clean up results
+
+		// Push the packaged slice to operands for the constructor
+		s.operands = append(s.operands, elems)
 		s.ops = append(s.ops, f.ctor)
-		s.values = s.values[:f.i]
 
 	case opLoop:
 		// Notice we DO NOT pop s.operands here yet!
@@ -4263,9 +4256,9 @@ _op_switch_:
 		// Master assembler!
 		elems := s.operands[l-1].([]Value)
 		s.operands = s.operands[:l-1]
-		
+
 		u := &url{Scheme: elems[0]} // Scheme is always first
-		
+
 		for _, elem := range elems[1:] {
 			switch x := elem.(type) {
 			case *url_auth:
@@ -4482,7 +4475,6 @@ func (s *symstr) checkpoint(kind uint32) backtrack {
 		if (kind & undoStack) != 0 { bt.own.vmstack = s.vmstack.clone() }
 		if (kind & undoHead) != 0 { bt.own.vmhead = s.vmhead }
 		if (kind & undoPack) != 0 {
-			bt.own.values = append([]Value(nil), s.values...)     // Safe Deep Copy
 			bt.own.frames = append([]frame(nil), s.frames...)   // Safe Deep Copy
 		}
 		if (kind & undoErr) != 0 { bt.own.err = s.err }
@@ -4503,7 +4495,6 @@ func (s *symstr) checkpoint(kind uint32) backtrack {
 		if (kind & undoStack) != 0 { bt.tie.vmstack = s.tie.vmstack.clone() }
 		if (kind & undoHead) != 0 { bt.tie.vmhead = s.tie.vmhead }
 		if (kind & undoPack) != 0 {
-			bt.tie.values = append([]Value(nil), s.tie.values...)     // Safe Deep Copy
 			bt.tie.frames = append([]frame(nil), s.tie.frames...)   // Safe Deep Copy
 		}
 		if (kind & undoErr) != 0 { bt.tie.err = s.tie.err }
@@ -4547,7 +4538,6 @@ func (s *symstr) unwind(bt *backtrack) {
 		if (bt.kind & undoCtx) != 0 { s.Context = bt.own.context }
 		if (bt.kind & undoHead) != 0 { s.vmhead = bt.own.vmhead }
 		if (bt.kind & undoPack) != 0 {
-			s.values = append([]Value(nil), bt.own.values...)     // Safe Deep Copy
 			s.frames = append([]frame(nil), bt.own.frames...)   // Safe Deep Copy
 		}
 		if (bt.kind & undoStack) != 0 { s.vmstack = bt.own.vmstack }
@@ -4569,7 +4559,6 @@ func (s *symstr) unwind(bt *backtrack) {
 		if (bt.kind & undoCtx) != 0 { s.tie.Context = bt.tie.context }
 		if (bt.kind & undoHead) != 0 { s.tie.vmhead = bt.tie.vmhead }
 		if (bt.kind & undoPack) != 0 {
-			s.tie.values = append([]Value(nil), bt.tie.values...)     // Safe Deep Copy
 			s.tie.frames = append([]frame(nil), bt.tie.frames...)   // Safe Deep Copy
 		}
 		if (bt.kind & undoStack) != 0 { s.tie.vmstack = bt.tie.vmstack }
@@ -12830,14 +12819,18 @@ func (c *compiler) expr() (x Value) {
 	}
 
 	c.ops = append(c.ops, opFrame)
-	c.operands = append(c.operands, opRet)
+	c.operands = append(c.operands, 0, opRet) // 🟢 Pull 0
 	execute()
 
 expr_loop:
 	for c.tok != EOF && c.err == nil {
 		isLHS := truly(c.Context, left_hand_side{})
 
-		if isLHS && c.tok.is_assign() { break expr_loop }
+		// 🟢 Break on `:=`, `+=`, etc. Always.
+		// Break on `=` ONLY IF we are actively parsing an LHS.
+		if c.tok.is_assign() {
+			if c.tok != ASSIGN || isLHS { break expr_loop }
+		}
 
 		c.loc = c.pos
 		sym, lit, tok := c.sym, c.lit, c.tok
@@ -12853,8 +12846,8 @@ expr_loop:
 			if truly(c.Context, aware_token{COMMA}) { break expr_loop }
 			val = &punct{valbase{c.loc}, symComma}
 		case COLON:
-			if len(c.values) > 0 {
-				if w, ok := c.values[len(c.values)-1].(*word); ok && (!isLHS || truly(c.Context, is_recipe_parser{false})) {
+			if len(c.results) > 0 {
+				if w, ok := c.results[len(c.results)-1].(*word); ok && (!isLHS || truly(c.Context, is_recipe_parser{false})) {
 					switch w.s {
 					// URL Schemes: file, http, https, ftp, ftps, mailto
 					case symFile, symHttp, symHttps, symFtp, symFtps, symMailto:
@@ -12867,19 +12860,19 @@ expr_loop:
 								// 🟢 IT IS A NATIVE URL!
 								c.step() // Eat second `/`
 
-								// Pop the scheme ('https') from values
-								c.values = c.values[:len(c.values)-1]
-								
+								// Pop the scheme ('https') from results natively
+								c.results = c.results[:len(c.results)-1]
+
 								// Switch into URL parsing context!
 								c.Context = parse_url_ctx{c.Context}
 
 								// Setup the URL frame
 								c.ops = append(c.ops, opFrame)
-								c.operands = append(c.operands, opURL)
+								c.operands = append(c.operands, 0, opURL) // Pull 0
 								execute()
 
 								// Shift the scheme in as the first element of the URL
-								c.ops = append(c.ops, opShift)
+								c.ops = append(c.ops, opRet) // 🟢 Replaces opShift
 								c.operands = append(c.operands, w)
 								execute()
 
@@ -12895,7 +12888,7 @@ expr_loop:
 
 		case MINUS:
 			// If MINUS appears at the start of a frame, it's a prefix flag (e.g. `-name`)
-			if len(c.values) == c.frames[len(c.frames)-1].i {
+			if len(c.results) == c.frames[len(c.frames)-1].i {
 				c.frames[len(c.frames)-1].ctor = opFlag
 				c.step()
 				continue expr_loop
@@ -12907,11 +12900,15 @@ expr_loop:
 			c.step()
 			fi := len(c.frames) - 1
 			if c.frames[fi].ctor == opRet { c.frames[fi].ctor = opCompound }
-			c.ops = append(c.ops, opShiftResult, opFrame, opReduce)
-			c.operands = append(c.operands, opDisjunct)
+
+			// 🟢 Fold current frame into Disjunct
+			c.ops = append(c.ops, opReduce)
 			execute()
 			c.ops = append(c.ops, opFrame)
-			c.operands = append(c.operands, opRet)
+			c.operands = append(c.operands, 1, opDisjunct) // Pull 1
+			execute()
+			c.ops = append(c.ops, opFrame)
+			c.operands = append(c.operands, 0, opRet) // Pull 0
 			execute()
 			continue expr_loop
 
@@ -12933,8 +12930,6 @@ expr_loop:
 			loc := c.loc
 			c.step() // Lookahead to the next token
 
-			// If '~' is followed by a space, newline, or expression boundary,
-			// it is a freestanding punctuation (e.g., `host ~ vendor`), NOT a regex prefix!
 			isTerminator := false
 			if isLHS && c.tok.is_assign() {
 				isTerminator = true
@@ -12950,18 +12945,16 @@ expr_loop:
 			}
 
 			if isTerminator {
-				// Downgrade to punctuation and push it
 				val = &punct{valbase{loc}, tok2sym[TILDE]}
 				goto skip_step
 			}
 
-			// It's attached to a pattern (e.g. `~x?`) -> Mutate Context!
 			if isGlob { erro(c, "pattern mixes glob and regex semantics", unwind{}) }
 			if !isRegex {
 				c.Context = oneshot_regex_expr_ctx{c.Context}
 				isRegex = true
 			}
-			continue expr_loop // Skip value assignment, just mutate context!
+			continue expr_loop
 		case CARET:
 			setRegex()
 			val = &regexmeta{valbase{c.loc}, regex_syntax.OpBeginLine}
@@ -12976,32 +12969,26 @@ expr_loop:
 
 		// 🟢 AMBIGUOUS POSTFIX MODIFIERS (*, ?, +)
 		case SAST, QUE, PLUS:
+			if tok == QUE && truly(c.Context, is_url_parser{}) {
+				goto skip_step // URL Query separator, handled strictly by bottom switch!
+			}
 			if !isRegex {
-				// We are not in Regex mode. Default to Glob semantics instantly!
-				if !isGlob {
-					c.Context = oneshot_glob_expr_ctx{c.Context}
-					isGlob = true
-				}
-
-				// Emit flat nodes to naturally build a flat compound
+				if !isGlob { c.Context = oneshot_glob_expr_ctx{c.Context}; isGlob = true }
 				if tok == PLUS {
 					val = &punct{valbase{c.loc}, symPlus}
 				} else {
 					val = &globmeta{valbase{c.loc}, tok2sym[tok]}
 				}
-				break // Skips the undetermined push
+				break
 			}
 
-			// REGEX MODE: Must tentatively pop because they are postfix modifiers!
 			fi := len(c.frames) - 1
-			lastIdx := len(c.values) - 1
+			lastIdx := len(c.results) - 1
 			var prev Value
 			if lastIdx >= c.frames[fi].i {
-				prev = c.values[lastIdx]
+				prev = c.results[lastIdx].(Value)
 			}
-
-			// Always tentatively pop and defer!
-			if prev != nil { c.values = c.values[:lastIdx] }
+			if prev != nil { c.results = c.results[:lastIdx] }
 			val = &undetermined{valbase{c.loc}, tok, tok2sym[tok], prev}
 
 		case DOTDOT: val = &punct{valbase{c.loc}, symDotDot}
@@ -13030,10 +13017,10 @@ expr_loop:
 			if rep, ok := val.(*regexrep); ok && rep != nil {
 				setRegex() // {n,m} forces Regex context
 				fi := len(c.frames) - 1
-				lastIdx := len(c.values) - 1
+				lastIdx := len(c.results) - 1
 				if lastIdx >= c.frames[fi].i {
-					prev := c.values[lastIdx]
-					c.values = c.values[:lastIdx]
+					prev := c.results[lastIdx].(Value)
+					c.results = c.results[:lastIdx]
 					rep.val = prev
 					val = rep
 					goto skip_step
@@ -13043,24 +13030,18 @@ expr_loop:
 			}
 			goto skip_step
 		case LBRACK:
-			// Brackets are parsed universally as `globrange`.
-			// If it turns out to be Regex later, resolveAmbiguity will cast it to regexclass!
 			val = c.glob(nil); goto skip_step
 		case LBOT_CORNER, LTOP_CORNER: val = c.corner_list(); goto skip_step
 		case LANGLE, RANGLE: val = c.punct(); goto skip_step
-		case AT: val = c.punct(); goto skip_step
-		case EXC: val = c.negative(); goto skip_step
 		case DELEGATE: val = c.calling(); goto skip_step
 		case CLOSURE:
-			if truly(c.Context, is_url_query_parser{}) {
-				break expr_loop //val = c.punct()
-			} else {
-				val = c.calling()
-			}
+			if truly(c.Context, is_url_query_parser{}) { break expr_loop } else { val = c.calling() }
 			goto skip_step
 		case PERC:
 			if truly(c.Context, is_url_query_parser{}) { val = c.punct() } else { val = c.perc(nil) }
 			goto skip_step
+		case EXC: val = c.negative(); goto skip_step
+		case AT: val = c.punct(); goto skip_step
 
 		default:
 			if tok.is_keyword() {
@@ -13075,7 +13056,7 @@ expr_loop:
 
 	skip_step:
 		if val != nil {
-			c.ops = append(c.ops, opShift)
+			c.ops = append(c.ops, opRet) // 🟢 Replaces opShift
 			c.operands = append(c.operands, val)
 			execute()
 		}
@@ -13085,7 +13066,7 @@ expr_loop:
 		}
 
 		fi := len(c.frames)-1
-		
+
 		switch c.tok {
 		case SPACE, LINEND, RPAREN, RBRACK, RBRACE, RBOT_CORNER, RTOP_CORNER, RCHEVRON, COMPOSED, SEMICOLON, EOF:
 			break expr_loop
@@ -13103,18 +13084,15 @@ expr_loop:
 			if c.frames[fi].ctor == opRet || c.frames[fi].ctor == opURL {
 				c.frames[fi].ctor = opQualword
 			} else if c.frames[fi].ctor == opPath || c.frames[fi].ctor == opPair || c.frames[fi].ctor == opFlag {
-				// 🟢 RIGHT-DEEP PRECEDENCE: '.' binds tighter
-				last := c.values[len(c.values)-1]
-				c.values = c.values[:len(c.values)-1]
+				// 🟢 RIGHT-DEEP PRECEDENCE: '.' binds tighter. Retroactive Frame!
 				c.ops = append(c.ops, opFrame)
-				c.operands = append(c.operands, opQualword)
-				execute()
-				c.ops = append(c.ops, opShift)
-				c.operands = append(c.operands, last)
+				c.operands = append(c.operands, 1, opQualword) // Pull 1 item
 				execute()
 			} else if c.frames[fi].ctor != opQualword {
-				c.ops = append(c.ops, opShiftResult, opFrame, opReduce)
-				c.operands = append(c.operands, opQualword)
+				c.ops = append(c.ops, opReduce)
+				execute()
+				c.ops = append(c.ops, opFrame)
+				c.operands = append(c.operands, 1, opQualword) // Pull 1 item
 				execute()
 			}
 			continue
@@ -13124,18 +13102,15 @@ expr_loop:
 			if c.frames[fi].ctor == opRet || c.frames[fi].ctor == opURL {
 				c.frames[fi].ctor = opPath
 			} else if c.frames[fi].ctor == opPair || c.frames[fi].ctor == opFlag {
-				// 🟢 RIGHT-DEEP PRECEDENCE: '/' binds tighter
-				last := c.values[len(c.values)-1]
-				c.values = c.values[:len(c.values)-1]
+				// 🟢 RIGHT-DEEP PRECEDENCE: '/' binds tighter. Retroactive Frame!
 				c.ops = append(c.ops, opFrame)
-				c.operands = append(c.operands, opPath)
-				execute()
-				c.ops = append(c.ops, opShift)
-				c.operands = append(c.operands, last)
+				c.operands = append(c.operands, 1, opPath) // Pull 1 item
 				execute()
 			} else if c.frames[fi].ctor != opPath {
-				c.ops = append(c.ops, opShiftResult, opFrame, opReduce)
-				c.operands = append(c.operands, opPath)
+				c.ops = append(c.ops, opReduce)
+				execute()
+				c.ops = append(c.ops, opFrame)
+				c.operands = append(c.operands, 1, opPath) // Pull 1 item
 				execute()
 			}
 			continue
@@ -13146,8 +13121,10 @@ expr_loop:
 				c.frames[fi].ctor = opCompound // Fallback to compound if no other math context
 			} else {
 				// Reduce left side and open a new frame for the right side
-				c.ops = append(c.ops, opShiftResult, opFrame, opReduce)
-				c.operands = append(c.operands, opCompound) // Or opMathMinus if you have it!
+				c.ops = append(c.ops, opReduce)
+				execute()
+				c.ops = append(c.ops, opFrame)
+				c.operands = append(c.operands, 1, opCompound) // Pull 1 item
 				execute()
 			}
 			continue
@@ -13156,54 +13133,50 @@ expr_loop:
 			c.step()
 			if c.frames[fi].ctor == opRet {
 				c.frames[fi].ctor = opPair
-			} else if c.frames[fi].ctor == opPair {
-				// 🟢 RIGHT-ASSOCIATIVE PRECEDENCE: a=b=c parses as a=(b=c)
-				last := c.values[len(c.values)-1]
-				c.values = c.values[:len(c.values)-1]
-
+			} else if c.frames[fi].ctor == opPair || c.frames[fi].ctor == opURLQuery || c.frames[fi].ctor == opCompound || c.frames[fi].ctor == opList {
+				// 🟢 RIGHT-ASSOCIATIVE PRECEDENCE / INNER CONTAINER PRECEDENCE
 				c.ops = append(c.ops, opFrame)
-				c.operands = append(c.operands, opPair)
-				execute()
-
-				c.ops = append(c.ops, opShift)
-				c.operands = append(c.operands, last)
+				c.operands = append(c.operands, 1, opPair) // Pull 1 item
 				execute()
 			} else {
-				// 🟢 REDUCTION: '=' binds weaker than path/qualword.
-				// Close the left side entirely and shift it into a new Pair frame!
-				c.ops = append(c.ops, opShiftResult, opFrame, opReduce)
-				c.operands = append(c.operands, opPair)
+				// 🟢 REDUCTION: '=' binds weaker. Close left side entirely.
+				c.ops = append(c.ops, opReduce)
+				execute()
+				c.ops = append(c.ops, opFrame)
+				c.operands = append(c.operands, 1, opPair) // Pull 1 item
 				execute()
 			}
 			continue
-		
+
 		// 🟢 URL NATIVE COMPONENTS
 		case AT:
 			if truly(c.Context, is_url_parser{}) {
 				c.step() // Eat `@`
-				// Everything before `@` is user:pass. Reduce the left side and flag it.
-				c.ops = append(c.ops, opShiftResult, opFrame, opReduce)
-				c.operands = append(c.operands, opURLAuth)
+				// Everything before `@` is user:pass. Reduce left side and flag it.
+				c.ops = append(c.ops, opReduce)
+				execute()
+				c.ops = append(c.ops, opFrame)
+				c.operands = append(c.operands, 1, opURLAuth) // Pull 1 item
 				execute()
 				continue
 			}
 		case QUE:
 			if truly(c.Context, is_url_parser{}) {
 				c.step() // Eat `?`
-				// Start query parsing context
 				c.Context = parse_url_query_ctx{c.Context}
-				c.ops = append(c.ops, opShiftResult, opFrame, opReduce)
-				c.operands = append(c.operands, opURLQuery)
+				c.ops = append(c.ops, opReduce)
+				execute()
+				c.ops = append(c.ops, opFrame)
+				c.operands = append(c.operands, 0, opURLQuery) // Queries don't pull left side
 				execute()
 				continue
 			}
 		case CLOSURE:
 			if truly(c.Context, is_url_query_parser{}) {
 				c.step() // Eat `&`
-				// `&` inside a query acts as a compound separator
-				if c.frames[fi].ctor != opCompound {
-					c.ops = append(c.ops, opShiftResult, opFrame, opReduce)
-					c.operands = append(c.operands, opCompound)
+				// Reduce active pair cleanly so the next key lands flatly on opURLQuery
+				if c.frames[fi].ctor == opPair || c.frames[fi].ctor == opCompound {
+					c.ops = append(c.ops, opReduce)
 					execute()
 				}
 				continue
@@ -13211,11 +13184,12 @@ expr_loop:
 		case HASH:
 			if truly(c.Context, is_url_parser{}) {
 				c.step() // Eat `#`
-				// Disable comments temporarily so `#` acts as fragment!
 				c.scanner.setBits(c.scanner.commentsOff())
 				c.Context = parse_url_fragment_ctx{c.Context}
-				c.ops = append(c.ops, opShiftResult, opFrame, opReduce)
-				c.operands = append(c.operands, opURLFragment)
+				c.ops = append(c.ops, opReduce)
+				execute()
+				c.ops = append(c.ops, opFrame)
+				c.operands = append(c.operands, 0, opURLFragment) // Fragments don't pull
 				execute()
 				continue
 			}
@@ -13226,8 +13200,11 @@ expr_loop:
 			if c.frames[fi].ctor == opRet {
 				c.frames[fi].ctor = opCompound
 			}
-			c.ops = append(c.ops, opShiftResult, opResolve, opSwap, opIdent, opSwap, opFrame, opReduce)
-			c.operands = append(c.operands, c.tok, 1, 1, opSelect)
+			// Let's rely on standard evaluate for now:
+			c.ops = append(c.ops, opReduce)
+			execute()
+			c.ops = append(c.ops, opResolve, opSwap, opIdent, opSwap, opFrame)
+			c.operands = append(c.operands, c.tok, 1, 1, 1, opSelect) // Added pull=1
 			execute()
 			continue
 		}
@@ -13237,7 +13214,7 @@ expr_loop:
 
 	// 🟢 Fold any remaining right-deep sub-frames back into their parents
 	for len(c.frames) > startFrames+1 {
-		c.ops = append(c.ops, opShiftResult, opReduce)
+		c.ops = append(c.ops, opReduce)
 		execute()
 	}
 
