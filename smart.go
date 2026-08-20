@@ -5407,7 +5407,7 @@ func _hash(ctx Context, h uint64, vs ...Value) uint64 {
 		case *plain:       h = _hash(ctx, h, p.elems...)
 		case *plainline:   h = _hash(ctx, h, p.elems...)
 		case *percpat:     h = _hash(ctx, h, p.Prefix, p.Suffix)
-		case *regexpat:    h = _hash(ctx, h, p.elems...)
+		case *regexpat:    h = mixString(h, p.re.String())
 		case *regexalt:    h = _hash(ctx, h, p.elems...)
 		case *regexlit:    h = _hash(ctx, h, p.Value)
 		case *regexgroup:  h = _hash(ctx, mixUint64(h, uint64(p.cap)), p.val)
@@ -11598,34 +11598,13 @@ rxloop:
 
 	var err error
 	var re *regexp.Regexp
-	var reAST *regex_syntax.Regexp
-
-	// 1. Parse the pattern string into the syntax AST
-	if reAST, err = regex_syntax.Parse(rx, regex_syntax.Perl); err != nil {
-		erro(p, "regex: %v", err)
-	}
-
-	// 2. Extract capture group symbols directly from reAST
-	// We allocate based on MaxCap() + 1 to maintain 1-to-1 index mapping.
-	subexpSyms := make([]Symbol, reAST.MaxCap()+1)
-	gatherSubexpSymbols(reAST, subexpSyms)
-	do(p, regex_subexp_auto{subexpSyms})
-
-	// 3. Build the native Value-based AST tree (now a method call on compiler)
-	base := valbase{pos}
-	val := p.buildRegexValue(base, reAST)
 
 	if re, err = regexp.Compile(rx); err != nil {
 		erro(p, "regex: %v", err)
 	}
 
-	// 4. Ensure the root is always a `*regexpat` to satisfy upstream type expectations
-	if pat, isRegexCon := val.(*regexcon); isRegexCon {
-		return &regexpat{*pat, re}
-	}
-
 	// Wrap it in a concat node if it parsed as a single literal/alt/rep
-	return &regexpat{regexcon{elements{elems: []Value{val}}}, re}
+	return &regexpat{valbase{pos}, re}
 }
 
 func gatherSubexpSymbols(re *regex_syntax.Regexp, syms []Symbol) {
@@ -19562,7 +19541,14 @@ func (p valbase) Pos() Pos { return p.pos }
 type spaces struct{ pos Pos; n int }
 func (_ spaces) kind() Kind { return KindSpaces }
 func (p spaces) Pos() Pos { return p.pos }
-func (_ spaces) String() (_ string) { return }
+func (p spaces) String() string {
+	var b compactbuilds
+	p.build(&b)
+	return b.shared()
+}
+func (p *spaces) build(b *compactbuilds) {
+	for i := 0; i < p.n; i++ { b.writeByte(' ') }
+}
 
 type loc struct{ Value ; pos Pos }
 func (l *loc) kind() Kind { return KindLoc }
@@ -21614,7 +21600,7 @@ func (p *globrange) String() string {
  * 	[[:word:]]     word characters (== [0-9A-Za-z_])
  * 	[[:xdigit:]]   hex digit (== [0-9A-Fa-f])
  */
-type regexpat struct{ regexcon; re *regexp.Regexp } // Braced regex pattern
+type regexpat struct{ valbase; re *regexp.Regexp } // Braced regex pattern: {regex(-sr) ...}
 func (_ *regexpat) kind() Kind { return KindRegexPat }
 func (p *regexpat) String() string {
 	var b compactbuilds
@@ -21624,16 +21610,11 @@ func (p *regexpat) String() string {
 func (p *regexpat) source(b *compactbuilds) {
 	b.setRaw(true) // CRITICAL: Prevent regex space squashing
 	b.write("{regex ")
-	if false {
-		builds(b, strsrc{}, p.elems)
-	} else {
-		b.write(p.re.String())
-	}
+	b.write(p.re.String())
 	b.writeByte('}')
 }
 func (p *regexpat) build(b *compactbuilds) {
-	b.setRaw(true) // CRITICAL: Prevent regex space squashing
-	builds(b, p.elems)
+	b.write(p.re.String())
 }
 
 // regexcon represents a concatenated sequence of regex nodes.
@@ -21773,32 +21754,6 @@ func regexclass_rune(b *compactbuilds, r rune) {
 	b.writeRune(r)
 }
 
-// regexgroup handles both capturing and non-capturing groups.
-// e.g., (re) or (?:re)
-type regexgroup struct {
-	valbase
-	cap int   // Capture index; 0 means non-capturing
-	val Value // The internal pattern
-}
-func (_ *regexgroup) kind() Kind { return KindRegexGroup }
-func (p *regexgroup) String() string {
-	var b compactbuilds
-	p.source(&b)
-	return b.shared()
-}
-func (p *regexgroup) source(b *compactbuilds) {
-	b.setRaw(true)
-	if p.cap > 0 { b.writeByte('(') } else { b.write("(?:") }
-	builds(b, strsrc{}, p.val)
-	b.writeByte(')')
-}
-func (p *regexgroup) build(b *compactbuilds) {
-	b.setRaw(true)
-	if p.cap > 0 { b.writeByte('(') } else { b.write("(?:") }
-	builds(b, p.val)
-	b.writeByte(')')
-}
-
 // regexlit is a fast-path for exact string/rune matches.
 type regexlit struct { Value }
 func (_ *regexlit) kind() Kind { return KindRegexLit }
@@ -21820,6 +21775,136 @@ func (p *regexlit) source(b *compactbuilds) {
 	}
 }
 func (p *regexlit) build(b *compactbuilds) { p.source(b) }
+
+type regexclasskind uint8
+const (
+	regexClassPerl regexclasskind = iota // \d, \s, \w, \D, \S, \W
+	regexClassUnicode                    // \p{Greek}, \PN
+	regexClassASCII                      // [:alpha:], [:^alpha:]
+)
+
+// regexnamedclass handles Perl (\d, \s), Unicode (\p{Greek}), and ASCII ([:alnum:]) classes.
+type regexnamedclass struct {
+	valbase
+	class   string
+	typ     regexclasskind
+	negated bool
+}
+func (_ *regexnamedclass) kind() Kind { return 0 } // KindRegexNamedClass
+func (p *regexnamedclass) String() string {
+	var b compactbuilds
+	p.source(&b)
+	return b.shared()
+}
+func (p *regexnamedclass) source(b *compactbuilds) {
+	b.setRaw(true)
+	switch p.typ {
+	case regexClassPerl:
+		b.writeByte('\\')
+		if p.negated {
+			b.write(strings.ToUpper(p.class))
+		} else {
+			b.write(strings.ToLower(p.class))
+		}
+	case regexClassUnicode:
+		b.writeByte('\\')
+		if p.negated { b.writeByte('P') } else { b.writeByte('p') }
+		if len(p.class) == 1 {
+			b.write(p.class)
+		} else {
+			b.writeByte('{')
+			b.write(p.class)
+			b.writeByte('}')
+		}
+	case regexClassASCII:
+		b.write("[:")
+		if p.negated { b.writeByte('^') }
+		b.write(p.class)
+		b.write(":]")
+	}
+}
+func (p *regexnamedclass) build(b *compactbuilds) { p.source(b) }
+
+// regexquote handles literal text escapes: \Q...\E
+type regexquote struct {
+	valbase
+	text string
+}
+func (_ *regexquote) kind() Kind { return 0 } // KindRegexQuote
+func (p *regexquote) String() string {
+	var b compactbuilds
+	p.source(&b)
+	return b.shared()
+}
+func (p *regexquote) source(b *compactbuilds) {
+	b.setRaw(true)
+	b.write(`\Q`)
+	b.write(p.text)
+	b.write(`\E`)
+}
+func (p *regexquote) build(b *compactbuilds) { p.source(b) }
+
+// regexgroup handles both capturing and non-capturing groups.
+// Upgraded to support named captures (?P<name>re) and inline flags (?is-m:re) or (?is-m)
+type regexgroup struct {
+	valbase
+	cap   int    // Capture index; 0 means non-capturing
+	name  string // Named capture: (?P<name>re)
+	flags string // Inline flags: (?is-m:re) or (?is-m)
+	val   Value  // The internal pattern (can be nil for pure flag toggles)
+}
+func (_ *regexgroup) kind() Kind { return 0 } // KindRegexGroup
+func (p *regexgroup) String() string {
+	var b compactbuilds
+	p.source(&b)
+	return b.shared()
+}
+func (p *regexgroup) source(b *compactbuilds) {
+	b.setRaw(true)
+	b.writeByte('(')
+	if p.cap > 0 {
+		if p.name != "" {
+			b.write("?P<")
+			b.write(p.name)
+			b.writeByte('>')
+		}
+	} else {
+		b.writeByte('?')
+		if p.flags != "" {
+			b.write(p.flags)
+		}
+		if p.val != nil {
+			b.writeByte(':')
+		}
+	}
+	if p.val != nil {
+		builds(b, strsrc{}, p.val)
+	}
+	b.writeByte(')')
+}
+func (p *regexgroup) build(b *compactbuilds) {
+	b.setRaw(true)
+	b.writeByte('(')
+	if p.cap > 0 {
+		if p.name != "" {
+			b.write("?P<")
+			b.write(p.name)
+			b.writeByte('>')
+		}
+	} else {
+		b.writeByte('?')
+		if p.flags != "" {
+			b.write(p.flags)
+		}
+		if p.val != nil {
+			b.writeByte(':')
+		}
+	}
+	if p.val != nil {
+		builds(b, p.val)
+	}
+	b.writeByte(')')
+}
 
 func values(args ...any) (elems []Value) {
 	for _, a := range args {
@@ -21997,10 +22082,7 @@ func __builds(ctx Context, sb *compactbuilds, v any) {
 		if t.Suffix != nil { __builds(ctx, sb, t.Suffix) }
 	case *regexpat:
 		if false {
-			// FIXME: {re x{1}, x{1,}, x{1,2}, x{5}?, x{2,}?, x{2,8}? \p{Greek}, \P{Greek}}
-			// FIXME: {re (re) (?P<name>re) (?:re) (?im) (?sU:re) \x{10ffff} \x1f \123 \* \. \? \$}
-			// FIXME: {re [[:xdigit:]]*, [^[:alpha:]], [^xyz] [a-z] \A \B \b \Q**??^:[]{}\E \^ \z}
-			t.regexcon.source(sb) // FIXME: Incomplete implementation!
+			t.source(sb)
 		} else if t.re != nil {
 			sb.write(t.re.String())
 		}
@@ -25682,7 +25764,7 @@ func ts(i any, o ...any) (s string) {
 	case          *def: if x == nil { content = "<nil-def>" } else { content = x.name.String() }
 	case      *project: content = x.name.String()
 	case          self: content = x.name.String()
-	case     *regexpat: content = x.regexcon.String()
+	case     *regexpat: content = x.String()
 	case     *globmeta: content = x.sym.String()
 	case    *globrange: content = x.Value.String()
 	case  *include_ctx: content = x.spec.String() + " " + _ts(x.Context)
