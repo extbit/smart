@@ -4730,11 +4730,14 @@ func (s *symstr) consumeClass(classNode Value, reverse bool) bool {
 
 	// 3. Evaluate the rune against the class conditions
 	switch t := classNode.(type) {
+	case *regexnamedclass:
+		erro(s, "TODO: unimplemented class match node: %s", t.class, unwind{})
+		return false
 	case *regexclass:
 		// Go's regexp syntax guarantees disjoint, positive, inclusive ranges [lo, hi]
-		// FIXME: for i := 0; i < len(t.runes); i += 2 {
-		// FIXME: 	if r >= t.runes[i] && r <= t.runes[i+1] { return true }
-		// FIXME: }
+		for i := 0; i < len(t.runes); i += 2 {
+			if r >= t.runes[i] && r <= t.runes[i+1] { return true }
+		}
 		return false
 	case *regexmeta:
 		if t.op == regex_syntax.OpAnyCharNotNL { return r != '\n' }
@@ -5412,7 +5415,7 @@ func _hash(ctx Context, h uint64, vs ...Value) uint64 {
 		case *regexlit:    h = _hash(ctx, h, p.Value)
 		case *regexgroup:  h = _hash(ctx, mixUint64(h, uint64(p.cap)), p.val)
 		case *regexmeta:   h = mixUint64(h, uint64(p.op))
-		case *regexclass:  h = mixString(h, p.text) //for _, r := range p.runes { h = mixUint64(h, uint64(r)) }
+		case *regexclass:  for _, r := range p.runes { h = mixUint64(h, uint64(r)) }
 		case *regexrep:
 			var greedy uint64; if p.greedy { greedy = 1 }
 			h = _hash(ctx, mixUint64(mixUint64(mixUint64(h, uint64(p.min)), uint64(p.max)), greedy), p.val)
@@ -13017,7 +13020,7 @@ expr_loop:
 			if isRegex {
 				switch lit {
 				case `d`, `D`, `s`, `S`, `w`, `W`:
-					val = &regexnamedclass{valbase{c.loc}, lit, regexClassPerl, lit[0] <= 'Z'}
+					val = &regexnamedclass{valbase{c.loc}, lit, regexClassPerl, lit[0] <= 'Z', parseRegexClass(`\`+lit)}
 					goto single_token_done
 				case `b`: val = &regexmeta{valbase{c.loc}, regex_syntax.OpWordBoundary}; goto single_token_done
 				case `B`: val = &regexmeta{valbase{c.loc}, regex_syntax.OpNoWordBoundary}; goto single_token_done
@@ -13037,7 +13040,9 @@ expr_loop:
 						if c.tok == WORD { class = c.sym.String() } else { class = c.lit }
 						c.step()
 					}
-					val = &regexnamedclass{valbase{loc}, class, regexClassUnicode, negated}
+					nc := &regexnamedclass{valbase{loc}, class, regexClassUnicode, negated, nil}
+					nc.runes = parseRegexClass(nc.String()) // Evaluate the perfectly reconstructed source string
+					val = nc
 					c.ops = append(c.ops, opRet)
 					c.operands = append(c.operands, val)
 					execute()
@@ -13045,14 +13050,14 @@ expr_loop:
 				case `Q`:
 					loc := c.loc
 					c.step() // Eat \Q
-					var b strings.Builder
+					var b compactbuilds
 					for c.tok != EOF {
 						if c.tok == ESCAPE && c.lit == `E` { break }
-						if c.tok == WORD { b.WriteString(c.sym.String()) } else { b.WriteString(c.lit) }
+						if c.tok == WORD { b.write(c.sym.String()) } else { b.write(c.lit) }
 						c.step()
 					}
 					if c.tok == ESCAPE && c.lit == `E` { c.step() } // Eat \E
-					val = &regexquote{valbase{loc}, b.String()}
+					val = &regexquote{valbase{loc}, b.shared()}
 					c.ops = append(c.ops, opRet)
 					c.operands = append(c.operands, val)
 					execute()
@@ -13084,83 +13089,83 @@ expr_loop:
 		case LBRACK:// Regex: Character Classes; Glob: Range
 			if isRegex {
 				loc := c.loc
-				var b strings.Builder
-				b.WriteString("[")
+				var b compactbuilds
+				b.write("[")
 				c.step() // Eat '['
 
 				if c.tok == CARET {
-					b.WriteString("^")
+					b.write("^")
 					c.step()
 				}
 				if c.tok == RBRACK {
-					b.WriteString("]")
+					b.write("]")
 					c.step()
 				}
 
 				inPosix := false
 				for c.tok != EOF {
 					if c.tok == RBRACK {
-						b.WriteString("]")
+						b.write("]")
 						if inPosix {
 							inPosix = false
 							c.step()
 							continue
 						}
-						val = &regexclass{valbase{loc}, b.String()}
+						ss := b.shared()
+						val = &regexclass{valbase{loc}, ss, parseRegexClass(ss)}
 						goto single_token_done
 					}
 					
 					switch c.tok {
 					case LBOT_CORNER: // ⌞
-						b.WriteString("[:")
+						b.write("[:")
 						inPosix = true
 					case RBOT_CORNER: // ⌟
-						b.WriteString(":]")
+						b.write(":]")
 						inPosix = false
-					case CARET: b.WriteString("^")
-					case MINUS: b.WriteString("-")
-					case LBRACK: b.WriteString("[")
+					case CARET: b.write("^")
+					case MINUS: b.write("-")
+					case LBRACK: b.write("[")
 					case COLON: 
-						b.WriteString(":")
-						if strings.HasSuffix(b.String(), "[:") {
+						b.write(":")
+						if strings.HasSuffix(b.shared(), "[:") {
 							inPosix = true
 						}
-					case DOT: b.WriteString(".")
-					case PLUS: b.WriteString("+")
-					case SAST: b.WriteString("*")
-					case QUE: b.WriteString("?")
-					case BAR: b.WriteString("|")
-					case LPAREN: b.WriteString("(")
-					case RPAREN: b.WriteString(")")
-					case LBRACE: b.WriteString("{")
-					case RBRACE: b.WriteString("}")
-					case COMMA: b.WriteString(",")
-					case AT: b.WriteString("@")
-					case HASH: b.WriteString("#")
-					case TILDE: b.WriteString("~")
-					case PCON: b.WriteString("/")
-					case PROOT: b.WriteString("//")
-					case PTAIL: b.WriteString("/$")
-					case DOTDOT: b.WriteString("..")
-					case LANGLE: b.WriteString("<")
-					case RANGLE: b.WriteString(">")
-					case SPACE: b.WriteString(" ")
-					case REGEX_EOT: b.WriteString("$")
+					case DOT: b.write(".")
+					case PLUS: b.write("+")
+					case SAST: b.write("*")
+					case QUE: b.write("?")
+					case BAR: b.write("|")
+					case LPAREN: b.write("(")
+					case RPAREN: b.write(")")
+					case LBRACE: b.write("{")
+					case RBRACE: b.write("}")
+					case COMMA: b.write(",")
+					case AT: b.write("@")
+					case HASH: b.write("#")
+					case TILDE: b.write("~")
+					case PCON: b.write("/")
+					case PROOT: b.write("//")
+					case PTAIL: b.write("/$")
+					case DOTDOT: b.write("..")
+					case LANGLE: b.write("<")
+					case RANGLE: b.write(">")
+					case SPACE: b.write(" ")
+					case REGEX_EOT: b.write("$")
 					case ESCAPE:
-						b.WriteString(`\`)
-						b.WriteString(c.lit) // The unslashed literal is restored precisely
+						b.write(`\`)
+						b.write(c.lit) // The unslashed literal is restored precisely
 					case WORD:
-						b.WriteString(c.sym.String())
+						b.write(c.sym.String())
 					case RAW, STRING, INTEGER, FLOATING, HEXADECIMAL, OCTAL, BINARY:
-						b.WriteString(c.lit)
+						b.write(c.lit)
 					default:
-						if c.lit != "" {
-							b.WriteString(c.lit)
-						}
+						if c.lit != "" { b.write(c.lit) }
 					}
 					c.step()
 				}
-				val = &regexclass{valbase{loc}, b.String()}
+				ss := b.shared()
+				val = &regexclass{valbase{loc}, ss, parseRegexClass(ss)}
 				goto single_token_done
 			}
 			val = c.glob(nil)
@@ -21835,10 +21840,22 @@ func (p *regexrep) formatRepetition(b *compactbuilds) {
 	}
 }
 
-// regexclass represents character classes like [a-z], \d, \w.
+// parseRegexClass leverages Go's native regex parser to precompute highly-optimized,
+// disjoint, positive inclusive [lo, hi] rune ranges for the Extbit VM to execute.
+func parseRegexClass(pattern string) []rune {
+	if re, err := regex_syntax.Parse(pattern, regex_syntax.Perl); err == nil {
+		if re.Op == regex_syntax.OpCharClass {
+			return re.Rune
+		}
+	}
+	return nil
+}
+
+// regexclass represents character classes like [a-z], [[:xdigit:]].
 type regexclass struct {
 	valbase
-	text string
+	text  string
+	runes []rune // Fast VM execution ranges [lo, hi, lo, hi...]
 }
 func (_ *regexclass) kind() Kind { return KindRegexClass }
 func (p *regexclass) String() string {
@@ -21851,28 +21868,6 @@ func (p *regexclass) source(b *compactbuilds) {
 	b.write(p.text)
 }
 func (p *regexclass) build(b *compactbuilds) { p.source(b) }
-
-// regexlit is a fast-path for exact string/rune matches.
-type regexlit struct { Value }
-func (_ *regexlit) kind() Kind { return KindRegexLit }
-func (p *regexlit) String() string {
-	var b compactbuilds
-	p.source(&b)
-	return b.shared()
-}
-func (p *regexlit) source(b *compactbuilds) {
-	// Reconstruct the regex source by iterating over the underlying symbols
-	// and escaping characters independently.
-	for _, sym := range __symSeq(__symbol(symbolize_ctx{nil}, p.Value)) {
-		switch sym { // '\\', '.', '+', '*', '?', '(', '|', ')', '[', ']', '{', '}', '^', '$':
-		case symBackslash, symDot, symPlus, symAsterisk, symQues, symLparen, symBar, symRparen,
-			symLbrack, symRbrack, symLbrace, symRbrace, symCaret, symDollarSign:
-			b.writeByte('\\')
-		}
-		sym.build(b)
-	}
-}
-func (p *regexlit) build(b *compactbuilds) { p.source(b) }
 
 type regexclasskind uint8
 const (
@@ -21887,6 +21882,7 @@ type regexnamedclass struct {
 	class   string
 	typ     regexclasskind
 	negated bool
+	runes   []rune // Fast VM execution ranges [lo, hi, lo, hi...]
 }
 func (_ *regexnamedclass) kind() Kind { return 0 } // KindRegexNamedClass
 func (p *regexnamedclass) String() string {
@@ -21910,9 +21906,7 @@ func (p *regexnamedclass) source(b *compactbuilds) {
 		if len(p.class) == 1 {
 			b.write(p.class)
 		} else {
-			b.writeByte('{')
-			b.write(p.class)
-			b.writeByte('}')
+			b.writef("{%s}", p.class)
 		}
 	case regexClassASCII:
 		b.write("[:")
@@ -21922,6 +21916,28 @@ func (p *regexnamedclass) source(b *compactbuilds) {
 	}
 }
 func (p *regexnamedclass) build(b *compactbuilds) { p.source(b) }
+
+// regexlit is a fast-path for exact string/rune matches.
+type regexlit struct { Value }
+func (_ *regexlit) kind() Kind { return KindRegexLit }
+func (p *regexlit) String() string {
+	var b compactbuilds
+	p.source(&b)
+	return b.shared()
+}
+func (p *regexlit) source(b *compactbuilds) {
+	// Reconstruct the regex source by iterating over the underlying symbols
+	// and escaping characters independently.
+	for _, sym := range __symSeq(__symbol(symbolize_ctx{nil}, p.Value)) {
+		switch sym { // '\\', '.', '+', '*', '?', '(', '|', ')', '[', ']', '{', '}', '^', '$':
+		case symBackslash, symDot, symPlus, symAsterisk, symQues, symLparen, symBar, symRparen,
+			symLbrack, symRbrack, symLbrace, symRbrace, symCaret, symDollarSign:
+			b.writeByte('\\')
+		}
+		sym.build(b)
+	}
+}
+func (p *regexlit) build(b *compactbuilds) { p.source(b) }
 
 // regexquote handles literal text escapes: \Q...\E
 type regexquote struct {
