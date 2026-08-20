@@ -13185,15 +13185,27 @@ expr_loop:
 	skip_step:
 		if val != nil {
 			fi := len(c.frames) - 1
-			// Automatically open an inner frame for contiguous segment tokens!
+
+			// 🟢 FIX: Automatically open an inner frame for contiguous segments,
+			// BUT explicitly exclude structural prefix markers from encapsulation!
+			shouldCompound := false
 			if c.frames[fi].ctor == opPath || c.frames[fi].ctor == opURL || c.frames[fi].ctor == opQualword {
+				shouldCompound = true
+				switch val.(type) {
+				case valbase, *punct:
+					shouldCompound = false
+				}
+			}
+
+			if shouldCompound {
 				c.ops = append(c.ops, opFrame)
-				c.operands = append(c.operands, 0, opCompound)
+				c.operands = append(c.operands, 0, opCompound) // Guarantee elements reduce to `Value`, not `[]Value` slice!
 				execute()
 			}
 
 			c.ops = append(c.ops, opRet)
 			c.operands = append(c.operands, val)
+
 			execute()
 		}
 
@@ -25894,6 +25906,12 @@ func ts(i any, o ...any) (s string) {
 		var b compactbuilds
 		b.write(_ts(x.val))
 		x.formatRepetition(&b)
+		content = b.shared()
+	case  *regexgroup:
+		var b compactbuilds
+		x.source(&b)
+		b.write(" ")
+		b.write(_ts(x.val))
 		content = b.shared()
 	case resolve_result:
 		var obj string
