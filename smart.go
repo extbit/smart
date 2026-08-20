@@ -3814,15 +3814,15 @@ _op_switch_:
 				if t.prev == nil { erro(pc(s, t), "regex modifier requires preceding expression", unwind{}) }
 				var rep Value
 				if t.tok == SAST {
-					rep = &regexrep{t.valbase, 0, -1, true, t.prev}
+					rep = &regexrep{t.valbase, 0, -1, true, repStyleSymbol, t.prev}
 				} else if t.tok == PLUS {
-					rep = &regexrep{t.valbase, 1, -1, true, t.prev}
+					rep = &regexrep{t.valbase, 1, -1, true, repStyleSymbol, t.prev}
 				} else if t.tok == QUE {
 					if r, ok := t.prev.(*regexrep); ok && r.greedy {
 						r.greedy = false
 						rep = r
 					} else {
-						rep = &regexrep{t.valbase, 0, 1, true, t.prev}
+						rep = &regexrep{t.valbase, 0, 1, true, repStyleSymbol, t.prev}
 					}
 				}
 
@@ -4732,9 +4732,9 @@ func (s *symstr) consumeClass(classNode Value, reverse bool) bool {
 	switch t := classNode.(type) {
 	case *regexclass:
 		// Go's regexp syntax guarantees disjoint, positive, inclusive ranges [lo, hi]
-		for i := 0; i < len(t.runes); i += 2 {
-			if r >= t.runes[i] && r <= t.runes[i+1] { return true }
-		}
+		// FIXME: for i := 0; i < len(t.runes); i += 2 {
+		// FIXME: 	if r >= t.runes[i] && r <= t.runes[i+1] { return true }
+		// FIXME: }
 		return false
 	case *regexmeta:
 		if t.op == regex_syntax.OpAnyCharNotNL { return r != '\n' }
@@ -5412,7 +5412,7 @@ func _hash(ctx Context, h uint64, vs ...Value) uint64 {
 		case *regexlit:    h = _hash(ctx, h, p.Value)
 		case *regexgroup:  h = _hash(ctx, mixUint64(h, uint64(p.cap)), p.val)
 		case *regexmeta:   h = mixUint64(h, uint64(p.op))
-		case *regexclass:  for _, r := range p.runes { h = mixUint64(h, uint64(r)) }
+		case *regexclass:  h = mixString(h, p.text) //for _, r := range p.runes { h = mixUint64(h, uint64(r)) }
 		case *regexrep:
 			var greedy uint64; if p.greedy { greedy = 1 }
 			h = _hash(ctx, mixUint64(mixUint64(mixUint64(h, uint64(p.min)), uint64(p.max)), greedy), p.val)
@@ -6798,7 +6798,7 @@ func _callstack(s string, i, j int, args ...any) (res []byte) {
 
 			var e string
 			if i, j = i+1, j-1; 0 < j && i < len(v) {
-				if wasPanic { wasPanic, e = false, "	<---- panic" }
+				if wasPanic { wasPanic, e = false, "	<---- panic 👈" }
 			} else {
 				e = fmt.Sprintf("  (%d more)", (len(v)-n)/2)
 			}
@@ -10838,7 +10838,7 @@ func (p *compiler) braced() (x Value) {
 		if p.tok == RBRACE {
 			p.step() // Eat '}'
 			// Returns the postfix modifier for expr() to bind!
-			return &regexrep{valbase{pos}, min, max, true, nil}
+			return &regexrep{valbase{pos}, min, max, true, repStyleRange, nil}
 		}
 
 		// Not a valid regex repetition! Rewind the scanner time to the INTEGER.
@@ -11622,84 +11622,6 @@ func gatherSubexpSymbols(re *regex_syntax.Regexp, syms []Symbol) {
 
 	for _, sub := range re.Sub {
 		gatherSubexpSymbols(sub, syms)
-	}
-}
-
-// buildRegexValue translates the standard library's regexp syntax tree into your
-// hyper-optimized, zero-allocation Value AST nodes.
-func (p *compiler) buildRegexValue(pos valbase, re *regex_syntax.Regexp) Value {
-	if re == nil { return nil }
-
-	switch re.Op {
-	case regex_syntax.OpNoMatch, regex_syntax.OpEmptyMatch:
-		return &regexlit{Value: nil}
-
-	case regex_syntax.OpLiteral:
-		// Convert runes from the parser back into an exact string match fragment
-		litStr := string(re.Rune)
-
-		// Map the raw literal string to native token values using the compiler's language semantics.
-		// (e.g. "configure.types." becomes a word/compound element instead of raw characters)
-		var nativeVal Value
-		if p != nil {
-			nativeVal = p.parseLiteralTokenString(pos, litStr)
-		} else {
-			// Fallback if compilation context is missing
-			nativeVal = &word{valbase: pos, s: intern(litStr)}
-		}
-
-		return &regexlit{Value: nativeVal}
-
-	case regex_syntax.OpCharClass:
-		return &regexclass{valbase: pos, runes: re.Rune}
-
-	case regex_syntax.OpAnyCharNotNL, regex_syntax.OpAnyChar,
-	     regex_syntax.OpBeginLine, regex_syntax.OpEndLine,
-	     regex_syntax.OpBeginText, regex_syntax.OpEndText,
-	     regex_syntax.OpWordBoundary, regex_syntax.OpNoWordBoundary:
-		return &regexmeta{valbase: pos, op: re.Op}
-
-	case regex_syntax.OpCapture:
-		return &regexgroup{
-			valbase: pos,
-			cap: re.Cap,
-			val: p.buildRegexValue(pos, re.Sub[0]),
-		}
-
-	case regex_syntax.OpStar, regex_syntax.OpPlus, regex_syntax.OpQuest, regex_syntax.OpRepeat:
-		min, max := re.Min, re.Max
-
-		// CRITICAL: Manually seed the bounds for non-OpRepeat operators
-		switch re.Op {
-		case regex_syntax.OpStar:  min, max = 0, -1
-		case regex_syntax.OpPlus:  min, max = 1, -1
-		case regex_syntax.OpQuest: min, max = 0, 1
-		}
-
-		return &regexrep{
-			valbase: pos,
-			min: min,
-			max: max,
-			greedy: (re.Flags & regex_syntax.NonGreedy) == 0,
-			val: p.buildRegexValue(pos, re.Sub[0]),
-		}
-
-	case regex_syntax.OpConcat:
-		pat := &regexcon{}
-		for _, sub := range re.Sub {
-			pat.elems = append(pat.elems, p.buildRegexValue(pos, sub))
-		}
-		return pat
-
-	case regex_syntax.OpAlternate:
-		alt := &regexalt{}
-		for _, sub := range re.Sub {
-			alt.elems = append(alt.elems, p.buildRegexValue(pos, sub))
-		}
-		return alt
-
-	default:
-		return &regexlit{Value: nil}
 	}
 }
 
@@ -12891,9 +12813,6 @@ expr_loop:
 								c.operands = append(c.operands, 1, opURL) // Pull 1, i.e., scheme (https)
 								execute()
 
-								// 🟢 NOTE: it's optional to disable comments for the URL!
-								// The scanner now relys on `truly(ctx, is_url_parser{})` too!
-								if true { defer c.scanner.setBits(c.scanner.commentsOff()) }
 								continue expr_loop
 							}
 						}
@@ -13003,8 +12922,27 @@ expr_loop:
 			if lastIdx >= c.frames[fi].i {
 				prev = c.results[lastIdx].(Value)
 			}
-			if prev != nil { c.results = c.results[:lastIdx] }
-			val = &undetermined{valbase{c.loc}, tok, tok2sym[tok], prev}
+
+			// If QUE (?) follows an existing repetition, it's a Non-Greedy Modifier!
+			if tok == QUE {
+				if rep, ok := prev.(*regexrep); ok && rep.greedy {
+					c.results = c.results[:lastIdx] // Pop the greedy rep
+					rep.greedy = false              // Modify to non-greedy
+					val = rep
+					goto single_token_done
+				}
+			}
+
+			if prev == nil { erro(c, "missing argument to repetition operator: %v", tok, unwind{}) }
+
+			c.results = c.results[:lastIdx] // Pop the targeted expression
+			var min, max int
+			if tok == SAST { min, max = 0, -1 }
+			if tok == PLUS { min, max = 1, -1 }
+			if tok == QUE { min, max = 0, 1 }
+
+			val = &regexrep{valbase{c.loc}, min, max, true, repStyleSymbol, prev}
+			goto single_token_done
 
 		case DOT:
 			if isRegex {
@@ -13036,7 +12974,6 @@ expr_loop:
 			val = &compound{elements{elems}}
 			goto skip_step
 
-		// 🟢 NATIVE REGEX CAPTURING & GROUPING
 		case LPAREN:
 			loc := c.loc
 			c.step() // Eat '('
@@ -13045,19 +12982,19 @@ expr_loop:
 				var name, flags string
 				if c.tok == QUE {
 					c.step() // Eat '?'
-					if c.lit == "P" { // ?P<name>
+					if c.tok == WORD && c.sym.String() == "P" { // ?P<name>
 						c.step() // Eat P
 						if c.tok == LANGLE {
 							c.step() // Eat <
-							name = c.lit
+							if c.tok == WORD { name = c.sym.String() } else { name = c.lit }
 							c.step() // Eat name
 							if c.tok == RANGLE { c.step() } // Eat >
 						}
 					} else if c.tok == COLON { // ?:
 						capIdx = 0
 						c.step() // Eat :
-					} else { // (?flags) or (?flags:...)
-						flags = c.lit
+					} else if c.tok == WORD { // (?flags) or (?flags:...)
+						flags = c.sym.String()
 						capIdx = 0
 						c.step() // Eat flags
 						if c.tok == COLON { c.step() } // Eat :
@@ -13071,23 +13008,21 @@ expr_loop:
 				val = c.expr()
 				if c.tok == RPAREN { c.step() }
 			}
-			// Push node cleanly without double-stepping via skip_step!
 			c.ops = append(c.ops, opRet)
 			c.operands = append(c.operands, val)
 			execute()
 			continue expr_loop
 
-		// 🟢 NATIVE REGEX ESCAPES
 		case ESCAPE:
 			if isRegex {
 				switch lit {
 				case `d`, `D`, `s`, `S`, `w`, `W`:
-					val = &regexnamedclass{valbase{c.loc}, lit[1:], regexClassPerl, lit[1] <= 'Z'}
-					goto skip_step
-				case `b`: val = &regexmeta{valbase{c.loc}, regex_syntax.OpWordBoundary}; goto skip_step
-				case `B`: val = &regexmeta{valbase{c.loc}, regex_syntax.OpNoWordBoundary}; goto skip_step
-				case `A`: val = &regexmeta{valbase{c.loc}, regex_syntax.OpBeginText}; goto skip_step
-				case `z`: val = &regexmeta{valbase{c.loc}, regex_syntax.OpEndText}; goto skip_step
+					val = &regexnamedclass{valbase{c.loc}, lit, regexClassPerl, lit[0] <= 'Z'}
+					goto single_token_done
+				case `b`: val = &regexmeta{valbase{c.loc}, regex_syntax.OpWordBoundary}; goto single_token_done
+				case `B`: val = &regexmeta{valbase{c.loc}, regex_syntax.OpNoWordBoundary}; goto single_token_done
+				case `A`: val = &regexmeta{valbase{c.loc}, regex_syntax.OpBeginText}; goto single_token_done
+				case `z`: val = &regexmeta{valbase{c.loc}, regex_syntax.OpEndText}; goto single_token_done
 				case `p`, `P`:
 					loc := c.loc
 					negated := lit == `P`
@@ -13095,15 +13030,14 @@ expr_loop:
 					var class string
 					if c.tok == LBRACE {
 						c.step() // Eat {
-						class = c.lit
+						if c.tok == WORD { class = c.sym.String() } else { class = c.lit }
 						c.step() // Eat class name
 						if c.tok == RBRACE { c.step() } // Eat }
 					} else {
-						class = c.lit
+						if c.tok == WORD { class = c.sym.String() } else { class = c.lit }
 						c.step()
 					}
 					val = &regexnamedclass{valbase{loc}, class, regexClassUnicode, negated}
-					// Push node cleanly without double-stepping!
 					c.ops = append(c.ops, opRet)
 					c.operands = append(c.operands, val)
 					execute()
@@ -13112,11 +13046,12 @@ expr_loop:
 					loc := c.loc
 					c.step() // Eat \Q
 					var b strings.Builder
-					for c.tok != EOF && c.tok != ESCAPE && c.lit != `E` {
-						b.WriteString(c.lit)
+					for c.tok != EOF {
+						if c.tok == ESCAPE && c.lit == `E` { break }
+						if c.tok == WORD { b.WriteString(c.sym.String()) } else { b.WriteString(c.lit) }
 						c.step()
 					}
-					if c.lit == `E` { c.step() } // Eat \E
+					if c.tok == ESCAPE && c.lit == `E` { c.step() } // Eat \E
 					val = &regexquote{valbase{loc}, b.String()}
 					c.ops = append(c.ops, opRet)
 					c.operands = append(c.operands, val)
@@ -13146,8 +13081,91 @@ expr_loop:
 				}
 			}
 			goto skip_step
-		case LBRACK:
-			val = c.glob(nil); goto skip_step
+		case LBRACK:// Regex: Character Classes; Glob: Range
+			if isRegex {
+				loc := c.loc
+				var b strings.Builder
+				b.WriteString("[")
+				c.step() // Eat '['
+
+				if c.tok == CARET {
+					b.WriteString("^")
+					c.step()
+				}
+				if c.tok == RBRACK {
+					b.WriteString("]")
+					c.step()
+				}
+
+				inPosix := false
+				for c.tok != EOF {
+					if c.tok == RBRACK {
+						b.WriteString("]")
+						if inPosix {
+							inPosix = false
+							c.step()
+							continue
+						}
+						val = &regexclass{valbase{loc}, b.String()}
+						goto single_token_done
+					}
+					
+					switch c.tok {
+					case LBOT_CORNER: // ⌞
+						b.WriteString("[:")
+						inPosix = true
+					case RBOT_CORNER: // ⌟
+						b.WriteString(":]")
+						inPosix = false
+					case CARET: b.WriteString("^")
+					case MINUS: b.WriteString("-")
+					case LBRACK: b.WriteString("[")
+					case COLON: 
+						b.WriteString(":")
+						if strings.HasSuffix(b.String(), "[:") {
+							inPosix = true
+						}
+					case DOT: b.WriteString(".")
+					case PLUS: b.WriteString("+")
+					case SAST: b.WriteString("*")
+					case QUE: b.WriteString("?")
+					case BAR: b.WriteString("|")
+					case LPAREN: b.WriteString("(")
+					case RPAREN: b.WriteString(")")
+					case LBRACE: b.WriteString("{")
+					case RBRACE: b.WriteString("}")
+					case COMMA: b.WriteString(",")
+					case AT: b.WriteString("@")
+					case HASH: b.WriteString("#")
+					case TILDE: b.WriteString("~")
+					case PCON: b.WriteString("/")
+					case PROOT: b.WriteString("//")
+					case PTAIL: b.WriteString("/$")
+					case DOTDOT: b.WriteString("..")
+					case LANGLE: b.WriteString("<")
+					case RANGLE: b.WriteString(">")
+					case SPACE: b.WriteString(" ")
+					case REGEX_EOT: b.WriteString("$")
+					case ESCAPE:
+						b.WriteString(`\`)
+						b.WriteString(c.lit) // The unslashed literal is restored precisely
+					case WORD:
+						b.WriteString(c.sym.String())
+					case RAW, STRING, INTEGER, FLOATING, HEXADECIMAL, OCTAL, BINARY:
+						b.WriteString(c.lit)
+					default:
+						if c.lit != "" {
+							b.WriteString(c.lit)
+						}
+					}
+					c.step()
+				}
+				val = &regexclass{valbase{loc}, b.String()}
+				goto single_token_done
+			}
+			val = c.glob(nil)
+			goto skip_step
+
 		case LBOT_CORNER, LTOP_CORNER: val = c.corner_list(); goto skip_step
 		case DELEGATE: val = c.calling(); goto skip_step
 		case CLOSURE:
@@ -13175,6 +13193,7 @@ expr_loop:
 			}
 		}
 
+	single_token_done:
 		c.step()
 
 	skip_step:
@@ -21763,11 +21782,19 @@ func (p *regexmeta) build(b *compactbuilds) {
 	}
 }
 
+type regexrepstyle uint8
+
+const (
+	repStyleSymbol regexrepstyle = iota // *, +, ?
+	repStyleRange                       // {n}, {n,}, {n,m}
+)
+
 // regexrep handles repetitions: *, +, ?, {n,m}
 type regexrep struct {
 	valbase
 	min, max int
 	greedy   bool
+	style    regexrepstyle
 	val      Value // The expression being repeated
 }
 func (_ *regexrep) kind() Kind { return KindRegexRep }
@@ -21785,18 +21812,23 @@ func (p *regexrep) build(b *compactbuilds) {
 	p.formatRepetition(b)
 }
 func (p *regexrep) formatRepetition(b *compactbuilds) {
-	if p.min == 0 && p.max == -1 {
-		b.writeByte('*')
-	} else if p.min == 1 && p.max == -1 {
-		b.writeByte('+')
-	} else if p.min == 0 && p.max == 1 {
-		b.writeByte('?')
-	} else if p.max == -1 {
-		b.write(fmt.Sprintf("{%d,}", p.min))
-	} else if p.min == p.max {
-		b.write(fmt.Sprintf("{%d}", p.min))
+	if p.style == repStyleSymbol {
+		if p.min == 0 && p.max == -1 {
+			b.writeByte('*')
+		} else if p.min == 1 && p.max == -1 {
+			b.writeByte('+')
+		} else if p.min == 0 && p.max == 1 {
+			b.writeByte('?')
+		}
 	} else {
-		b.write(fmt.Sprintf("{%d,%d}", p.min, p.max))
+		// Explicit range syntax {n}, {n,}, {n,m}
+		if p.min == p.max {
+			b.writef("{%d}", p.min)
+		} else if p.max == -1 {
+			b.writef("{%d,}", p.min)
+		} else {
+			b.writef("{%d,%d}", p.min, p.max)
+		}
 	}
 	if !p.greedy {
 		b.writeByte('?')
@@ -21804,10 +21836,9 @@ func (p *regexrep) formatRepetition(b *compactbuilds) {
 }
 
 // regexclass represents character classes like [a-z], \d, \w.
-// Runes are stored in pairs (even index is 'lo', odd index is 'hi').
 type regexclass struct {
 	valbase
-	runes []rune
+	text string
 }
 func (_ *regexclass) kind() Kind { return KindRegexClass }
 func (p *regexclass) String() string {
@@ -21817,27 +21848,9 @@ func (p *regexclass) String() string {
 }
 func (p *regexclass) source(b *compactbuilds) {
 	b.setRaw(true)
-	b.writeByte('[')
-	for i := 0; i < len(p.runes); i += 2 {
-		lo, hi := p.runes[i], p.runes[i+1]
-		if lo == hi {
-			regexclass_rune(b, lo)
-		} else {
-			regexclass_rune(b, lo)
-			b.writeByte('-')
-			regexclass_rune(b, hi)
-		}
-	}
-	b.writeByte(']')
+	b.write(p.text)
 }
 func (p *regexclass) build(b *compactbuilds) { p.source(b) }
-
-func regexclass_rune(b *compactbuilds, r rune) {
-	if r == '\\' || r == ']' || r == '^' || r == '-' {
-		b.writeByte('\\')
-	}
-	b.writeRune(r)
-}
 
 // regexlit is a fast-path for exact string/rune matches.
 type regexlit struct { Value }
@@ -25857,7 +25870,13 @@ func ts(i any, o ...any) (s string) {
 	case     *original: content = x.o.String() + " " + _ts(x.Context)
 	case        Symbol: content = x.String() + " " + strconv.Itoa(int(x))
 	case       filemap: content = x.String()
+	case       *spaces: content = sf("%d", x.n)
 	case  *conjunction: return fmt.Sprintf("{%s %s %s}", t, _ts(&x.list), _ts(x.sep))
+	case  *regexrep:
+		var b compactbuilds
+		b.write(_ts(x.val))
+		x.formatRepetition(&b)
+		content = b.shared()
 	case resolve_result:
 		var obj string
 		if x.obj == nil { obj = "<nil>" } else { obj = _ts(x.obj) }
