@@ -11772,12 +11772,6 @@ func (p *compiler) punct() *punct {
 	return &punct{valbase{pos}, sym}
 }
 
-func (p *compiler) escape() *escaped {
-	v := &escaped{valbase{p.pos}, p.lit}
-	p.expect(ESCAPE)
-	return v
-}
-
 type is_strcomp_parser struct{}
 type parse_strcomp_ctx struct{ Context }
 func (p parse_strcomp_ctx) do(ctx Context, op any) (_ any) {
@@ -13039,12 +13033,102 @@ expr_loop:
 				elems = append(elems, &punct{valbase{c.pos}, symRangle})
 				c.step()
 			}
-			// Protect the angle bracket contents from the outer qualword
 			val = &compound{elements{elems}}
 			goto skip_step
 
+		// 🟢 NATIVE REGEX CAPTURING & GROUPING
+		case LPAREN:
+			loc := c.loc
+			c.step() // Eat '('
+			if isRegex {
+				capIdx := 1
+				var name, flags string
+				if c.tok == QUE {
+					c.step() // Eat '?'
+					if c.lit == "P" { // ?P<name>
+						c.step() // Eat P
+						if c.tok == LANGLE {
+							c.step() // Eat <
+							name = c.lit
+							c.step() // Eat name
+							if c.tok == RANGLE { c.step() } // Eat >
+						}
+					} else if c.tok == COLON { // ?:
+						capIdx = 0
+						c.step() // Eat :
+					} else { // (?flags) or (?flags:...)
+						flags = c.lit
+						capIdx = 0
+						c.step() // Eat flags
+						if c.tok == COLON { c.step() } // Eat :
+					}
+				}
+				var inner Value
+				if c.tok != RPAREN { inner = c.expr() }
+				if c.tok == RPAREN { c.step() }
+				val = &regexgroup{valbase{loc}, capIdx, name, flags, inner}
+			} else {
+				val = c.expr()
+				if c.tok == RPAREN { c.step() }
+			}
+			// Push node cleanly without double-stepping via skip_step!
+			c.ops = append(c.ops, opRet)
+			c.operands = append(c.operands, val)
+			execute()
+			continue expr_loop
+
+		// 🟢 NATIVE REGEX ESCAPES
+		case ESCAPE:
+			if isRegex {
+				switch lit {
+				case `d`, `D`, `s`, `S`, `w`, `W`:
+					val = &regexnamedclass{valbase{c.loc}, lit[1:], regexClassPerl, lit[1] <= 'Z'}
+					goto skip_step
+				case `b`: val = &regexmeta{valbase{c.loc}, regex_syntax.OpWordBoundary}; goto skip_step
+				case `B`: val = &regexmeta{valbase{c.loc}, regex_syntax.OpNoWordBoundary}; goto skip_step
+				case `A`: val = &regexmeta{valbase{c.loc}, regex_syntax.OpBeginText}; goto skip_step
+				case `z`: val = &regexmeta{valbase{c.loc}, regex_syntax.OpEndText}; goto skip_step
+				case `p`, `P`:
+					loc := c.loc
+					negated := lit == `P`
+					c.step() // Eat \p
+					var class string
+					if c.tok == LBRACE {
+						c.step() // Eat {
+						class = c.lit
+						c.step() // Eat class name
+						if c.tok == RBRACE { c.step() } // Eat }
+					} else {
+						class = c.lit
+						c.step()
+					}
+					val = &regexnamedclass{valbase{loc}, class, regexClassUnicode, negated}
+					// Push node cleanly without double-stepping!
+					c.ops = append(c.ops, opRet)
+					c.operands = append(c.operands, val)
+					execute()
+					continue expr_loop
+				case `Q`:
+					loc := c.loc
+					c.step() // Eat \Q
+					var b strings.Builder
+					for c.tok != EOF && c.tok != ESCAPE && c.lit != `E` {
+						b.WriteString(c.lit)
+						c.step()
+					}
+					if c.lit == `E` { c.step() } // Eat \E
+					val = &regexquote{valbase{loc}, b.String()}
+					c.ops = append(c.ops, opRet)
+					c.operands = append(c.operands, val)
+					execute()
+					continue expr_loop
+				}
+			}
+			val = &escaped{valbase{c.loc}, c.lit}
+			c.expect(ESCAPE)
+			goto skip_step
+
 		case STRCOMP: val = c.strcomp(); goto skip_step
-		case ESCAPE: val = c.escape(); goto skip_step
 		case LBRACE:
 			val = c.braced()
 			if rep, ok := val.(*regexrep); ok && rep != nil {
@@ -13079,7 +13163,7 @@ expr_loop:
 			val = c.punct()
 			goto skip_step
 		case HASH:
-			if truly(c.Context, is_url_parser{}) { goto skip_step } // 🟢 Bypass push
+			if truly(c.Context, is_url_parser{}) { goto skip_step } // Bypass push
 			break expr_loop // Normal expressions break at comments!
 
 		default:
@@ -13251,13 +13335,14 @@ expr_loop:
 			}
 			break expr_loop
 
-		// 🟢 FIXME: Arrow selection (untested).
 		case SELECT_PROP, SELECT_PROG1, SELECT_PROG2:
 			c.step()
 			if c.frames[fi].ctor == opRet {
 				c.frames[fi].ctor = opCompound
 			}
-			c.ops = append(c.ops, opResolve, opSwap, opIdent, opSwap, opFrame, opReduce)
+			c.ops = append(c.ops, opReduce)
+			execute()
+			c.ops = append(c.ops, opResolve, opSwap, opIdent, opSwap, opFrame)
 			c.operands = append(c.operands, c.tok, 1, 1, 1, opSelect)
 			execute()
 			continue
