@@ -13184,6 +13184,14 @@ expr_loop:
 
 	skip_step:
 		if val != nil {
+			fi := len(c.frames) - 1
+			// Automatically open an inner frame for contiguous segment tokens!
+			if c.frames[fi].ctor == opPath || c.frames[fi].ctor == opURL || c.frames[fi].ctor == opQualword {
+				c.ops = append(c.ops, opFrame)
+				c.operands = append(c.operands, 0, opCompound)
+				execute()
+			}
+
 			c.ops = append(c.ops, opRet)
 			c.operands = append(c.operands, val)
 			execute()
@@ -13221,8 +13229,13 @@ expr_loop:
 				c.operands = append(c.operands, 1, opQualword)
 				execute()
 			} else if c.frames[fi].ctor != opQualword {
-				c.ops = append(c.ops, opFrame, opReduce)
-				c.operands = append(c.operands, 1, opQualword)
+				// If the parent frame is ALREADY opQualword, just reduce the segment!
+				if fi > 0 && c.frames[fi-1].ctor == opQualword {
+					c.ops = append(c.ops, opReduce)
+				} else {
+					c.ops = append(c.ops, opFrame, opReduce)
+					c.operands = append(c.operands, 1, opQualword)
+				}
 				execute()
 			}
 			continue
@@ -13236,11 +13249,12 @@ expr_loop:
 					fi = len(c.frames) - 1
 				}
 				if c.frames[fi].ctor == opURL {
-					c.ops = append(c.ops, opFrame)
-					c.operands = append(c.operands, 0, opPath) // Start of URL Path: Pull 0
-					execute()
 					c.ops = append(c.ops, opRet)
 					c.operands = append(c.operands, &punct{valbase{c.loc}, symEmptyPrefix})
+
+					c.ops = append(c.ops, opFrame)
+					c.operands = append(c.operands, 0, opPath) // Start of URL Path: Pull 0
+
 					execute()
 					continue
 				}
@@ -13253,8 +13267,13 @@ expr_loop:
 				c.operands = append(c.operands, 1, opPath)
 				execute()
 			} else if c.frames[fi].ctor != opPath {
-				c.ops = append(c.ops, opFrame, opReduce)
-				c.operands = append(c.operands, 1, opPath)
+				// If the parent frame is ALREADY opPath, just reduce the segment!
+				if fi > 0 && c.frames[fi-1].ctor == opPath {
+					c.ops = append(c.ops, opReduce)
+				} else {
+					c.ops = append(c.ops, opFrame, opReduce)
+					c.operands = append(c.operands, 1, opPath)
+				}
 				execute()
 			}
 			continue
