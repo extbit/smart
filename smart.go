@@ -13053,7 +13053,16 @@ expr_loop:
 					var b compactbuilds
 					for c.tok != EOF {
 						if c.tok == ESCAPE && c.lit == `E` { break }
-						if c.tok == WORD { b.write(c.sym.String()) } else { b.write(c.lit) }
+						if c.tok == ESCAPE {
+							b.write(`\`)
+							b.write(c.lit)
+						} else if c.tok == WORD {
+							b.write(c.sym.String())
+						} else if c.lit == "" {
+							b.write(tok2sym[c.tok].String())
+						} else {
+							b.write(c.lit)
+						}
 						c.step()
 					}
 					if c.tok == ESCAPE && c.lit == `E` { c.step() } // Eat \E
@@ -13090,6 +13099,7 @@ expr_loop:
 			if isRegex {
 				loc := c.loc
 				var b compactbuilds
+				b.setRaw(true)
 				b.write("[")
 				c.step() // Eat '['
 
@@ -13115,53 +13125,24 @@ expr_loop:
 						val = &regexclass{valbase{loc}, ss, parseRegexClass(ss)}
 						goto single_token_done
 					}
-					
-					switch c.tok {
-					case LBOT_CORNER: // ⌞
-						b.write("[:")
-						inPosix = true
-					case RBOT_CORNER: // ⌟
-						b.write(":]")
-						inPosix = false
-					case CARET: b.write("^")
-					case MINUS: b.write("-")
-					case LBRACK: b.write("[")
-					case COLON: 
-						b.write(":")
-						if strings.HasSuffix(b.shared(), "[:") {
-							inPosix = true
-						}
-					case DOT: b.write(".")
-					case PLUS: b.write("+")
-					case SAST: b.write("*")
-					case QUE: b.write("?")
-					case BAR: b.write("|")
-					case LPAREN: b.write("(")
-					case RPAREN: b.write(")")
-					case LBRACE: b.write("{")
-					case RBRACE: b.write("}")
-					case COMMA: b.write(",")
-					case AT: b.write("@")
-					case HASH: b.write("#")
-					case TILDE: b.write("~")
-					case PCON: b.write("/")
-					case PROOT: b.write("//")
-					case PTAIL: b.write("/$")
-					case DOTDOT: b.write("..")
-					case LANGLE: b.write("<")
-					case RANGLE: b.write(">")
-					case SPACE: b.write(" ")
-					case REGEX_EOT: b.write("$")
-					case ESCAPE:
+
+					// 🟢 Write the token first
+					if c.tok == ESCAPE {
 						b.write(`\`)
-						b.write(c.lit) // The unslashed literal is restored precisely
-					case WORD:
-						b.write(c.sym.String())
-					case RAW, STRING, INTEGER, FLOATING, HEXADECIMAL, OCTAL, BINARY:
 						b.write(c.lit)
-					default:
-						if c.lit != "" { b.write(c.lit) }
+					} else if c.tok == WORD {
+						b.write(c.sym.String())
+					} else if c.lit == "" {
+						b.write(tok2sym[c.tok].String())
+					} else {
+						b.write(c.lit)
 					}
+
+					// 🟢 Detect POSIX Boundaries AFTER writing
+					if c.tok == LBOT_CORNER { inPosix = true }
+					if c.tok == RBOT_CORNER { inPosix = false }
+					if c.tok == COLON && strings.HasSuffix(b.shared(), "[:") { inPosix = true }
+
 					c.step()
 				}
 				ss := b.shared()
@@ -21765,13 +21746,15 @@ func (p *regexmeta) String() string {
 	return b.shared()
 }
 func (p *regexmeta) source(b *compactbuilds) {
-	// Source maps back to the canonical human-written representations
+	b.setRaw(true)
 	switch p.op {
-	case regex_syntax.OpBeginLine, regex_syntax.OpBeginText: b.writeByte('^')
-	case regex_syntax.OpEndLine, regex_syntax.OpEndText:     b.writeByte('$')
-	case regex_syntax.OpWordBoundary:                        b.write(`\b`)
-	case regex_syntax.OpNoWordBoundary:                      b.write(`\B`)
-	case regex_syntax.OpAnyCharNotNL, regex_syntax.OpAnyChar:b.writeByte('.')
+	case regex_syntax.OpBeginLine: b.writeByte('^')
+	case regex_syntax.OpBeginText: b.write(`\A`)
+	case regex_syntax.OpEndLine:   b.writeByte('$')
+	case regex_syntax.OpEndText:   b.write(`\z`)
+	case regex_syntax.OpWordBoundary:        b.write(`\b`)
+	case regex_syntax.OpNoWordBoundary:      b.write(`\B`)
+	case regex_syntax.OpAnyCharNotNL, regex_syntax.OpAnyChar: b.writeByte('.')
 	}
 }
 func (p *regexmeta) build(b *compactbuilds) {
