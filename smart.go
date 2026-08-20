@@ -9875,7 +9875,7 @@ const (
     KindObject
     KindKnownObject
     KindUndetermined
-    KindSkipped
+	KindSpaces
     KindSelf
     KindProject
     KindBuiltin
@@ -9950,7 +9950,7 @@ var kindNames = []struct {
 	{KindObject, "Object"},
 	{KindKnownObject, "KnownObject"},
 	{KindUndetermined, "Undetermined"},
-	{KindSkipped, "Skipped"},
+	{KindSpaces, "Spaces"},
 	{KindSelf, "Self"},
 	{KindProject, "Project"},
 	{KindBuiltin, "Builtin"},
@@ -10770,6 +10770,18 @@ func (p braced_ctx) do(ctx Context, op any) any {
 	return p.Context.do(ctx, op)
 }
 
+type braced_space_as_lit struct{}
+type braced_regex_ctx struct{ Context }
+func (p braced_regex_ctx) do(ctx Context, op any) (_ any) {
+	switch t := op.(type) {
+	case inner_cast: return p.Context
+	case dynamic_cast: return t.ctx(p, p.Context)
+	case braced_space_as_lit: return true
+	case is_regex_parser: return true
+	}
+	return p.Context.do(ctx, op)
+}
+
 func (p *compiler) braced() (x Value) {
 	if l_traverse.enabled { defer un(l_trace(l_traverse, "braced")) }
 
@@ -10898,12 +10910,39 @@ func (p *compiler) braced() (x Value) {
 		return &globbrace{*g}
 
 	case REGEX: // {regex ...}
-		return p.regex()
+		p.step() // Eat "regex"
+
+		var opts struct{
+			useSysRegex bool `sys-regex,sre,sr`
+		}
+		if p.tok == LPAREN {
+			if rest := p.optsGroup(&opts); rest != nil {
+				erro(pc(p,rest), "unknown regex options: %v", rest, unwind{})
+			}
+		}
+		if opts.useSysRegex { return p.regex() }
+
+		p.spaces()
+
+		rc := braced_regex_ctx{p.Context}
+		p.Context = rc
+		rx := p.expr()
+		p.Context = bc
+		p.expect(RBRACE)
+		return rx
 
 	case WORD:
 		switch p.sym {
 		case symR, symRe: // {r ...}, {re ...}
-			return p.regex()
+			p.step() // Eat "r" or "re"
+			p.spaces()
+
+			rc := braced_regex_ctx{p.Context}
+			p.Context = rc
+			rx := p.expr()
+			p.Context = bc
+			p.expect(RBRACE)
+			return rx
 
 		case symAuto: // {auto [(a=1, ...)] [list...]}
 			p.next(true) // consume 'auto'
@@ -11172,6 +11211,10 @@ func (p *compiler) opts(store any) []Value {
 		vals = append(vals, merge(p.expr())...)
 	}
 	return parseOpts(p, store, vals...)
+}
+
+func (p *compiler) optsGroup(store any) []Value {
+	return parseOpts(p, store, p.group().elems...)
 }
 
 type aware_token struct{ token }
@@ -12838,8 +12881,17 @@ expr_loop:
 		var val Value
 
 		switch c.tok {
-		case SPACE, LINEND, RPAREN, RBRACK, RBRACE, RBOT_CORNER, RTOP_CORNER, RANGLE, RCHEVRON, COMPOSED, SEMICOLON, EOF:
+		case LINEND, RPAREN, RBRACK, RBRACE, RBOT_CORNER, RTOP_CORNER, RANGLE, RCHEVRON, COMPOSED, SEMICOLON, EOF:
 			break expr_loop
+		case SPACE:
+			if truly(c.Context, braced_space_as_lit{}) {
+				sps := &spaces{c.loc, 1}
+				for c.step(); c.tok == SPACE; c.step() { sps.n++ }
+				val = sps
+				goto skip_step
+			} else {
+				break expr_loop
+			}
 		case COMMA:
 			if truly(c.Context, aware_token{COMMA}) { break expr_loop }
 			val = &punct{valbase{c.loc}, symComma}
@@ -12872,7 +12924,7 @@ expr_loop:
 								continue expr_loop
 							}
 						}
-						// Not `://`! Rewind scanner time natively[cite: 1].
+						// Not `://`! Rewind scanner time natively.
 						c.scanner.scanstate = snap
 					}
 				}
@@ -12960,7 +13012,7 @@ expr_loop:
 
 		case SAST, QUE, PLUS:
 			if tok == QUE && truly(c.Context, is_url_parser{}) {
-				goto skip_step // 🟢 Bypass push, let bottom switch handle it structurally
+				goto skip_step
 			}
 			if !isRegex {
 				if !isGlob { c.Context = oneshot_glob_expr_ctx{c.Context}; isGlob = true }
@@ -13000,23 +13052,14 @@ expr_loop:
 			val = valbase{c.loc}
 			c.frames[len(c.frames)-1].ctor = opPath
 
-		// 🟢 Group <atomic.h> securely inside a compound!
 		case LANGLE:
-			loc := c.loc
-			c.step()
-
-			inner := c.expr() // Recursively extract inner expression
-
-			var elems []Value
-			elems = append(elems, &punct{valbase{loc}, symLangle})
-			if inner != nil && !isNull(inner) {
-				elems = append(elems, inner)
-			}
+			elems := []Value{ &punct{valbase{c.loc}, symLangle} }
+			c.step() // Eat '<'
+			elems = append(elems, c.expr())
 			if c.tok == RANGLE {
 				elems = append(elems, &punct{valbase{c.pos}, symRangle})
 				c.step()
 			}
-
 			// Protect the angle bracket contents from the outer qualword
 			val = &compound{elements{elems}}
 			goto skip_step
@@ -13085,7 +13128,12 @@ expr_loop:
 		fi := len(c.frames)-1
 
 		switch c.tok {
-		case SPACE, LINEND, RPAREN, RBRACK, RBRACE, RBOT_CORNER, RTOP_CORNER, RANGLE, RCHEVRON, COMPOSED, SEMICOLON, EOF:
+		case LINEND, RPAREN, RBRACK, RBRACE, RBOT_CORNER, RTOP_CORNER, RANGLE, RCHEVRON, COMPOSED, SEMICOLON, EOF:
+			break expr_loop
+		case SPACE:
+			if truly(c.Context, braced_space_as_lit{}) {
+				break // Break switch, continue loop. The next iteration will parse it as a literal atom!
+			}
 			break expr_loop
 
 		case COMMA:
@@ -13105,7 +13153,6 @@ expr_loop:
 				c.operands = append(c.operands, 1, opQualword)
 				execute()
 			} else if c.frames[fi].ctor != opQualword {
-				// 🟢 FIX 4: Reduce contiguous compounds BEFORE pulling them!
 				c.ops = append(c.ops, opFrame, opReduce)
 				c.operands = append(c.operands, 1, opQualword)
 				execute()
@@ -13114,7 +13161,6 @@ expr_loop:
 
 		case PCON:
 			c.step()
-			// 🟢 URL Component boundaries must not pull hosts into paths
 			if truly(c.Context, is_url_parser{}) {
 				if c.frames[fi].ctor == opQualword || c.frames[fi].ctor == opURLAuth {
 					c.ops = append(c.ops, opReduce)
@@ -13146,7 +13192,6 @@ expr_loop:
 			continue
 
 		case MINUS:
-			// URLs frequently have hyphens in hosts and paths, treat as normal punct
 			if truly(c.Context, is_url_parser{}) {
 				val = &punct{valbase{c.pos}, symMinus}
 				c.step()
@@ -13178,11 +13223,9 @@ expr_loop:
 			}
 			continue
 
-		// 🟢 URL NATIVE COMPONENTS
 		case AT:
 			if truly(c.Context, is_url_parser{}) {
 				c.step() // Eat `@`
-				// Close subframes to return to opURL boundary
 				for c.frames[len(c.frames)-1].ctor != opURL {
 					c.ops = append(c.ops, opReduce)
 					execute()
@@ -13195,7 +13238,6 @@ expr_loop:
 		case QUE:
 			if truly(c.Context, is_url_parser{}) {
 				c.step() // Eat `?`
-				// 🟢 FIX 5: Only close INNER subframes (like Path/Qualword), leave opURL open!
 				for c.frames[len(c.frames)-1].ctor != opURL {
 					c.ops = append(c.ops, opReduce)
 					execute()
@@ -13209,7 +13251,6 @@ expr_loop:
 		case CLOSURE:
 			if truly(c.Context, is_url_query_parser{}) {
 				c.step() // Eat `&`
-				// Reduce active pair cleanly so the next key lands flatly on opURLQuery
 				if c.frames[fi].ctor == opPair || c.frames[fi].ctor == opCompound {
 					c.ops = append(c.ops, opReduce)
 					execute()
@@ -13219,7 +13260,6 @@ expr_loop:
 		case HASH:
 			if truly(c.Context, is_url_parser{}) {
 				c.step() // Eat `#`
-				// Close subframes to return to opURL boundary
 				for c.frames[len(c.frames)-1].ctor != opURL {
 					c.ops = append(c.ops, opReduce)
 					execute()
@@ -13238,9 +13278,7 @@ expr_loop:
 			if c.frames[fi].ctor == opRet {
 				c.frames[fi].ctor = opCompound
 			}
-			c.ops = append(c.ops, opReduce)
-			execute()
-			c.ops = append(c.ops, opResolve, opSwap, opIdent, opSwap, opFrame)
+			c.ops = append(c.ops, opResolve, opSwap, opIdent, opSwap, opFrame, opReduce)
 			c.operands = append(c.operands, c.tok, 1, 1, 1, opSelect)
 			execute()
 			continue
@@ -19521,6 +19559,11 @@ func (_ valbase) kind() Kind { return KindUnclassified }
 func (_ valbase) String() (_ string) { return }
 func (p valbase) Pos() Pos { return p.pos }
 
+type spaces struct{ pos Pos; n int }
+func (_ spaces) kind() Kind { return KindSpaces }
+func (p spaces) Pos() Pos { return p.pos }
+func (_ spaces) String() (_ string) { return }
+
 type loc struct{ Value ; pos Pos }
 func (l *loc) kind() Kind { return KindLoc }
 func (l *loc) Pos() Pos { return l.pos }
@@ -21234,7 +21277,6 @@ func (p *pair) String() (s string) {
 }
 
 type skipped struct{ Value }
-func (p skipped) kind() Kind { return p.Value.kind()|KindSkipped }
 
 type delegate struct{
     valbase
