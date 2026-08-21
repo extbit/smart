@@ -13081,7 +13081,7 @@ expr_loop:
 			if isRegex {
 				// 🟢 In Regex, `"` is just a literal character, we made it punct.
 				val = &punct{valbase{c.loc}, symQuotation}
-				c.scanner.pop(isStrcompString) // trun off strcomp scan to avoid `raw` scanning
+				c.scanner.pop(isStrcompString) // turn off strcomp scan to avoid `raw` scanning
 				break
 			} else {
 				val = c.strcomp()
@@ -13427,6 +13427,15 @@ expr_loop:
 	}
 
 	if x == nil { x = _null(c.pos) }
+
+	// 🟢 FIX: Regex Alternation (BAR) natively resolves as an Extbit `list`.
+	// Convert it back into the pure `regexalt` AST node seamlessly!
+	if isRegex {
+		if lst, ok := x.(*list); ok {
+			x = &regexalt{elements{lst.elems}}
+		}
+	}
+
 	if checkpoints { c.check_expr(x) }
 	return x
 }
