@@ -13186,10 +13186,10 @@ expr_loop:
 		if val != nil {
 			fi := len(c.frames) - 1
 
-			// 🟢 FIX: Automatically open an inner frame for contiguous segments,
-			// BUT explicitly exclude structural prefix markers from encapsulation!
+			// Automatically open an inner frame for contiguous segments,
+			// EXCLUSIVELY inside regex domains, and exclude structural prefix markers.
 			shouldCompound := false
-			if c.frames[fi].ctor == opPath || c.frames[fi].ctor == opURL || c.frames[fi].ctor == opQualword {
+			if isRegex && (c.frames[fi].ctor == opPath || c.frames[fi].ctor == opURL || c.frames[fi].ctor == opQualword) {
 				shouldCompound = true
 				switch val.(type) {
 				case valbase, *punct:
@@ -13199,13 +13199,12 @@ expr_loop:
 
 			if shouldCompound {
 				c.ops = append(c.ops, opFrame)
-				c.operands = append(c.operands, 0, opCompound) // Guarantee elements reduce to `Value`, not `[]Value` slice!
+				c.operands = append(c.operands, 0, opCompound) // Guarantee elements reduce to `Value`
 				execute()
 			}
 
 			c.ops = append(c.ops, opRet)
 			c.operands = append(c.operands, val)
-
 			execute()
 		}
 
@@ -13234,6 +13233,13 @@ expr_loop:
 
 		case DOT:
 			c.step()
+
+			if isRegex && fi > 0 && c.frames[fi].ctor == opCompound {
+				c.ops = append(c.ops, opReduce)
+				execute()
+				fi = len(c.frames) - 1
+			}
+
 			if c.frames[fi].ctor == opRet {
 				c.frames[fi].ctor = opQualword
 			} else if c.frames[fi].ctor == opPath || c.frames[fi].ctor == opPair || c.frames[fi].ctor == opFlag || c.frames[fi].ctor == opURL {
@@ -13254,6 +13260,13 @@ expr_loop:
 
 		case PCON:
 			c.step()
+
+			if isRegex && fi > 0 && c.frames[fi].ctor == opCompound {
+				c.ops = append(c.ops, opReduce)
+				execute()
+				fi = len(c.frames) - 1
+			}
+
 			if truly(c.Context, is_url_parser{}) {
 				if c.frames[fi].ctor == opQualword || c.frames[fi].ctor == opURLAuth {
 					c.ops = append(c.ops, opReduce)
