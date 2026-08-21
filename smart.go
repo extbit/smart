@@ -13077,7 +13077,16 @@ expr_loop:
 			c.expect(ESCAPE)
 			goto skip_step
 
-		case STRCOMP: val = c.strcomp(); goto skip_step
+		case STRCOMP:
+			if isRegex {
+				// 🟢 In Regex, `"` is just a literal character, we made it punct.
+				val = &punct{valbase{c.loc}, symQuotation}
+				c.scanner.pop(isStrcompString) // trun off strcomp scan to avoid `raw` scanning
+				break
+			} else {
+				val = c.strcomp()
+				goto skip_step
+			}
 		case LBRACE:
 			val = c.braced()
 			if rep, ok := val.(*regexrep); ok && rep != nil {
