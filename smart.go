@@ -3001,8 +3001,8 @@ const (
 	// ============================================================================
 	opWalk
 	opCallback
-	opUnroll            // Unrolls a collection onto the stack dynamically
-	opUnrollRev         // Unrolls a collection onto the stack dynamically (reversed)
+	opForEach           // Unrolls a collection onto the stack dynamically
+	opForEachRev        // Unrolls a collection onto the stack dynamically (reversed)
 	opLoop              // Lazy stateful iterator for dynamic unrolling
 	opYieldSym          // Yields a scalar value into raw symbols on the tape
 
@@ -3010,13 +3010,20 @@ const (
 	// 4. PATTERN MATCHING (Symbol-Based NFA)
 	// Consumes target symbols from `s.tie` and leverages `s.backtracks` for forks.
 	// ============================================================================
-	opMatchExact        // Consumes a specific posym, string, or rune from `s.tie`
-	opMatchClass        // Consumes exactly 1 rune from `s.tie` satisfying a condition
-	opMatchAnchor       // Zero-width assertion (^, $, \b). Fails if unmet.
-	opMatchFork         // Splits execution (Alternation). Pushes Alt to backtracks, runs Primary.
-	opMatchRep          // Repetition Generator (*, +). Pushes loop/stop branches natively.
-	opMatchCapStart     // Marks the start of a capture group in `s.stems`
-	opMatchCapEnd       // Finalizes a capture group in `s.stems`
+	opMatch             // Consumes an exact string/rune from `s.tie` (L-to-R)
+	opMatchRev          // Consumes an exact string/rune from `s.tie` (R-to-L)
+	opMatchClass        // Consumes exactly 1 matching rune from `s.tie` (L-to-R)
+	opMatchClassRev     // Consumes exactly 1 matching rune from `s.tie` (R-to-L)
+	opMatchAnchor       // Zero-width assertion (^, $, \b)
+	opMatchAnchorRev    // Zero-width assertion (Reversed, flips BOF/EOF logic)
+	opMatchFork         // Pushes Alternate branch to backtracks, runs Primary natively
+	opMatchForkRev      // Pushes Reverse Alternate branch to backtracks
+	opMatchRep          // Repetition (*, +). Pushes loop/stop branches natively.
+	opMatchRepRev       // Repetition (*, +). Pushes Reverse loop/stop branches.
+	opMatchCapStart     // Marks the start of a capture group
+	opMatchCapStartRev  // Marks the start of a capture group (encountered LAST in reverse)
+	opMatchCapEnd       // Marks the end of a capture group
+	opMatchCapEndRev    // Marks the end of a capture group (encountered FIRST in reverse)
 
 	// ============================================================================
 	// 5. STRUCTURALIZE (Frame Stack Shift-Reduce)
@@ -3080,19 +3087,26 @@ var evalopNames = [...]string{
 	// 3. SYMBOLIZE
 	"opWalk",
 	"opCallback",
-	"opUnroll",
-	"opUnrollRev",
+	"opForEach",
+	"opForEachRev",
 	"opLoop",
 	"opYieldSym",
 
 	// 4. PATTERN MATCHING
-	"opMatchExact",
+	"opMatch",
+	"opMatchRev",
 	"opMatchClass",
+	"opMatchClassRev",
 	"opMatchAnchor",
+	"opMatchAnchorRev",
 	"opMatchFork",
+	"opMatchForkRev",
 	"opMatchRep",
+	"opMatchRepRev",
 	"opMatchCapStart",
+	"opMatchCapStartRev",
 	"opMatchCapEnd",
+	"opMatchCapEndRev",
 
 	// 5. STRUCTURALIZE
 	"opFrame",
@@ -3505,7 +3519,7 @@ _op_switch_:
 				// FIXME: needs to extend opIdent, opResolve(Closure), etc.
 			}
 			// If it's a list, unroll it into identifiers dynamically
-			s.ops = append(s.ops, opUnroll)
+			s.ops = append(s.ops, opForEach)
 			s.operands = append(s.operands, t, opIdent)
 			break _op_switch_ // Suspend current operation
 		default:
@@ -3619,44 +3633,56 @@ _op_switch_:
 			s.operands = append(s.operands, t)
 		}
 
-	case opUnroll:
+	case opForEach:
 		targetOp := s.operands[l-1].(evalop)
 		arg      := s.operands[l-2]
 		s.operands = s.operands[:l-2]
 
 		switch t := arg.(type) {
+		case []Value:
+			if len(t) == 0 { return }
+			s.ops = append(s.ops, opLoop)
+			s.operands = append(s.operands, &op_loop{t, 1, 0, len(t), targetOp, symEmpty})
+
 		case *list:
 			if len(t.elems) == 0 { return }
 			s.ops = append(s.ops, opLoop)
 			s.operands = append(s.operands, &op_loop{t.elems, 1, 0, len(t.elems), targetOp, symSpace})
 
-		// TODO: Maybe *array, *tuple, or other generic data collections that need spreading
-
-		case Value: // SCALAR OPTIMIZATION
+		case Value, loop_sep: // SCALAR OPTIMIZATION
 			s.ops = append(s.ops, targetOp)
 			s.operands = append(s.operands, t)
+
+		default:
+			erro(pc(s,arg), "VM execution trap: opForEach unexpected %T", arg, unwind{})
 		}
 
-	case opUnrollRev:
+	case opForEachRev:
 		targetOp := s.operands[l-1].(evalop)
 		arg      := s.operands[l-2]
 		s.operands = s.operands[:l-2]
 
 		switch t := arg.(type) {
+		case []Value:
+			if len(t) == 0 { return }
+			s.ops = append(s.ops, opLoop)
+			s.operands = append(s.operands, &op_loop{t, -1, len(t) - 1, -1, targetOp, symEmpty})
+
 		case *list:
 			if len(t.elems) == 0 { return }
 			s.ops = append(s.ops, opLoop)
 			s.operands = append(s.operands, &op_loop{t.elems, -1, len(t.elems) - 1, -1, targetOp, symSpace})
 
-		// TODO: Maybe *array, *tuple, or other generic data collections that need spreading
-
-		case Value: // SCALAR OPTIMIZATION
+		case Value, loop_sep: // SCALAR OPTIMIZATION
 			s.ops = append(s.ops, targetOp)
 			s.operands = append(s.operands, t)
+
+		default:
+			erro(pc(s,arg), "VM execution trap: opForEachRev unexpected %T", arg, unwind{})
 		}
 
 	case opExpand: // Designed for dynamic op (wrappers), e.g., opLoop.
-		s.ops = append(s.ops, opUnroll)
+		s.ops = append(s.ops, opForEach)
 		s.operands = append(s.operands, opEval)
 
 	case opEvalResult: // Natively pops the reduced AST (or unrolled slice) from s.results!
@@ -3704,7 +3730,7 @@ _op_switch_:
 			erro(pc(s, top), "VM execution trap: opEvalResult unexpected %T", top, unwind{})
 		}
 
-	case opEval: // Works with opUnroll to evaluate unrolled value!
+	case opEval: // Works with opForEach to evaluate unrolled value!
 		arg := s.operands[l-1]
 		s.operands = s.operands[:l-1]
 
@@ -3733,7 +3759,7 @@ _op_switch_:
 						s.ops = append(s.ops, opRet)
 						s.operands = append(s.operands, rr)
 					} else {
-						s.ops = append(s.ops, opResolve, opSwap, opIdent, opSwap, opUnroll)
+						s.ops = append(s.ops, opResolve, opSwap, opIdent, opSwap, opForEach)
 						s.operands = append(s.operands, t.l, 1, 1, t.x, opEval)
 					}
 				} else {
@@ -3795,7 +3821,7 @@ _op_switch_:
 					s.operands = append(s.operands, rr)
 				} else {
 					// FIXME: t.x can eval to N values, that case it leaks
-					s.ops = append(s.ops, opResolveClosure, opSwap, opIdent, opSwap, opUnroll)
+					s.ops = append(s.ops, opResolveClosure, opSwap, opIdent, opSwap, opForEach)
 					s.operands = append(s.operands, t.l, 1, 1, t.x, opEval)
 				}
 			} else {
@@ -3987,7 +4013,7 @@ _op_switch_:
 				s.ops = append(s.ops, opRestoreContext)
 				s.operands = append(s.operands, restore_context{s.Context})
 
-				s.ops = append(s.ops, opUnroll)
+				s.ops = append(s.ops, opForEach)
 				s.operands = append(s.operands, t.value, opEval)
 
 				de := &evoke_def_ctx{evocation{automatic{Context: s.Context, defs: make(def_map)}}, t}
@@ -4282,179 +4308,363 @@ _op_switch_:
 	// ============================================================================
 	// 4. PATTERN MATCHING (Symbol-Based NFA)
 	// ============================================================================
-	case opMatchExact:
+
+	// ----------------------------------------------------------------------------
+	// FORWARD INSTRUCTION SET (Left-to-Right)
+	// ----------------------------------------------------------------------------
+	case opMatch:
 		val := s.operands[l-1].(Value)
 		s.operands = s.operands[:l-1]
-		if !s.tie.consumeExact(val, s.class&clsReverse != 0) {
-			if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
+
+		switch t := val.(type) {
+		case *compound:
+			// Unroll Left-to-Right: Push C, B, A -> Evaluated A, B, C
+			for i := len(t.elems) - 1; i >= 0; i-- {
+				s.ops = append(s.ops, opMatch)
+				s.operands = append(s.operands, t.elems[i])
+			}
+		case *regexgroup:
+			s.ops = append(s.ops, opMatchCapEnd, opMatch, opMatchCapStart)
+			s.operands = append(s.operands, t, t.val, t)
+		case *regexalt:
+			for i := len(t.elems) - 1; i > 0; i-- {
+				s.ops = append(s.ops, opMatchFork)
+				s.operands = append(s.operands, t.elems[i])
+			}
+			if len(t.elems) > 0 {
+				s.ops = append(s.ops, opMatch)
+				s.operands = append(s.operands, t.elems[0])
+			}
+		case *regexrep:
+			s.ops = append(s.ops, opMatchRep)
+			s.operands = append(s.operands, &match_rep_iter{
+				min: t.min, max: t.max, count: 0, greedy: t.greedy, payload: t.val,
+			})
+		case *regexclass, *regexnamedclass:
+			s.ops = append(s.ops, opMatchClass)
+			s.operands = append(s.operands, t)
+		case *regexmeta:
+			s.ops = append(s.ops, opMatchAnchor)
+			s.operands = append(s.operands, t)
+		default:
+			var str string
+			switch leaf := val.(type) {
+			case *word:       str = leaf.s.String()
+			case *punct:      str = leaf.s.String()
+			case *raw:        str = leaf.s
+			case *escaped:    str = leaf.s
+			case *strlit:     str = leaf.s
+			case *regexquote: str = leaf.text
+			default: erro(s.Context, "unsupported regex unroll node: %T", val, unwind{})
+			}
+
+			if str == "" { break _op_switch_ }
+
+			// Replenish tape if empty
+			if len(s.vmhead.str) == 0 {
+				if !s.ensure_syms() || len(s.syms) == 0 {
+					if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
+					break _op_switch_
+				}
+				s.vmhead.loc = s.syms[0].Pos
+				s.vmhead.str = s.syms[0].String()
+				s.syms = s.syms[1:]
+			}
+
+			// ZERO-LOOP EXACT CONSUMPTION
+			if strings.HasPrefix(s.vmhead.str, str) {
+				s.vmhead.str = s.vmhead.str[len(str):]
+				if len(s.vmhead.str) > 0 { s.vmhead.loc += Pos(len(str)) }
+			} else if strings.HasPrefix(str, s.vmhead.str) {
+				rem := str[len(s.vmhead.str):]
+				s.vmhead.str = ""
+				s.ops = append(s.ops, opMatch) // Push remaining exact match as an intermediate literal
+				s.operands = append(s.operands, &raw{valbase{s.vmhead.loc}, rem})
+			} else {
+				if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
+			}
 		}
 
 	case opMatchClass:
 		classNode := s.operands[l-1].(Value)
 		s.operands = s.operands[:l-1]
-		if !s.tie.consumeClass(classNode, s.class&clsReverse != 0) {
+
+		if len(s.vmhead.str) == 0 {
+			if !s.ensure_syms() || len(s.syms) == 0 {
+				if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
+				break _op_switch_
+			}
+			s.vmhead.loc = s.syms[0].Pos
+			s.vmhead.str = s.syms[0].String()
+			s.syms = s.syms[1:]
+		}
+
+		r, size := utf8.DecodeRuneInString(s.vmhead.str)
+		matched := false
+
+		switch t := classNode.(type) {
+		case *regexclass:
+			for i := 0; i < len(t.runes); i += 2 {
+				if r >= t.runes[i] && r <= t.runes[i+1] { matched = true; break }
+			}
+		case *regexnamedclass:
+			for i := 0; i < len(t.runes); i += 2 {
+				if r >= t.runes[i] && r <= t.runes[i+1] { matched = true; break }
+			}
+		case *regexmeta:
+			if t.op == regex_syntax.OpAnyCharNotNL { matched = (r != '\n') }
+			if t.op == regex_syntax.OpAnyChar { matched = true }
+		case *globmeta:
+			if t.sym == symQues { matched = (r != '/') } else { matched = true }
+		}
+
+		if matched {
+			s.vmhead.str = s.vmhead.str[size:]
+			if len(s.vmhead.str) > 0 { s.vmhead.loc += Pos(size) }
+		} else {
 			if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
 		}
 
 	case opMatchAnchor:
 		anchor := s.operands[l-1].(*regexmeta)
 		s.operands = s.operands[:l-1]
-		if !s.tie.checkAnchor(anchor.op, s.class&clsReverse != 0) {
+
+		atEOF := s.exhausted() && len(s.vmhead.str) == 0 && len(s.syms) == 0
+		atBOF := len(s.syms) == 0 && s.opsDone < 10 // FIXME: Implement precise global BOF tracking
+
+		matched := false
+		switch anchor.op {
+		case regex_syntax.OpBeginLine, regex_syntax.OpBeginText: matched = atBOF
+		case regex_syntax.OpEndLine, regex_syntax.OpEndText:     matched = atEOF
+		case regex_syntax.OpWordBoundary, regex_syntax.OpNoWordBoundary: matched = true // TODO: Word Bounds
+		}
+
+		if !matched {
 			if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
 		}
 
 	case opMatchFork:
-		// opMatchFork expects the Alternate branch on the stack.
-		// (The Primary branch should already be unrolled prior to this op).
 		alt := s.operands[l-1]
 		s.operands = s.operands[:l-1]
-
-		// 1. Snapshot the universe (Tape, Stems, and Errors)
 		bt := s.checkpoint(undoTape | undoStems | undoErr | undoHead)
-
-		// 2. Set the alternate timeline instructions
-		// When the VM unwinds here, it will unroll the 'alt' node to match.
-		bt.altOps = []evalop{opUnroll}
-		bt.altOpn = []any{alt, opEval} // e.g., Unroll `alt` and Evaluate it
-
-		// 3. Register the backtrack fork
+		bt.altOps = []evalop{opMatch}
+		bt.altOpn = []any{alt}
 		s.backtracks = append(s.backtracks, bt)
 
-		// The VM naturally continues executing the Primary branch!
-
 	case opMatchRep:
-		// We use a stateful iterator struct for repetitions, just like opLoop!
-		// Expected on stack: *match_rep_iter { min, max, count, greedy, payload }
 		iter := s.operands[l-1].(*match_rep_iter)
-
 		if iter.max != -1 && iter.count >= iter.max {
-			// Max reached. Force STOP.
 			s.operands = s.operands[:l-1]
 			break _op_switch_
 		}
-
 		iter.count++
-
-		// Create the alternate timeline
 		bt := s.checkpoint(undoTape | undoStems | undoErr | undoHead)
 
 		if iter.greedy {
-			// GREEDY: Active = Loop, Alternate = Stop
-			bt.altOps = []evalop{} // Stop means do nothing, just let VM continue!
+			bt.altOps = []evalop{}
 			bt.altOpn = []any{}
-
-			// Push Loop to active stack (Execute Payload, then opMatchRep again)
-			s.ops = append(s.ops, opMatchRep, opEval)
-			s.operands = append(s.operands, iter.payload) // payload evaluates to match ops
+			s.ops = append(s.ops, opMatchRep, opMatch)
+			s.operands = append(s.operands, iter.payload)
 		} else {
-			// RELUCTANT: Active = Stop, Alternate = Loop
-			bt.altOps = []evalop{opMatchRep, opEval}
+			bt.altOps = []evalop{opMatchRep, opMatch}
 			bt.altOpn = []any{iter, iter.payload}
-
-			// Active stack does nothing (Stop looping and continue pattern)
 			s.operands = s.operands[:l-1]
 		}
-
 		s.backtracks = append(s.backtracks, bt)
 
-	case opMatchCapStart:
-		// Mark the start of a capture group using the current tape offset
-		// TODO: Calculate current byte offset from `s.tie` and push to `s.stems`
+	// ----------------------------------------------------------------------------
+	// REVERSE INSTRUCTION SET (Right-to-Left)
+	// ----------------------------------------------------------------------------
+	case opMatchRev:
+		val := s.operands[l-1].(Value)
+		s.operands = s.operands[:l-1]
 
-	case opMatchCapEnd:
-		// Mark the end of the most recent open capture group in `s.stems`
-		// TODO: Finalize the byte offset for the active stem
+		switch t := val.(type) {
+		case *compound:
+			// Unroll Right-to-Left: Push A, B, C -> Evaluated C, B, A
+			for i := 0; i < len(t.elems); i++ {
+				s.ops = append(s.ops, opMatchRev)
+				s.operands = append(s.operands, t.elems[i])
+			}
+		case *regexgroup:
+			s.ops = append(s.ops, opMatchCapStartRev, opMatchRev, opMatchCapEndRev)
+			s.operands = append(s.operands, t, t.val, t)
+		case *regexalt:
+			for i := len(t.elems) - 1; i > 0; i-- {
+				s.ops = append(s.ops, opMatchForkRev)
+				s.operands = append(s.operands, t.elems[i])
+			}
+			if len(t.elems) > 0 {
+				s.ops = append(s.ops, opMatchRev)
+				s.operands = append(s.operands, t.elems[0])
+			}
+		case *regexrep:
+			s.ops = append(s.ops, opMatchRepRev)
+			s.operands = append(s.operands, &match_rep_iter{
+				min: t.min, max: t.max, count: 0, greedy: t.greedy, payload: t.val,
+			})
+		case *regexclass, *regexnamedclass:
+			s.ops = append(s.ops, opMatchClassRev)
+			s.operands = append(s.operands, t)
+		case *regexmeta:
+			s.ops = append(s.ops, opMatchAnchorRev)
+			s.operands = append(s.operands, t)
+		default:
+			var str string
+			switch leaf := val.(type) {
+			case *word:       str = leaf.s.String()
+			case *punct:      str = leaf.s.String()
+			case *raw:        str = leaf.s
+			case *escaped:    str = leaf.s
+			case *strlit:     str = leaf.s
+			case *regexquote: str = leaf.text
+			default: erro(s.Context, "unsupported regex unroll node: %T", val, unwind{})
+			}
 
-	case opDebug:
-		var trace string
-		var extra []any
-		if t, ok := s.operands[l-1].(tracked_stub); ok {
-			trace, extra = string(t.trace), t.args
+			if str == "" { break _op_switch_ }
+
+			// Replenish tape from the END if empty
+			if len(s.vmhead.str) == 0 {
+				if !s.ensure_syms() || len(s.syms) == 0 {
+					if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
+					break _op_switch_
+				}
+				lastIdx := len(s.syms) - 1
+				s.vmhead.loc = s.syms[lastIdx].Pos
+				s.vmhead.str = s.syms[lastIdx].String()
+				s.syms = s.syms[:lastIdx]
+			}
+
+			// ZERO-LOOP EXACT CONSUMPTION (REVERSE)
+			if strings.HasSuffix(s.vmhead.str, str) {
+				s.vmhead.str = s.vmhead.str[:len(s.vmhead.str)-len(str)]
+			} else if strings.HasSuffix(str, s.vmhead.str) {
+				rem := str[:len(str)-len(s.vmhead.str)]
+				s.vmhead.str = ""
+				s.ops = append(s.ops, opMatchRev) // Push remaining exact match as an intermediate literal
+				s.operands = append(s.operands, &raw{valbase{s.vmhead.loc}, rem})
+			} else {
+				if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
+			}
+		}
+
+	case opMatchClassRev:
+		classNode := s.operands[l-1].(Value)
+		s.operands = s.operands[:l-1]
+
+		if len(s.vmhead.str) == 0 {
+			if !s.ensure_syms() || len(s.syms) == 0 {
+				if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
+				break _op_switch_
+			}
+			lastIdx := len(s.syms) - 1
+			s.vmhead.loc = s.syms[lastIdx].Pos
+			s.vmhead.str = s.syms[lastIdx].String()
+			s.syms = s.syms[:lastIdx]
+		}
+
+		r, size := utf8.DecodeLastRuneInString(s.vmhead.str)
+		matched := false
+
+		switch t := classNode.(type) {
+		case *regexclass:
+			for i := 0; i < len(t.runes); i += 2 {
+				if r >= t.runes[i] && r <= t.runes[i+1] { matched = true; break }
+			}
+		case *regexnamedclass:
+			for i := 0; i < len(t.runes); i += 2 {
+				if r >= t.runes[i] && r <= t.runes[i+1] { matched = true; break }
+			}
+		case *regexmeta:
+			if t.op == regex_syntax.OpAnyCharNotNL { matched = (r != '\n') }
+			if t.op == regex_syntax.OpAnyChar { matched = true }
+		case *globmeta:
+			if t.sym == symQues { matched = (r != '/') } else { matched = true }
+		}
+
+		if matched {
+			s.vmhead.str = s.vmhead.str[:len(s.vmhead.str)-size]
+		} else {
+			if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
+		}
+
+	case opMatchAnchorRev:
+		anchor := s.operands[l-1].(*regexmeta)
+		s.operands = s.operands[:l-1]
+
+		atEOF := s.exhausted() && len(s.vmhead.str) == 0 && len(s.syms) == 0
+		atBOF := len(s.syms) == 0 && s.opsDone < 10
+
+		matched := false
+		switch anchor.op {
+		case regex_syntax.OpBeginLine, regex_syntax.OpBeginText: matched = atEOF // FLIPPED
+		case regex_syntax.OpEndLine, regex_syntax.OpEndText:     matched = atBOF // FLIPPED
+		case regex_syntax.OpWordBoundary, regex_syntax.OpNoWordBoundary: matched = true // TODO: Word Bounds
+		}
+
+		if !matched {
+			if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
+		}
+
+	case opMatchForkRev:
+		alt := s.operands[l-1]
+		s.operands = s.operands[:l-1]
+		bt := s.checkpoint(undoTape | undoStems | undoErr | undoHead)
+		bt.altOps = []evalop{opMatchRev}
+		bt.altOpn = []any{alt}
+		s.backtracks = append(s.backtracks, bt)
+
+	case opMatchRepRev:
+		iter := s.operands[l-1].(*match_rep_iter)
+		if iter.max != -1 && iter.count >= iter.max {
+			s.operands = s.operands[:l-1]
+			break _op_switch_
+		}
+		iter.count++
+		bt := s.checkpoint(undoTape | undoStems | undoErr | undoHead)
+
+		if iter.greedy {
+			bt.altOps = []evalop{}
+			bt.altOpn = []any{}
+			s.ops = append(s.ops, opMatchRepRev, opMatchRev)
+			s.operands = append(s.operands, iter.payload)
+		} else {
+			bt.altOps = []evalop{opMatchRepRev, opMatchRev}
+			bt.altOpn = []any{iter, iter.payload}
 			s.operands = s.operands[:l-1]
 		}
+		s.backtracks = append(s.backtracks, bt)
 
-		var format compactbuilds
-		format.setRaw(true)
+	// ----------------------------------------------------------------------------
+	// CAPTURE GROUPS (Placeholders)
+	// ----------------------------------------------------------------------------
+	case opMatchCapStart, opMatchCapStartRev:
+		g := s.operands[l-1].(*regexgroup) // 🟢 Pop the group!
+		s.operands = s.operands[:l-1]
 
-		var pos Pos
-		var args []any
-		var isRes bool
-		var val = s.operands[l-2]
-
-	_query_pos:
-		if pos == NoPos && val != nil {
-			switch t := val.(type) {
-			case posym: pos = t.Pos // Extract Pos natively
-			case Pos: pos = t
-			case Value: pos = t.Pos()
-			case []Value: if len(t) > 0 { pos = t[0].Pos() }
-			}
-		}
-		if pos == NoPos && !isRes && rl > 0 {
-			val, isRes = s.results[rl-1], true
-			goto _query_pos
+		if false {
+			s.ops = append(s.ops, opDebug)
+			s.operands = append(s.operands, track(_f("CapStart: %v", g), callstack{num:3}))
 		}
 
-		if p, ok := do(s.Context, get_fatpos{pos}).(Position); ok && p.valid() {
-			format.write("%s:%d:")
-			args = append(args, p.Filename, p.Line)
-			if p.Column > 0 {
-				format.write("%d:")
-				args = append(args, p.Column)
-			}
+		// TODO: Calculate current byte offset from `s.tie` and push to `s.stems`
+
+	case opMatchCapEnd, opMatchCapEndRev:
+		g := s.operands[l-1].(*regexgroup) // 🟢 Pop the group!
+		s.operands = s.operands[:l-1]
+
+		if false {
+			s.ops = append(s.ops, opDebug)
+			s.operands = append(s.operands, track(_f("CapEnd: %v", g), callstack{num:3}))
 		}
 
-		format.write("[%s] VM Tick: %d\n")
-		args = append(args, "VALUE", s.opsDone)
+		// TODO: Finalize the byte offset for the active stem
 
-		if err, ok := val.(error); ok && err != nil {
-			s.err = err
-			s.operands = s.operands[:l-2]
-			args[0] = "ERROR"
-			format.write("  Error      : %v\n")
-			args = append(args, err)
-		} else if val == nil {
-			args[0] = "<nil-value>"
-		} else {
-			format.write("  Value Type : %T\n  Value      : %v\n")
-			args = append(args, val, val)
-
-			if v, isAstNode := val.(Value); isAstNode && !isNull(v) {
-				format.write("  AST Dump   : %s\n")
-				args = append(args, ts(v, s.Context))
-			}
-			if d, isDef := val.(*def); isDef {
-				format.write("  Def Value  : %s\n")
-				args = append(args, ts(d.value, s.Context))
-			}
-		}
-
-		format.write("  Ops        : %v")
-		args = append(args, s.ops)
-
-		if len(s.operands) <= 10 {
-			format.write("\n  Operands   : %v")
-			args = append(args, s.operands)
-		} else {
-			n := len(s.operands)-10
-			format.write("\n  Operands   : (... skip %d elements) %v %T")
-			args = append(args, n, s.operands[n:], s.operands[len(s.operands)-1])
-		}
-
-		if val == nil && rl == 0 {
-			format.write("\n%s")
-			args = append(args, trace)
-		} else {
-			format.write("\n  Results    : %v\n%s")
-			args = append(args, s.results, trace)
-		}
-
-		args = append(args, extra...)
-		prompt(s.Context, format.shared(), args...)
-
-	case opEnd:
-		s.err = io.EOF
-
+	// ============================================================================
+	// Debug with track; EOF.
+	// ============================================================================
+	case opDebug: s.opDebug(l, rl)
+	case opEnd: s.err = io.EOF
 	default:
 		erro(s, "VM execution trap: unimplemented op: %v", op, unwind{})
 	}
@@ -4645,131 +4855,97 @@ func (s *symstr) pop_head() posym {
 	return ps
 }
 
-// consumeExact attempts to consume an exact string sequence from the VM's target tape.
-func (s *symstr) consumeExact(val Value, reverse bool) bool {
-	str := __string(s.Context, val)
-	if str == "" { return true }
+func (s *symstr) opDebug(l, rl int) {
+	var trace string
+	var extra []any
+	if t, ok := s.operands[l-1].(*tracked_stub); ok {
+		trace, extra = string(t.trace), t.args
+		s.operands = s.operands[:l-1]
+	}
 
-	if !reverse {
-		for len(str) > 0 {
-			// 1. Replenish the buffer if empty
-			if len(s.vmhead.str) == 0 {
-				if !s.ensure_syms() || len(s.syms) == 0 { return false }
-				s.vmhead.loc = s.syms[0].Pos
-				s.vmhead.str = s.syms[0].String()
-				s.syms = s.syms[1:]
-			}
+	var format compactbuilds
+	format.setRaw(true)
 
-			// 2. Consume matching prefix
-			if strings.HasPrefix(s.vmhead.str, str) {
-				s.vmhead.str = s.vmhead.str[len(str):]
-				if len(s.vmhead.str) > 0 { s.vmhead.loc += Pos(len(str)) }
-				return true
-			} else if strings.HasPrefix(str, s.vmhead.str) {
-				str = str[len(s.vmhead.str):]
-				s.vmhead.str = ""
-			} else {
-				return false // Mismatch
-			}
+	var pos Pos
+	var args []any
+	var isRes bool
+	var val any
+	if l = len(s.operands); l > 0 { val = s.operands[l-1] }
+
+_query_pos:
+	if pos == NoPos && val != nil {
+		switch t := val.(type) {
+		case posym: pos = t.Pos // Extract Pos natively
+		case Pos: pos = t
+		case Value: pos = t.Pos()
+		case []Value: if len(t) > 0 { pos = t[0].Pos() }
 		}
+	}
+	if pos == NoPos && !isRes && rl > 0 {
+		val, isRes = s.results[rl-1], true
+		goto _query_pos
+	}
+
+	if p, ok := do(s.Context, get_fatpos{pos}).(Position); ok && p.valid() {
+		format.write("%s:%d:")
+		args = append(args, p.Filename, p.Line)
+		if p.Column > 0 {
+			format.write("%d:")
+			args = append(args, p.Column)
+		}
+	}
+
+	format.write("[%s] VM Tick: %d\n")
+	args = append(args, "VALUE", s.opsDone)
+
+	if err, ok := val.(error); ok && err != nil {
+		s.err = err
+		s.operands = s.operands[:l-2]
+		args[0] = "ERROR"
+		format.write("  Error      : %v\n")
+		args = append(args, err)
+	} else if val == nil {
+		args[0] = "<nil-value>"
 	} else {
-		for len(str) > 0 {
-			// 1. Replenish the buffer from the END of the tape
-			if len(s.vmhead.str) == 0 {
-				if !s.ensure_syms() || len(s.syms) == 0 { return false }
-				lastIdx := len(s.syms) - 1
-				s.vmhead.loc = s.syms[lastIdx].Pos
-				s.vmhead.str = s.syms[lastIdx].String()
-				s.syms = s.syms[:lastIdx]
-			}
+		format.write("  Value Type : %T\n  Value      : %v\n")
+		args = append(args, val, val)
 
-			// 2. Consume matching suffix
-			if strings.HasSuffix(s.vmhead.str, str) {
-				s.vmhead.str = s.vmhead.str[:len(s.vmhead.str)-len(str)]
-				return true
-			} else if strings.HasSuffix(str, s.vmhead.str) {
-				str = str[:len(str)-len(s.vmhead.str)]
-				s.vmhead.str = ""
-			} else {
-				return false // Mismatch
-			}
+		if v, isAstNode := val.(Value); isAstNode && !isNull(v) {
+			format.write("  AST Dump   : %s\n")
+			args = append(args, ts(v, s.Context))
 		}
-	}
-	return true
-}
-
-// consumeClass attempts to consume exactly one rune from the tape that satisfies the AST node.
-func (s *symstr) consumeClass(classNode Value, reverse bool) bool {
-	// 1. Replenish the buffer if empty
-	if len(s.vmhead.str) == 0 {
-		if !s.ensure_syms() || len(s.syms) == 0 { return false }
-		if !reverse {
-			s.vmhead.loc = s.syms[0].Pos
-			s.vmhead.str = s.syms[0].String()
-			s.syms = s.syms[1:]
-		} else {
-			lastIdx := len(s.syms) - 1
-			s.vmhead.loc = s.syms[lastIdx].Pos
-			s.vmhead.str = s.syms[lastIdx].String()
-			s.syms = s.syms[:lastIdx]
+		if d, isDef := val.(*def); isDef {
+			format.write("  Def Value  : %s\n")
+			args = append(args, ts(d.value, s.Context))
 		}
 	}
 
-	var r rune
-	var size int
+	format.write("  Ops        : %v")
+	args = append(args, s.ops)
 
-	// 2. Decode exactly one rune
-	if !reverse {
-		r, size = utf8.DecodeRuneInString(s.vmhead.str)
-		s.vmhead.str = s.vmhead.str[size:]
-		if len(s.vmhead.str) > 0 { s.vmhead.loc += Pos(size) }
+	if len(s.operands) <= 10 {
+		format.write("\n  Operands   : %v")
+		args = append(args, s.operands)
 	} else {
-		r, size = utf8.DecodeLastRuneInString(s.vmhead.str)
-		s.vmhead.str = s.vmhead.str[:len(s.vmhead.str)-size]
+		n := len(s.operands)-10
+		format.write("\n  Operands   : (... skip %d elements) %v %T")
+		args = append(args, n, s.operands[n:], s.operands[len(s.operands)-1])
 	}
 
-	// 3. Evaluate the rune against the class conditions
-	switch t := classNode.(type) {
-	case *regexnamedclass:
-		erro(s, "TODO: unimplemented class match node: %s", t.class, unwind{})
-		return false
-	case *regexclass:
-		// Go's regexp syntax guarantees disjoint, positive, inclusive ranges [lo, hi]
-		for i := 0; i < len(t.runes); i += 2 {
-			if r >= t.runes[i] && r <= t.runes[i+1] { return true }
-		}
-		return false
-	case *regexmeta:
-		if t.op == regex_syntax.OpAnyCharNotNL { return r != '\n' }
-		if t.op == regex_syntax.OpAnyChar { return true }
-		return false
-	case *globmeta:
-		if t.sym == symQues { return r != '/' } // Glob '?' matches anything EXCEPT '/'
-		return true // Fallback wildcard
-	default:
-		erro(s.Context, "unsupported class match node: %T", classNode)
-		return false
+	if val == nil && rl == 0 {
+		format.write("\n%s")
+		args = append(args, trace)
+	} else {
+		format.write("\n  Results    : %v\n%s")
+		args = append(args, s.results, trace)
 	}
-}
 
-// checkAnchor enforces zero-width assertions (^, $, \b) without consuming tape characters.
-func (s *symstr) checkAnchor(op regex_syntax.Op, reverse bool) bool {
-	atEOF := s.exhausted() && len(s.vmhead.str) == 0 && len(s.syms) == 0
+	args = append(args, extra...)
+	prompt(s.Context, format.shared(), args...)
 
-	// FIXME: BOF needs a strict `s.consumedBytes == 0` check tracked across ops.
-	// For now, if the VM just booted, we'll tentatively allow BOF.
-	atBOF := len(s.syms) == 0 && s.opsDone < 10
-
-	switch op {
-	case regex_syntax.OpBeginLine, regex_syntax.OpBeginText:
-		if !reverse { return atBOF } else { return atEOF }
-	case regex_syntax.OpEndLine, regex_syntax.OpEndText:
-		if !reverse { return atEOF } else { return atBOF }
-	case regex_syntax.OpWordBoundary, regex_syntax.OpNoWordBoundary:
-		// TODO: Implement word boundary rune lookbehind/lookahead.
-		return true
+	for _, a := range args {
+		if _, ok := a.(unwind); ok { panic("debug unwind") }
 	}
-	return false
 }
 
 // clone securely deep-copies the volatile execution stacks.
@@ -5016,16 +5192,16 @@ func (s *symstr) match(pattern, target Value) (matched bool, res, rem Value, ste
 	// LAYER 0: Bootstrap the Matcher (Unrolls the PATTERN AST into execution instructions)
 	var unrollOp evalop
 	if trail {
-		unrollOp = opUnrollRev
+		unrollOp = opForEachRev
 		s.class |= clsReverse // Set direction natively!
 	} else {
-		unrollOp = opUnroll
+		unrollOp = opForEach
 		s.class &^= clsReverse // Forward
 	}
 
 	s.ops = append(s.ops, opEnd, unrollOp) // CRITICAL: Bootstrap with opEnd to guarantee io.EOF
 	// Push BOTH the AST node and the dynamic target operation (the new exact match primitive)
-	s.operands = append(s.operands, pattern, opMatchExact)
+	s.operands = append(s.operands, pattern, opMatch)
 
 	// LAYER 1: Bootstrap the Target Tape
 	gen := &symstr{Context: s.Context}
@@ -5177,11 +5353,11 @@ func (s *symstr) evals(nodes ...Value) (res []Value) {
 	startOps := len(s.ops)
 	startRes := len(s.results)
 
-	// Bootstrap with opUnroll + opEval!
+	// Bootstrap with opForEach + opEval!
 	// Since s.ops is LIFO, we push from len-1 down to 0 to guarantee
 	// left-to-right forward execution sequence.
 	for i := len(nodes) - 1; i >= 0; i-- {
-		s.ops = append(s.ops, opUnroll)
+		s.ops = append(s.ops, opForEach)
 		s.operands = append(s.operands, nodes[i], opEval)
 	}
 
@@ -5272,7 +5448,7 @@ func (s *symstr) evoke(x Value, o, a []Value) (res Value) {
 
 	// Evaluate Callee (Executes 1st)
 	if x != nil {
-		s.ops = append(s.ops, opResolve, opSwap, opIdent, opSwap, opUnroll)
+		s.ops = append(s.ops, opResolve, opSwap, opIdent, opSwap, opForEach)
 		// We use LPAREN as the virtual token since programmatic evocation acts like $(...)
 		s.operands = append(s.operands, LPAREN, 1, 1, x, opEval)
 	} else {
@@ -6823,9 +6999,11 @@ type tracked_stub struct {
 	args  []any // Preserves the raw arguments for opDebug to unpack
 }
 
+func (t *tracked_stub) String() string { return "tracked_stub{}" }
+
 // track captures the current runtime callstack location to yield a structural "loc"
 // stub for debugging VM operations. It natively unpacks structs like callstack{num: x}.
-func track(args ...any) tracked_stub {
+func track(args ...any) *tracked_stub {
 	var mapped []any
 	for _, a := range args {
 		switch t := a.(type) {
@@ -6839,7 +7017,7 @@ func track(args ...any) tracked_stub {
 
 	// i=2 skips `_callstack` (handled internally) AND `track` itself to point at the caller.
 	// j=0 allows the mapped args (like t.num) to dictate the frame depth.
-	return tracked_stub{
+	return &tracked_stub{
 		trace: _callstack("trace", 2*2, 0, mapped...),
 		args:  args,
 	}
