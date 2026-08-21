@@ -3551,7 +3551,6 @@ _op_switch_:
 				res = d
 			} else {
 				res = project_resolve(s.Context, id.name)
-				debug(s, "%v %v %v", id.name, res, _fatpos(s.Context,res.Pos()))
 			}
 		case LBRACE:
 			if t := project_entry(s.Context, id.name); t.valid() { res = t }
@@ -11722,12 +11721,22 @@ func (p *compiler) perc(x Value) Value {
 }
 
 type is_regex_parser struct{}
-type parse_regex_ctx struct{ Context }
-func (p parse_regex_ctx) do(ctx Context, op any) (_ any) {
+type parse_regex_ctx struct{ Context; capIdx *int }
+func (p *parse_regex_ctx) do(ctx Context, op any) (_ any) {
 	switch t := op.(type) {
 	case inner_cast: return p.Context
 	case dynamic_cast: return t.ctx(p, p.Context)
 	case is_regex_parser: return true
+	case defcap_name:
+		idx := 1
+		if p.capIdx != nil {
+			*p.capIdx++
+			idx = *p.capIdx
+		}
+		// 🟢 CRITICAL: Always broadcast to the parent (parse_grep_ctx) so
+		// variables like $1, $2 are instantiated, even on fallback!
+		p.Context.do(ctx, defcap_name{idx, t.s})
+		return idx
 	}
 	return p.Context.do(ctx, op)
 }
@@ -11740,7 +11749,8 @@ func (p *compiler) regex() (_ Value) {
 
 	pos := p.pos
 
-	cc := parse_regex_ctx{p.Context}; defer func() { p.Context = cc.Context } ()
+	var capIndex int
+	cc := &parse_regex_ctx{p.Context, &capIndex}; defer func() { p.Context = cc.Context } ()
 	p.Context = cc
 
 	if !p.scanner.bits.isBrace() {
@@ -12709,9 +12719,8 @@ func (p *parse_foreach_ctx) do(ctx Context, op any) (_ any) {
 	return p.Context.do(ctx, op)
 }
 
-type regex_subexp_auto struct{ subexpSyms []Symbol }
 type parse_grep_ctx struct{ Context ; o objbase ; a map[Symbol]*auto }
-func (p *parse_grep_ctx) do(ctx Context, op any) (_ any) {
+func (p *parse_grep_ctx) do(ctx Context, op any) any {
 	switch t := op.(type) {
 	case inner_cast: return p.Context
 	case dynamic_cast: return t.ctx(p, p.Context)
@@ -12730,20 +12739,16 @@ func (p *parse_grep_ctx) do(ctx Context, op any) (_ any) {
 	case set_auto:
 		// Parse-time context does not hold runtime values.
 		// Let it safely fall through to the runtime execution wrapper!
-	case regex_subexp_auto:
-		p.a = map[Symbol]*auto{sym_0: &auto{knownobject{p.o, sym_0}}}
-		// Start at index 1 as sym_0 is already handled above
-		for i, sym := range t.subexpSyms { // regexp.Regexp.SubexpNames()
-			if i > 0 {
-				// THE DOD FIX: Explicitly register unnamed numeric captures ($1, $2)
-				// so they aren't erased and eagerly inlined by the compiler during parse time!
-				numSym := intern(strconv.Itoa(i))
-				p.a[numSym] = &auto{knownobject{p.o, numSym}}
-
-				if sym != symEmpty {
-					p.a[sym] = &auto{knownobject{p.o, sym}}
-				}
-			}
+	case defcap_name:
+		if p.a == nil {
+			p.a = map[Symbol]*auto{sym_0: &auto{knownobject{p.o, sym_0}}}
+		}
+		if t.i > 0 {
+			num := intern(strconv.Itoa(t.i))
+			p.a[num] = &auto{knownobject{p.o, num}}
+		}
+		if t.s != symEmpty {
+			p.a[t.s] = &auto{knownobject{p.o, t.s}}
 		}
 	}
 	return p.Context.do(ctx, op)
@@ -12773,7 +12778,7 @@ func (p *compiler) calling() (result Value) {
 
 		if p.tok == SPACE { erro(p, "unexpected spaces") }
 
-		sc := selection_ctx{p.Context,closure}
+		sc := selection_ctx{p.Context, closure}
 		p.Context = sc
 		name = p.expr()
 		p.Context = sc.Context
@@ -12789,7 +12794,7 @@ func (p *compiler) calling() (result Value) {
 
 		// Extract arguments dynamically based on context symbol
 		if (tok == LPAREN && p.tok != RPAREN) || (tok == LBRACE && p.tok != RBRACE) {
-			cc := aware_ctx{p.Context,COMMA}; defer func() { p.Context = cc.Context } ()
+			cc := aware_ctx{p.Context, COMMA}; defer func() { p.Context = cc.Context } ()
 			p.Context = cc
 
 			switch sym {
@@ -12801,11 +12806,11 @@ func (p *compiler) calling() (result Value) {
 				}
 			case symGrep:
 				p.Context = &parse_grep_ctx{p.Context, objbase{valbase{p.pos}, _term(p.Context).scope}, nil}
-			// THE DOD FIX: Removed symForeach from here!
 			}
 
-			// 1. Parse the FIRST argument (The list to iterate over)
-			// This evaluates in the parent context, allowing outer `$_` to safely resolve to `xx`!
+			// 1. Parse the FIRST argument
+			// 🟢 FIX: Restore `parseValues()` to properly gather space-separated sequences
+			// (like `$0 $1 $2`) into discrete `list` arguments before the COMMA!
 			args = append(args, _list(p.parseValues()...))
 
 			// 2. THE DOD FIX: Push foreach loop-variable shielding ONLY for the body!
@@ -12815,10 +12820,9 @@ func (p *compiler) calling() (result Value) {
 				p.Context = fc
 			}
 
-			// 3. Parse subsequent arguments (The loop body)
-			// Now the inner `$_` is safely shielded and bound to the inner loop!
+			// 3. Parse subsequent arguments
 			for p.tok == COMMA {
-				p.next(true)
+				p.next(true) // 🟢 Eat comma and implicitly clear succeeding spaces
 				args = append(args, _list(p.parseValues()...))
 			}
 		}
@@ -12885,8 +12889,6 @@ func (p *compiler) calling() (result Value) {
 	}
 
 	// THE DOD FIX: defStatic is a compile-time value-return!
-	// It must unconditionally inline directly to the tape, bypassing all runtime
-	// preservation logic (like is_auto_preserved) which is strictly for *auto.
 	if x, y := obj.(*def); y && x.iso(defStatic) && !truly(p, is_auto_preserved{x.name}) {
 		return _loc(x.value, name.Pos())
 	}
@@ -12928,9 +12930,10 @@ func (c *compiler) expr() (x Value) {
 	isRegex := truly(c.Context, is_regex_parser{})
 	isGlob := truly(c.Context, is_glob_parser{})
 
+	var capIndex int
 	setRegex := func() {
 		if isGlob { erro(c, "pattern mixes glob and regex semantics", unwind{}) }
-		if !isRegex { c.Context = parse_regex_ctx{c.Context}; isRegex = true }
+		if !isRegex { c.Context = &parse_regex_ctx{c.Context, &capIndex}; isRegex = true }
 	}
 	setGlob := func() {
 		if isRegex { erro(c, "pattern mixes glob and regex semantics", unwind{}) }
@@ -13159,32 +13162,41 @@ expr_loop:
 			loc := c.loc
 			c.step() // Eat '('
 			if isRegex {
-				capIdx := 1
-				var name, flags string
+				var name, flags Symbol
+
+				captureGroup := true
 				if c.tok == QUE {
 					c.step() // Eat '?'
 					if c.tok == WORD && c.sym.String() == "P" { // ?P<name>
 						c.step() // Eat P
 						if c.tok == LANGLE {
 							c.step() // Eat <
-							if c.tok == WORD { name = c.sym.String() } else { name = c.lit }
+							name = c.sym
 							c.step() // Eat name
 							if c.tok == RANGLE { c.step() } // Eat >
 						}
 					} else if c.tok == COLON { // ?:
-						capIdx = 0
+						captureGroup = false
 						c.step() // Eat :
 					} else if c.tok == WORD { // (?flags) or (?flags:...)
-						flags = c.sym.String()
-						capIdx = 0
+						captureGroup = false
+						flags = c.sym
 						c.step() // Eat flags
 						if c.tok == COLON { c.step() } // Eat :
 					}
 				}
+
+				var idx int
+				if captureGroup {
+					// 🟢 Register the capture group BEFORE parsing the inner expression!
+					// This guarantees pre-order traversal indexing for nested groups.
+					if idx, _ = do(c.Context, defcap_name{s:name}).(int); idx <= 0 { idx = 1 }
+				}
+
 				var inner Value
 				if c.tok != RPAREN { inner = c.expr() }
 				if c.tok == RPAREN { c.step() }
-				val = &regexgroup{valbase{loc}, capIdx, name, flags, inner}
+				val = &regexgroup{valbase{loc}, idx, name, flags, inner}
 			} else {
 				val = c.expr()
 				if c.tok == RPAREN { c.step() }
@@ -13230,8 +13242,7 @@ expr_loop:
 					c.step() // Eat \Q
 					var b compactbuilds
 					for c.tok != EOF {
-						if c.tok == ESCAPE && c.lit == `E` { break }
-						if c.tok == ESCAPE {
+						if c.tok == ESCAPE { if c.lit == `E` { break }
 							b.write(`\`)
 							b.write(c.lit)
 						} else if c.tok == WORD {
@@ -13419,9 +13430,11 @@ expr_loop:
 			goto skip_step
 
 		case DOT:
+			if isRegex { break } // 🟢 In Regex, DOT is strictly the `AnyChar` atom. Do not steal it as an infix!
+
 			c.step()
 
-			if isRegex && fi > 0 && c.frames[fi].ctor == opCompound {
+			if false && fi > 0 && c.frames[fi].ctor == opCompound {
 				c.ops = append(c.ops, opReduce)
 				execute()
 				fi = len(c.frames) - 1
@@ -13881,6 +13894,7 @@ func (p *compiler) braced_quote() (res Value) {
     return &quote{list{elements{vals}}}
 }
 
+type defcap_name struct { i int; s Symbol }
 type defcap  struct { Value ; name Symbol }
 type defcaps struct { Value ; caps []*defcap }
 func (dc *defcaps) String() string {
@@ -22186,8 +22200,8 @@ func (p *regexquote) build(b *compactbuilds) { p.source(b) }
 type regexgroup struct {
 	valbase
 	cap   int    // Capture index; 0 means non-capturing
-	name  string // Named capture: (?P<name>re)
-	flags string // Inline flags: (?is-m:re) or (?is-m)
+	name  Symbol // Named capture: (?P<name>re)
+	flags Symbol // Inline flags: (?is-m:re) or (?is-m)
 	val   Value  // The internal pattern (can be nil for pure flag toggles)
 }
 func (_ *regexgroup) kind() Kind { return 0 } // KindRegexGroup
@@ -22200,19 +22214,15 @@ func (p *regexgroup) source(b *compactbuilds) {
 	b.setRaw(true)
 	b.writeByte('(')
 	if p.cap > 0 {
-		if p.name != "" {
+		if p.name != symEmpty {
 			b.write("?P<")
-			b.write(p.name)
+			p.name.build(b)
 			b.writeByte('>')
 		}
 	} else {
 		b.writeByte('?')
-		if p.flags != "" {
-			b.write(p.flags)
-		}
-		if p.val != nil {
-			b.writeByte(':')
-		}
+		if p.flags != symEmpty { p.flags.build(b) }
+		if p.val != nil { b.writeByte(':') }
 	}
 	if p.val != nil {
 		builds(b, strsrc{}, p.val)
@@ -22223,19 +22233,15 @@ func (p *regexgroup) build(b *compactbuilds) {
 	b.setRaw(true)
 	b.writeByte('(')
 	if p.cap > 0 {
-		if p.name != "" {
+		if p.name != symEmpty {
 			b.write("?P<")
-			b.write(p.name)
+			p.name.build(b)
 			b.writeByte('>')
 		}
 	} else {
 		b.writeByte('?')
-		if p.flags != "" {
-			b.write(p.flags)
-		}
-		if p.val != nil {
-			b.writeByte(':')
-		}
+		if p.flags != symEmpty { p.flags.build(b) }
+		if p.val != nil { b.writeByte(':') }
 	}
 	if p.val != nil {
 		builds(b, p.val)
