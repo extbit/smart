@@ -4351,7 +4351,6 @@ _op_switch_:
 
 		switch t := val.(type) {
 		case *compound:
-			// Unroll Left-to-Right: Push C, B, A -> Evaluated A, B, C
 			for i := len(t.elems) - 1; i >= 0; i-- {
 				s.ops = append(s.ops, opMatch)
 				s.operands = append(s.operands, t.elems[i])
@@ -4397,27 +4396,21 @@ _op_switch_:
 			}
 
 			if str == "" { break _op_switch_ }
+			needle := intern(str)
 
-			// Replenish tape if empty
-			if len(s.vmhead.str) == 0 {
-				if !s.ensure_syms() || len(s.syms) == 0 {
+			if s.ensure_syms() {
+				idx := __posymSeqIndex(s.syms, 0, needle)
+				if idx == 0 { // 🟢 Must match at exactly index 0 for Exact Consumption
+					_, right, targetIdx := __posymSeqSplitAt(s.syms, needle.len())
+
+					var rem []posym
+					if right.Symbol != symEmpty { rem = append(rem, right) }
+					if targetIdx+1 < len(s.syms) { rem = append(rem, s.syms[targetIdx+1:]...) }
+
+					s.syms = rem // Reconstruct tape without the consumed prefix
+				} else {
 					if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
-					break _op_switch_
 				}
-				s.vmhead.loc = s.syms[0].Pos
-				s.vmhead.str = s.syms[0].String()
-				s.syms = s.syms[1:]
-			}
-
-			// ZERO-LOOP EXACT CONSUMPTION
-			if strings.HasPrefix(s.vmhead.str, str) {
-				s.vmhead.str = s.vmhead.str[len(str):]
-				if len(s.vmhead.str) > 0 { s.vmhead.loc += Pos(len(str)) }
-			} else if strings.HasPrefix(str, s.vmhead.str) {
-				rem := str[len(s.vmhead.str):]
-				s.vmhead.str = ""
-				s.ops = append(s.ops, opMatch) // Push remaining exact match as an intermediate literal
-				s.operands = append(s.operands, &raw{valbase{s.vmhead.loc}, rem})
 			} else {
 				if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
 			}
@@ -4427,17 +4420,13 @@ _op_switch_:
 		classNode := s.operands[l-1].(Value)
 		s.operands = s.operands[:l-1]
 
-		if len(s.vmhead.str) == 0 {
-			if !s.ensure_syms() || len(s.syms) == 0 {
-				if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
-				break _op_switch_
-			}
-			s.vmhead.loc = s.syms[0].Pos
-			s.vmhead.str = s.syms[0].String()
-			s.syms = s.syms[1:]
+		if !s.ensure_syms() || len(s.syms) == 0 {
+			if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
+			break _op_switch_
 		}
 
-		r, size := utf8.DecodeRuneInString(s.vmhead.str)
+		head := s.syms[0].String()
+		r, size := utf8.DecodeRuneInString(head)
 		matched := false
 
 		switch t := classNode.(type) {
@@ -4457,8 +4446,11 @@ _op_switch_:
 		}
 
 		if matched {
-			s.vmhead.str = s.vmhead.str[size:]
-			if len(s.vmhead.str) > 0 { s.vmhead.loc += Pos(size) }
+			_, right, targetIdx := __posymSeqSplitAt(s.syms, size)
+			var rem []posym
+			if right.Symbol != symEmpty { rem = append(rem, right) }
+			if targetIdx+1 < len(s.syms) { rem = append(rem, s.syms[targetIdx+1:]...) }
+			s.syms = rem
 		} else {
 			if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
 		}
@@ -4467,7 +4459,7 @@ _op_switch_:
 		anchor := s.operands[l-1].(*regexmeta)
 		s.operands = s.operands[:l-1]
 
-		atEOF := s.exhausted() && len(s.vmhead.str) == 0 && len(s.syms) == 0
+		atEOF := s.exhausted() && len(s.syms) == 0
 		atBOF := len(s.syms) == 0 && s.opsDone < 10 // FIXME: Implement precise global BOF tracking
 
 		matched := false
@@ -4519,7 +4511,6 @@ _op_switch_:
 
 		switch t := val.(type) {
 		case *compound:
-			// Unroll Right-to-Left: Push A, B, C -> Evaluated C, B, A
 			for i := 0; i < len(t.elems); i++ {
 				s.ops = append(s.ops, opMatchRev)
 				s.operands = append(s.operands, t.elems[i])
@@ -4557,31 +4548,29 @@ _op_switch_:
 			case *strlit:     str = leaf.s
 			case *regexquote: str = leaf.text
 			default:
-				erro(s.Context, "unsupported regex unroll node: %T", val, unwind{})
+				e := _f("VM execution trap: unsupported match unroll node %s", ts(val,s)).erro()
+				s.ops = append(s.ops, opDebug)
+				s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
+				s.results = append(s.results, nil)
+				break _op_switch_
 			}
 
 			if str == "" { break _op_switch_ }
+			needle := intern(str)
 
-			// Replenish tape from the END if empty
-			if len(s.vmhead.str) == 0 {
-				if !s.ensure_syms() || len(s.syms) == 0 {
+			if s.ensure_syms() {
+				totalLen := 0
+				for _, sym := range s.syms { totalLen += sym.len() }
+
+				limitByte := totalLen - needle.len()
+				idx := __posymSeqLastIndex(s.syms, limitByte, needle)
+
+				if idx == limitByte && idx >= 0 { // 🟢 Matches perfectly at the tail end
+					left, _, _ := __posymSeqSplitAt(s.syms, limitByte)
+					s.syms = left
+				} else {
 					if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
-					break _op_switch_
 				}
-				lastIdx := len(s.syms) - 1
-				s.vmhead.loc = s.syms[lastIdx].Pos
-				s.vmhead.str = s.syms[lastIdx].String()
-				s.syms = s.syms[:lastIdx]
-			}
-
-			// ZERO-LOOP EXACT CONSUMPTION (REVERSE)
-			if strings.HasSuffix(s.vmhead.str, str) {
-				s.vmhead.str = s.vmhead.str[:len(s.vmhead.str)-len(str)]
-			} else if strings.HasSuffix(str, s.vmhead.str) {
-				rem := str[:len(str)-len(s.vmhead.str)]
-				s.vmhead.str = ""
-				s.ops = append(s.ops, opMatchRev) // Push remaining exact match as an intermediate literal
-				s.operands = append(s.operands, &raw{valbase{s.vmhead.loc}, rem})
 			} else {
 				if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
 			}
@@ -4591,18 +4580,14 @@ _op_switch_:
 		classNode := s.operands[l-1].(Value)
 		s.operands = s.operands[:l-1]
 
-		if len(s.vmhead.str) == 0 {
-			if !s.ensure_syms() || len(s.syms) == 0 {
-				if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
-				break _op_switch_
-			}
-			lastIdx := len(s.syms) - 1
-			s.vmhead.loc = s.syms[lastIdx].Pos
-			s.vmhead.str = s.syms[lastIdx].String()
-			s.syms = s.syms[:lastIdx]
+		if !s.ensure_syms() || len(s.syms) == 0 {
+			if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
+			break _op_switch_
 		}
 
-		r, size := utf8.DecodeLastRuneInString(s.vmhead.str)
+		lastIdx := len(s.syms) - 1
+		tail := s.syms[lastIdx].String()
+		r, size := utf8.DecodeLastRuneInString(tail)
 		matched := false
 
 		switch t := classNode.(type) {
@@ -4622,7 +4607,11 @@ _op_switch_:
 		}
 
 		if matched {
-			s.vmhead.str = s.vmhead.str[:len(s.vmhead.str)-size]
+			totalLen := 0
+			for _, sym := range s.syms { totalLen += sym.len() }
+
+			left, _, _ := __posymSeqSplitAt(s.syms, totalLen - size)
+			s.syms = left
 		} else {
 			if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
 		}
@@ -4631,7 +4620,7 @@ _op_switch_:
 		anchor := s.operands[l-1].(*regexmeta)
 		s.operands = s.operands[:l-1]
 
-		atEOF := s.exhausted() && len(s.vmhead.str) == 0 && len(s.syms) == 0
+		atEOF := s.exhausted() && len(s.syms) == 0
 		atBOF := len(s.syms) == 0 && s.opsDone < 10
 
 		matched := false
@@ -4673,31 +4662,6 @@ _op_switch_:
 			s.operands = s.operands[:l-1]
 		}
 		s.backtracks = append(s.backtracks, bt)
-
-	// ----------------------------------------------------------------------------
-	// CAPTURE GROUPS (Placeholders)
-	// ----------------------------------------------------------------------------
-	case opMatchCapStart, opMatchCapStartRev:
-		g := s.operands[l-1].(*regexgroup) // 🟢 Pop the group!
-		s.operands = s.operands[:l-1]
-
-		if false {
-			s.ops = append(s.ops, opDebug)
-			s.operands = append(s.operands, track(_f("CapStart: %v", g), callstack{num:3}))
-		}
-
-		// TODO: Calculate current byte offset from `s.tie` and push to `s.stems`
-
-	case opMatchCapEnd, opMatchCapEndRev:
-		g := s.operands[l-1].(*regexgroup) // 🟢 Pop the group!
-		s.operands = s.operands[:l-1]
-
-		if false {
-			s.ops = append(s.ops, opDebug)
-			s.operands = append(s.operands, track(_f("CapEnd: %v", g), callstack{num:3}))
-		}
-
-		// TODO: Finalize the byte offset for the active stem
 
 	// ============================================================================
 	// Debug with track; EOF.
@@ -13065,6 +13029,11 @@ expr_loop:
 			break expr_loop
 
 		case MINUS:
+			if isRegex {
+				// 🟢 In Regex, MINUS is strictly a literal atom. Do not steal it as a flag!
+				val = &punct{valbase{c.loc}, symDash} // NOTE: NOT symMinus (i.e., `minus`)
+				break
+			}
 			if len(c.results) == c.frames[len(c.frames)-1].i {
 				c.frames[len(c.frames)-1].ctor = opFlag
 				c.step()
@@ -13556,6 +13525,8 @@ expr_loop:
 			continue
 
 		case MINUS:
+			if isRegex { break } // 🟢 In Regex, MINUS is strictly a literal atom. Do not steal it as an infix!
+
 			if truly(c.Context, is_url_parser{}) {
 				val = &punct{valbase{c.pos}, symMinus}
 				c.step()
