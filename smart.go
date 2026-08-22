@@ -846,10 +846,12 @@ const (
 	symUndir4
 	symUndir5
 	symUndir6
+
 	symUndir7
 	symUndir8
 	symUndir9
 
+	sym_Cxx // C++
 	sym_cxx // c++
 
 	symReadDir
@@ -897,6 +899,8 @@ const (
 	symWorkDotSmart
 	symBuildDotSm
 	symBuildDotSmart
+
+	symSharp0 // #0
 
 	symDotSlash     // ./
 	symDotDotSlash  // ../
@@ -1060,7 +1064,7 @@ var coreSymSeqs = []string{
 	"base2", "base3", "base4", "base5", "base6", "base7", "base8", "base9", "base64",
 	"dir2", "dir3", "dir4", "dir5", "dir6", "dir7", "dir8", "dir9",
 	"undir2", "undir3", "undir4", "undir5", "undir6", "undir7", "undir8", "undir9",
-	"c++",
+	"C++", "c++",
 
 	"read-dir", "relative-dir", "not-equal", "filter-out", "decode-base64", "encode-base64",
 	"trim-left", "trim-right", "trim-prefix", "trim-suffix", "trim-ext",
@@ -1070,6 +1074,8 @@ var coreSymSeqs = []string{
 
 	"target.tmp", "target.out", "target.triple", "rel.remnant", "rel.chop", "variant.tag", "configuration.sm",
 	"do.sm", "do.smart", "do.smart.b", "work.sm", "work.smart", "build.sm", "build.smart",
+
+	"#0",
 
 	"./", "../",
 	".base", ".configure", ".container", ".self", ".usee", ".mode", ".goals", ".go", ".search",
@@ -2692,6 +2698,11 @@ func __posymSeq(ps posym) (seq []posym) {
 	return
 }
 
+func __posymSeqLen(seq []posym) (n int) {
+	for _, s := range seq { n += s.len() }
+	return n
+}
+
 // __posymSeqEqual provides O(1) bounds-checked array comparison.
 func __posymSeqEqual(a []posym, b []Symbol) bool {
 	if len(a) != len(b) { return false }
@@ -3334,11 +3345,18 @@ type match_rep_iter struct {
 	count    int
 	greedy   bool
 	payload  Value // The AST node to repeat (e.g., regexclass, exact string, etc.)
+	lastPos  Pos // ADDED TO PREVENT EMPTY-MATCH DEADLOCKS
 }
 func (p *match_rep_iter) String() string {
 	var b compactbuilds
 	b.writef("match_rep_iter{%v,%d,%d,%d,%v}", p.payload, p.min, p.max, p.count, p.greedy)
 	return b.shared()
+}
+
+type match_cap_state struct {
+	node    Value   // Generic AST Node (e.g., *matchgroup, *globmeta)
+	syms    []posym // Tape snapshot
+	tapeLen int     // Tape length at snapshot time
 }
 
 func (s *symstr) step() {
@@ -4346,16 +4364,16 @@ _op_switch_:
 	// FORWARD INSTRUCTION SET (Left-to-Right)
 	// ----------------------------------------------------------------------------
 	case opMatch:
-		val := s.operands[l-1].(Value)
+		arg := s.operands[l-1]
 		s.operands = s.operands[:l-1]
 
-		switch t := val.(type) {
+		switch t := arg.(type) {
 		case *compound:
 			for i := len(t.elems) - 1; i >= 0; i-- {
 				s.ops = append(s.ops, opMatch)
 				s.operands = append(s.operands, t.elems[i])
 			}
-		case *regexgroup:
+		case *matchgroup:
 			s.ops = append(s.ops, opMatchCapEnd, opMatch, opMatchCapStart)
 			s.operands = append(s.operands, t, t.val, t)
 		case *regexalt:
@@ -4370,7 +4388,7 @@ _op_switch_:
 		case *regexrep:
 			s.ops = append(s.ops, opMatchRep)
 			s.operands = append(s.operands, &match_rep_iter{
-				min: t.min, max: t.max, count: 0, greedy: t.greedy, payload: t.val,
+				min: t.min, max: t.max, count: 0, greedy: t.greedy, payload: t.val, lastPos: -2,
 			})
 		case *regexclass, *regexnamedclass:
 			s.ops = append(s.ops, opMatchClass)
@@ -4379,35 +4397,40 @@ _op_switch_:
 			s.ops = append(s.ops, opMatchAnchor)
 			s.operands = append(s.operands, t)
 		default:
-			var str string
-			switch leaf := val.(type) {
-			case *word:       str = leaf.s.String()
-			case *punct:      str = leaf.s.String()
-			case *raw:        str = leaf.s
-			case *escaped:    str = leaf.s
-			case *strlit:     str = leaf.s
-			case *regexquote: str = leaf.text
+			var needle Symbol
+			switch leaf := arg.(type) {
+			case *word:       needle = leaf.s
+			case *punct:      needle = leaf.s
+			case *raw:        needle = intern(leaf.s)
+			case *escaped:    needle = intern(leaf.s)
+			case *strlit:     needle = intern(leaf.s)
+			case *regexquote: needle = intern(leaf.text)
 			default:
-				e := _f("VM execution trap: unsupported match unroll node %s", ts(val,s)).erro()
+				e := _f("VM execution trap: unsupported match unroll node %s", ts(arg,s)).erro()
 				s.ops = append(s.ops, opDebug)
 				s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
 				s.results = append(s.results, nil)
 				break _op_switch_
 			}
 
-			if str == "" { break _op_switch_ }
-			needle := intern(str)
+			if needle == symEmpty { break _op_switch_ }
 
-			if s.ensure_syms() {
-				idx := __posymSeqIndex(s.syms, 0, needle)
-				if idx == 0 { // 🟢 Must match at exactly index 0 for Exact Consumption
-					_, right, targetIdx := __posymSeqSplitAt(s.syms, needle.len())
+			if s.tie.ensure_syms() {
+				idx := __posymSeqIndex(s.tie.syms, 0, needle)
+				if idx == 0 {
+					left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, needle.len())
+
+					// 🟢 Accumulate consumed tokens to all open forward stems
+					for i := range s.stems {
+						if s.stems[i].start == -1 {
+							s.stems[i].syms = append(s.stems[i].syms, left...)
+						}
+					}
 
 					var rem []posym
 					if right.Symbol != symEmpty { rem = append(rem, right) }
-					if targetIdx+1 < len(s.syms) { rem = append(rem, s.syms[targetIdx+1:]...) }
-
-					s.syms = rem // Reconstruct tape without the consumed prefix
+					if targetIdx+1 < len(s.tie.syms) { rem = append(rem, s.tie.syms[targetIdx+1:]...) }
+					s.tie.syms = rem 
 				} else {
 					if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
 				}
@@ -4420,12 +4443,12 @@ _op_switch_:
 		classNode := s.operands[l-1].(Value)
 		s.operands = s.operands[:l-1]
 
-		if !s.ensure_syms() || len(s.syms) == 0 {
+		if !s.tie.ensure_syms() || len(s.tie.syms) == 0 {
 			if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
 			break _op_switch_
 		}
 
-		head := s.syms[0].String()
+		head := s.tie.syms[0].String()
 		r, size := utf8.DecodeRuneInString(head)
 		matched := false
 
@@ -4446,11 +4469,19 @@ _op_switch_:
 		}
 
 		if matched {
-			_, right, targetIdx := __posymSeqSplitAt(s.syms, size)
+			left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, size)
+			
+			// 🟢 Accumulate
+			for i := range s.stems {
+				if s.stems[i].start == -1 {
+					s.stems[i].syms = append(s.stems[i].syms, left...)
+				}
+			}
+
 			var rem []posym
 			if right.Symbol != symEmpty { rem = append(rem, right) }
-			if targetIdx+1 < len(s.syms) { rem = append(rem, s.syms[targetIdx+1:]...) }
-			s.syms = rem
+			if targetIdx+1 < len(s.tie.syms) { rem = append(rem, s.tie.syms[targetIdx+1:]...) }
+			s.tie.syms = rem
 		} else {
 			if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
 		}
@@ -4459,14 +4490,14 @@ _op_switch_:
 		anchor := s.operands[l-1].(*regexmeta)
 		s.operands = s.operands[:l-1]
 
-		atEOF := s.exhausted() && len(s.syms) == 0
-		atBOF := len(s.syms) == 0 && s.opsDone < 10 // FIXME: Implement precise global BOF tracking
+		atEOF := s.tie.exhausted() && len(s.tie.syms) == 0
+		atBOF := len(s.tie.syms) == 0 && s.opsDone < 10
 
 		matched := false
 		switch anchor.op {
 		case regex_syntax.OpBeginLine, regex_syntax.OpBeginText: matched = atBOF
 		case regex_syntax.OpEndLine, regex_syntax.OpEndText:     matched = atEOF
-		case regex_syntax.OpWordBoundary, regex_syntax.OpNoWordBoundary: matched = true // TODO: Word Bounds
+		case regex_syntax.OpWordBoundary, regex_syntax.OpNoWordBoundary: matched = true 
 		}
 
 		if !matched {
@@ -4487,6 +4518,17 @@ _op_switch_:
 			s.operands = s.operands[:l-1]
 			break _op_switch_
 		}
+
+		// 🟢 Anti-Empty-Match Deadlock Guard
+		var currentPos Pos = -2
+		if len(s.tie.syms) > 0 { currentPos = s.tie.syms[0].Pos }
+
+		if iter.count > 0 && iter.lastPos == currentPos {
+			s.operands = s.operands[:l-1]
+			break _op_switch_
+		}
+
+		iter.lastPos = currentPos
 		iter.count++
 		bt := s.checkpoint(undoTape | undoStems | undoErr | undoHead)
 
@@ -4515,7 +4557,7 @@ _op_switch_:
 				s.ops = append(s.ops, opMatchRev)
 				s.operands = append(s.operands, t.elems[i])
 			}
-		case *regexgroup:
+		case *matchgroup:
 			s.ops = append(s.ops, opMatchCapStartRev, opMatchRev, opMatchCapEndRev)
 			s.operands = append(s.operands, t, t.val, t)
 		case *regexalt:
@@ -4530,7 +4572,7 @@ _op_switch_:
 		case *regexrep:
 			s.ops = append(s.ops, opMatchRepRev)
 			s.operands = append(s.operands, &match_rep_iter{
-				min: t.min, max: t.max, count: 0, greedy: t.greedy, payload: t.val,
+				min: t.min, max: t.max, count: 0, greedy: t.greedy, payload: t.val, lastPos: -2,
 			})
 		case *regexclass, *regexnamedclass:
 			s.ops = append(s.ops, opMatchClassRev)
@@ -4539,14 +4581,14 @@ _op_switch_:
 			s.ops = append(s.ops, opMatchAnchorRev)
 			s.operands = append(s.operands, t)
 		default:
-			var str string
+			var needle Symbol
 			switch leaf := val.(type) {
-			case *word:       str = leaf.s.String()
-			case *punct:      str = leaf.s.String()
-			case *raw:        str = leaf.s
-			case *escaped:    str = leaf.s
-			case *strlit:     str = leaf.s
-			case *regexquote: str = leaf.text
+			case *word:       needle = leaf.s
+			case *punct:      needle = leaf.s
+			case *raw:        needle = intern(leaf.s)
+			case *escaped:    needle = intern(leaf.s)
+			case *strlit:     needle = intern(leaf.s)
+			case *regexquote: needle = intern(leaf.text)
 			default:
 				e := _f("VM execution trap: unsupported match unroll node %s", ts(val,s)).erro()
 				s.ops = append(s.ops, opDebug)
@@ -4555,19 +4597,30 @@ _op_switch_:
 				break _op_switch_
 			}
 
-			if str == "" { break _op_switch_ }
-			needle := intern(str)
+			if needle == symEmpty { break _op_switch_ }
 
-			if s.ensure_syms() {
+			if s.tie.ensure_syms() {
 				totalLen := 0
-				for _, sym := range s.syms { totalLen += sym.len() }
+				for _, sym := range s.tie.syms { totalLen += sym.len() }
 
 				limitByte := totalLen - needle.len()
-				idx := __posymSeqLastIndex(s.syms, limitByte, needle)
+				idx := __posymSeqLastIndex(s.tie.syms, limitByte, needle)
 
-				if idx == limitByte && idx >= 0 { // 🟢 Matches perfectly at the tail end
-					left, _, _ := __posymSeqSplitAt(s.syms, limitByte)
-					s.syms = left
+				if idx == limitByte && idx >= 0 {
+					left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, limitByte)
+					
+					// 🟢 Accumulate consumed tokens to all open reverse stems
+					var consumed []posym
+					if right.Symbol != symEmpty { consumed = append(consumed, right) }
+					if targetIdx+1 < len(s.tie.syms) { consumed = append(consumed, s.tie.syms[targetIdx+1:]...) }
+
+					for i := range s.stems {
+						if s.stems[i].start == -2 { // Open reverse group
+							s.stems[i].syms = append(consumed, s.stems[i].syms...)
+						}
+					}
+
+					s.tie.syms = left
 				} else {
 					if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
 				}
@@ -4580,13 +4633,13 @@ _op_switch_:
 		classNode := s.operands[l-1].(Value)
 		s.operands = s.operands[:l-1]
 
-		if !s.ensure_syms() || len(s.syms) == 0 {
+		if !s.tie.ensure_syms() || len(s.tie.syms) == 0 {
 			if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
 			break _op_switch_
 		}
 
-		lastIdx := len(s.syms) - 1
-		tail := s.syms[lastIdx].String()
+		lastIdx := len(s.tie.syms) - 1
+		tail := s.tie.syms[lastIdx].String()
 		r, size := utf8.DecodeLastRuneInString(tail)
 		matched := false
 
@@ -4608,10 +4661,22 @@ _op_switch_:
 
 		if matched {
 			totalLen := 0
-			for _, sym := range s.syms { totalLen += sym.len() }
+			for _, sym := range s.tie.syms { totalLen += sym.len() }
 
-			left, _, _ := __posymSeqSplitAt(s.syms, totalLen - size)
-			s.syms = left
+			left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, totalLen - size)
+			
+			// 🟢 Accumulate
+			var consumed []posym
+			if right.Symbol != symEmpty { consumed = append(consumed, right) }
+			if targetIdx+1 < len(s.tie.syms) { consumed = append(consumed, s.tie.syms[targetIdx+1:]...) }
+
+			for i := range s.stems {
+				if s.stems[i].start == -2 {
+					s.stems[i].syms = append(consumed, s.stems[i].syms...)
+				}
+			}
+
+			s.tie.syms = left
 		} else {
 			if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
 		}
@@ -4620,14 +4685,14 @@ _op_switch_:
 		anchor := s.operands[l-1].(*regexmeta)
 		s.operands = s.operands[:l-1]
 
-		atEOF := s.exhausted() && len(s.syms) == 0
-		atBOF := len(s.syms) == 0 && s.opsDone < 10
+		atEOF := s.tie.exhausted() && len(s.tie.syms) == 0
+		atBOF := len(s.tie.syms) == 0 && s.opsDone < 10
 
 		matched := false
 		switch anchor.op {
 		case regex_syntax.OpBeginLine, regex_syntax.OpBeginText: matched = atEOF // FLIPPED
 		case regex_syntax.OpEndLine, regex_syntax.OpEndText:     matched = atBOF // FLIPPED
-		case regex_syntax.OpWordBoundary, regex_syntax.OpNoWordBoundary: matched = true // TODO: Word Bounds
+		case regex_syntax.OpWordBoundary, regex_syntax.OpNoWordBoundary: matched = true 
 		}
 
 		if !matched {
@@ -4648,6 +4713,17 @@ _op_switch_:
 			s.operands = s.operands[:l-1]
 			break _op_switch_
 		}
+
+		// 🟢 Anti-Empty-Match Deadlock Guard (Reverse)
+		var currentPos Pos = -2
+		if len(s.tie.syms) > 0 { currentPos = s.tie.syms[len(s.tie.syms)-1].Pos }
+
+		if iter.count > 0 && iter.lastPos == currentPos {
+			s.operands = s.operands[:l-1]
+			break _op_switch_
+		}
+
+		iter.lastPos = currentPos
 		iter.count++
 		bt := s.checkpoint(undoTape | undoStems | undoErr | undoHead)
 
@@ -4662,6 +4738,104 @@ _op_switch_:
 			s.operands = s.operands[:l-1]
 		}
 		s.backtracks = append(s.backtracks, bt)
+
+	// ----------------------------------------------------------------------------
+	// CAPTURE GROUPS & GLOB STEMS
+	// ----------------------------------------------------------------------------
+	case opMatchCapStart:
+		node := s.operands[l-1].(Value)
+		s.operands = s.operands[:l-1]
+
+		var sym Symbol
+		var pos Pos
+		var capIdx int
+
+		switch t := node.(type) {
+		case *matchgroup: sym, pos, capIdx = t.name, t.Pos(), t.cap
+		case *globmeta:   sym, pos, capIdx = t.sym, t.Pos(), 1
+		default:          capIdx = 0
+		}
+
+		if capIdx != 0 {
+			if sym == symEmpty { sym = intern(strconv.Itoa(capIdx)) }
+			// 🟢 Push an OPEN capture group marker (-1 for forward)
+			s.stems = append(s.stems, capture{
+				start: -1, 
+				end:   -1,
+				name:  posym{pos, sym},
+				syms:  nil,
+			})
+		}
+
+	case opMatchCapEnd:
+		node := s.operands[l-1].(Value)
+		s.operands = s.operands[:l-1]
+
+		var sym Symbol
+		var capIdx int
+		switch t := node.(type) {
+		case *matchgroup: sym, capIdx = t.name, t.cap
+		case *globmeta:   sym, capIdx = t.sym, 1
+		default:          capIdx = 0
+		}
+
+		if capIdx != 0 {
+			if sym == symEmpty { sym = intern(strconv.Itoa(capIdx)) }
+			// 🟢 Find the most recent open group and lock it closed
+			for i := len(s.stems) - 1; i >= 0; i-- {
+				if s.stems[i].start == -1 && s.stems[i].name.Symbol == sym {
+					s.stems[i].start = 1 // Closed
+					break
+				}
+			}
+		}
+
+	case opMatchCapEndRev: // Opens in reverse
+		node := s.operands[l-1].(Value)
+		s.operands = s.operands[:l-1]
+
+		var sym Symbol
+		var pos Pos
+		var capIdx int
+
+		switch t := node.(type) {
+		case *matchgroup: sym, pos, capIdx = t.name, t.Pos(), t.cap
+		case *globmeta:   sym, pos, capIdx = t.sym, t.Pos(), 1
+		default:          capIdx = 0
+		}
+
+		if capIdx != 0 {
+			if sym == symEmpty { sym = intern(strconv.Itoa(capIdx)) }
+			// 🟢 Push an OPEN capture group marker (-2 for reverse)
+			s.stems = append(s.stems, capture{
+				start: -2, 
+				end:   -1,
+				name:  posym{pos, sym},
+				syms:  nil,
+			})
+		}
+
+	case opMatchCapStartRev: // Closes in reverse
+		node := s.operands[l-1].(Value)
+		s.operands = s.operands[:l-1]
+
+		var sym Symbol
+		var capIdx int
+		switch t := node.(type) {
+		case *matchgroup: sym, capIdx = t.name, t.cap
+		case *globmeta:   sym, capIdx = t.sym, 1
+		default:          capIdx = 0
+		}
+
+		if capIdx != 0 {
+			if sym == symEmpty { sym = intern(strconv.Itoa(capIdx)) }
+			for i := len(s.stems) - 1; i >= 0; i-- {
+				if s.stems[i].start == -2 && s.stems[i].name.Symbol == sym {
+					s.stems[i].start = 1 // Closed
+					break
+				}
+			}
+		}
 
 	// ============================================================================
 	// Debug with track; EOF.
@@ -5196,102 +5370,90 @@ func (p *named_stem) String() string { return p.Value.String() }
 func (s *symstr) match(pattern, target Value) (matched bool, res, rem Value, stems []Value) {
 	trail := truly(s.Context, propReversal)
 
-	// LAYER 0: Bootstrap the Matcher (Unrolls the PATTERN AST into execution instructions)
+	// LAYER 0: Bootstrap the Matcher
 	var unrollOp evalop
 	if trail {
 		unrollOp = opForEachRev
-		s.class |= clsReverse // Set direction natively!
+		s.class |= clsReverse
 	} else {
 		unrollOp = opForEach
-		s.class &^= clsReverse // Forward
+		s.class &^= clsReverse
 	}
 
-	s.ops = append(s.ops, opEnd, unrollOp) // CRITICAL: Bootstrap with opEnd to guarantee io.EOF
-	// Push BOTH the AST node and the dynamic target operation (the new exact match primitive)
-	s.operands = append(s.operands, pattern, opMatch)
+	// 🟢 Implicit Full Match Capture (cap: -1) tracks exactly what is consumed!
+	fullMatchGrp := &matchgroup{cap: -1, name: symSharp0, val: pattern}
 
-	// LAYER 1: Bootstrap the Target Tape
-	gen := &symstr{Context: s.Context}
-	gen.ops = append(gen.ops, opEnd, unrollOp)
-	// Push BOTH the target AST node and the dynamic yield operation
-	gen.operands = append(gen.operands, target, opYieldSym)
+	s.ops = append(s.ops, opEnd)
+	if trail {
+		s.ops = append(s.ops, opMatchCapStartRev, unrollOp, opMatchCapEndRev)
+	} else {
+		s.ops = append(s.ops, opMatchCapEnd, unrollOp, opMatchCapStart)
+	}
+	s.operands = append(s.operands, fullMatchGrp, pattern, opMatch, fullMatchGrp)
 
-	// LAYER 2: Configure this symstr instance as the Matcher
-	s.tie = gen
+	// Bootstrap the Target Tape
+	s.tie = &symstr{Context: s.Context}
+	s.tie.ops = append(s.tie.ops, opEnd, unrollOp)
+	s.tie.operands = append(s.tie.operands, target, opYieldSym)
 
 	// Execute the Matcher!
 	for len(s.ops) > 0 && s.err == nil { s.step() }
 
 	matched = s.err == io.EOF && s.exhausted()
 
-	// Helper to dynamically rebuild raw symbol tapes back into AST structures
+	// 1. Extract `res` natively from the virtual capture group
+	var fullMatchSyms []posym
+	var filteredStems []capture
+
+	for i, cap := range s.stems {
+		if cap.name.Symbol == fullMatchGrp.name && i == 0 {
+			fullMatchSyms = cap.syms
+		} else {
+			filteredStems = append(filteredStems, cap)
+		}
+	}
+	s.stems = filteredStems // Clean up the virtual group
+
 	rebuild := func(syms []posym) Value {
 		if len(syms) == 0 { return nil }
 		if len(syms) == 1 { return _word(syms[0].Pos, syms[0].Symbol) }
-
 		var elems []Value
 		for _, ps := range syms { elems = append(elems, _word(ps.Pos, ps.Symbol)) }
 		return _compound(elems...)
 	}
 
-	// 1. Extract `res` directly from the Matcher's active frame/results
-	if rl := len(s.results); rl > 0 {
+	if len(fullMatchSyms) > 0 {
+		res = rebuild(fullMatchSyms)
+	} else if rl := len(s.results); rl > 0 {
 		res = s.results[rl-1].(Value)
 	}
 
-	// 2. Extract `rem` by natively flushing whatever is left on the Generator tape!
+	// 2. Extract `rem` by flushing whatever is left on the Generator tape
 	var remSyms []posym
-	for gen.ensure_syms() {
-		remSyms = append(remSyms, gen.syms...)
-		gen.syms = nil
+	for s.tie.ensure_syms() {
+		remSyms = append(remSyms, s.tie.syms...)
+		s.tie.syms = nil
 	}
+	if len(remSyms) > 0 { rem = rebuild(remSyms) }
 
-	if len(remSyms) > 0 {
-		rem = rebuild(remSyms)
-	}
+	if force_full_match_anchor { matched = matched && s.tie.exhausted() }
 
-	// Stream Termination Symmetry Checks
-	if force_full_match_anchor { matched = matched && gen.exhausted() }
-
-	// 3. Extract `stems` natively from the Matcher's captures
+	// 3. Extract `stems`
 	if numStems := len(s.stems); numStems > 0 {
 		stems = make([]Value, numStems)
 		for i, capture := range s.stems {
 			var stem Value
 			if len(capture.syms) > 0 {
-
-				// Rebuild the captured fragment into an AST natively
 				stem = rebuild(capture.syms)
-
 				if capture.name.Symbol != symEmpty && stem != nil {
 					stem = &named_stem{stem, capture.name.Symbol}
 				}
 			}
-
-			if trail {
-				stems[numStems-1-i] = stem
-			} else {
-				stems[i] = stem
-			}
+			if trail { stems[numStems-1-i] = stem } else { stems[i] = stem }
 		}
 	}
 
-	// Sanity Warnings
 	if checkpoints {
-		if matched {
-			if !s.exhausted() {
-				warn(pc(s.Context, pattern), "pattern stream not exhausted: %v %v; ops=%v str=%q syms=%v",
-					pattern, target, s.ops, s.str, s.syms)
-			}
-			if force_full_match_anchor && !gen.exhausted() {
-				warn(pc(s.Context, target), "value stream not exhausted: %v %v; ops=%v str=%q syms=%v",
-					pattern, target, gen.ops, gen.str, gen.syms)
-			}
-			if rem == nil && len(gen.str) > 0 {
-				warn(pc(s.Context, target), "leaked fractional shattering: %v %v -> %s",
-					pattern, target, gen.str)
-			}
-		}
 		check_match(s.Context, pattern, target, trail)(&matched, &res, &rem, &stems)
 	}
 	return
@@ -5300,7 +5462,6 @@ func (s *symstr) match(pattern, target Value) (matched bool, res, rem Value, ste
 // match matches pattern against target value.
 func match(ctx Context, pattern, target Value) (matched bool, res, rem Value, stems []Value) {
 	if target == nil || pattern == nil { return false, nil, target, nil }
-
 	if checkpoints {
 		switch sf("%v %v", pattern, target) {
 		// case "":
@@ -5313,22 +5474,20 @@ func match(ctx Context, pattern, target Value) (matched bool, res, rem Value, st
 			d_step = 2; defer func(i int) { d_step = i } (d_step)
 		}
 	}
-
-	matcher := &symstr{Context: ctx}
-	return matcher.match(pattern, target)
+	return (&symstr{Context: ctx}).match(pattern, target)
 }
 
 // eval fully leverages the Virtual Machine's single-stream Generator Mode
 // to dynamically unroll and pack AST nodes without recursive heap allocations.
-func (s *symstr) eval(v Value) Value {
-	if res := s.evals(v); len(res) > 0 {
+func (s *symstr) eval(v Value) (res Value) {
+	if vals := s.evals(v); len(vals) > 0 {
+		if len(vals) == 1 { res = vals[0] } else { res = &list{elements{vals}} }
 		if checkpoints {
-			if len(res) > 1 { erro(s.Context, "too many results: %v", res) }
 
-			check(s.Context, res[0], v)
+			check(s.Context, res, v)
 
 			// Checking eval(eval(AST)) == eval(AST)
-			var res1 = s.evals(res...)
+			var res1 = s.evals(vals...)
 			var res2 = s.evals(res1...)
 
 			if len(res1) != len(res2) {
@@ -5347,7 +5506,7 @@ func (s *symstr) eval(v Value) Value {
 				}
 			}
 		}
-		return res[0]
+		return
 	}
 	return _null(v.Pos())
 }
@@ -5596,7 +5755,7 @@ func _hash(ctx Context, h uint64, vs ...Value) uint64 {
 		case *regexpat:    h = mixString(h, p.re.String())
 		case *regexalt:    h = _hash(ctx, h, p.elems...)
 		case *regexlit:    h = _hash(ctx, h, p.Value)
-		case *regexgroup:  h = _hash(ctx, mixUint64(h, uint64(p.cap)), p.val)
+		case *matchgroup:  h = _hash(ctx, mixUint64(h, uint64(p.cap)), p.val)
 		case *regexmeta:   h = mixUint64(h, uint64(p.op))
 		case *regexclass:  for _, r := range p.runes { h = mixUint64(h, uint64(r)) }
 		case *regexrep:
@@ -10062,7 +10221,7 @@ const (
     KindRegexCon
 	KindRegexAlt
 	KindRegexRep
-	KindRegexGroup
+	KindMatchgroup
 	KindRegexClass
 	KindRegexMeta
 	KindRegexLit // Regex Literal
@@ -10138,7 +10297,7 @@ var kindNames = []struct {
 	{KindRegexCon, "RegexCon"},
 	{KindRegexAlt, "RegexAlt"},
 	{KindRegexRep, "RegexRep"},
-	{KindRegexGroup, "RegexGroup"},
+	{KindMatchgroup, "Matchgroup"},
 	{KindRegexClass, "RegexClass"},
 	{KindRegexMeta, "RegexMeta"},
 	{KindRegexLit, "RegexLit"},
@@ -13217,7 +13376,7 @@ expr_loop:
 				var inner Value
 				if c.tok != RPAREN { inner = c.expr() }
 				if c.tok == RPAREN { c.step() }
-				val = &regexgroup{valbase{loc}, idx, name, flags, inner}
+				val = &matchgroup{valbase{loc}, idx, name, flags, inner}
 			} else {
 				val = c.expr()
 				if c.tok == RPAREN { c.step() }
@@ -22218,22 +22377,22 @@ func (p *regexquote) source(b *compactbuilds) {
 }
 func (p *regexquote) build(b *compactbuilds) { p.source(b) }
 
-// regexgroup handles both capturing and non-capturing groups.
+// matchgroup handles both capturing and non-capturing groups.
 // Upgraded to support named captures (?P<name>re) and inline flags (?is-m:re) or (?is-m)
-type regexgroup struct {
+type matchgroup struct {
 	valbase
 	cap   int    // Capture index; 0 means non-capturing
 	name  Symbol // Named capture: (?P<name>re)
 	flags Symbol // Inline flags: (?is-m:re) or (?is-m)
 	val   Value  // The internal pattern (can be nil for pure flag toggles)
 }
-func (_ *regexgroup) kind() Kind { return 0 } // KindRegexGroup
-func (p *regexgroup) String() string {
+func (_ *matchgroup) kind() Kind { return 0 } // KindMatchgroup
+func (p *matchgroup) String() string {
 	var b compactbuilds
 	p.source(&b)
 	return b.shared()
 }
-func (p *regexgroup) source(b *compactbuilds) {
+func (p *matchgroup) source(b *compactbuilds) {
 	b.setRaw(true)
 	b.writeByte('(')
 	if p.cap > 0 {
@@ -22252,7 +22411,7 @@ func (p *regexgroup) source(b *compactbuilds) {
 	}
 	b.writeByte(')')
 }
-func (p *regexgroup) build(b *compactbuilds) {
+func (p *matchgroup) build(b *compactbuilds) {
 	b.setRaw(true)
 	b.writeByte('(')
 	if p.cap > 0 {
@@ -26145,7 +26304,7 @@ func ts(i any, o ...any) (s string) {
 		b.write(_ts(x.val))
 		x.formatRepetition(&b)
 		content = b.shared()
-	case  *regexgroup:
+	case  *matchgroup:
 		var b compactbuilds
 		x.source(&b)
 		b.write(" ")
