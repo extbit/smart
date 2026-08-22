@@ -3323,12 +3323,22 @@ type cartesian_iter struct {
 	total       int
 	count       int
 }
+func (p *cartesian_iter) String() string {
+	var b compactbuilds
+	b.writef("cartesian_iter{%v,%v}", p.constructOp, p.matrix)
+	return b.shared()
+}
 
 type match_rep_iter struct {
 	min, max int
 	count    int
 	greedy   bool
 	payload  Value // The AST node to repeat (e.g., regexclass, exact string, etc.)
+}
+func (p *match_rep_iter) String() string {
+	var b compactbuilds
+	b.writef("match_rep_iter{%v,%d,%d,%d,%v}", p.payload, p.min, p.max, p.count, p.greedy)
+	return b.shared()
 }
 
 func (s *symstr) step() {
@@ -3653,7 +3663,9 @@ _op_switch_:
 			s.operands = append(s.operands, t)
 
 		default:
-			erro(pc(s,arg), "VM execution trap: opForEach unexpected %T", arg, unwind{})
+			e := _f("VM execution trap: opForEach unexpected %s", ts(arg,s)).erro()
+			s.ops = append(s.ops, opDebug)
+			s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
 		}
 
 	case opForEachRev:
@@ -3677,7 +3689,9 @@ _op_switch_:
 			s.operands = append(s.operands, t)
 
 		default:
-			erro(pc(s,arg), "VM execution trap: opForEachRev unexpected %T", arg, unwind{})
+			e := _f("VM execution trap: opForEachRev unexpected %s", ts(arg,s)).erro()
+			s.ops = append(s.ops, opDebug)
+			s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
 		}
 
 	case opExpand: // Designed for dynamic op (wrappers), e.g., opLoop.
@@ -3726,7 +3740,9 @@ _op_switch_:
 			}
 
 		default:
-			erro(pc(s, top), "VM execution trap: opEvalResult unexpected %T", top, unwind{})
+			e := _f("VM execution trap: opEvalResult unexpected %s", ts(top,s)).erro()
+			s.ops = append(s.ops, opDebug)
+			s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
 		}
 
 	case opEval: // Works with opForEach to evaluate unrolled value!
@@ -3743,14 +3759,14 @@ _op_switch_:
 				s.operands = append(s.operands, len(t.a))
 				if len(t.a) > 0 {
 					s.ops = append(s.ops, opLoop)
-					s.operands = append(s.operands, &op_loop{t.a, 1, 0, len(t.a), opExpand, symEmpty})
+					s.operands = append(s.operands, &op_loop{t.a, 1, 0, len(t.a), opEval, symEmpty})
 				}
 
 				s.ops = append(s.ops, opGroup)
 				s.operands = append(s.operands, len(t.o))
 				if len(t.o) > 0 {
 					s.ops = append(s.ops, opLoop)
-					s.operands = append(s.operands, &op_loop{t.o, 1, 0, len(t.o), opExpand, symEmpty})
+					s.operands = append(s.operands, &op_loop{t.o, 1, 0, len(t.o), opEval, symEmpty})
 				}
 
 				if t.x != nil {
@@ -3775,14 +3791,14 @@ _op_switch_:
 				s.operands = append(s.operands, len(t.a))
 				if len(t.a) > 0 {
 					s.ops = append(s.ops, opLoop)
-					s.operands = append(s.operands, &op_loop{t.a, 1, 0, len(t.a), opExpand, symEmpty})
+					s.operands = append(s.operands, &op_loop{t.a, 1, 0, len(t.a), opEval, symEmpty})
 				}
 
 				s.ops = append(s.ops, opGroup)
 				s.operands = append(s.operands, len(t.o))
 				if len(t.o) > 0 {
 					s.ops = append(s.ops, opLoop)
-					s.operands = append(s.operands, &op_loop{t.o, 1, 0, len(t.o), opExpand, symEmpty})
+					s.operands = append(s.operands, &op_loop{t.o, 1, 0, len(t.o), opEval, symEmpty})
 				}
 
 				// Push raw t.x without opResolve!
@@ -3803,14 +3819,14 @@ _op_switch_:
 			s.operands = append(s.operands, len(t.a))
 			if len(t.a) > 0 {
 				s.ops = append(s.ops, opLoop)
-				s.operands = append(s.operands, &op_loop{t.a, 1, 0, len(t.a), opExpand, symEmpty})
+				s.operands = append(s.operands, &op_loop{t.a, 1, 0, len(t.a), opEval, symEmpty})
 			}
 
 			s.ops = append(s.ops, opGroup)
 			s.operands = append(s.operands, len(t.o))
 			if len(t.o) > 0 {
 				s.ops = append(s.ops, opLoop)
-				s.operands = append(s.operands, &op_loop{t.o, 1, 0, len(t.o), opExpand, symEmpty})
+				s.operands = append(s.operands, &op_loop{t.o, 1, 0, len(t.o), opEval, symEmpty})
 			}
 
 			if t.x != nil {
@@ -3881,7 +3897,9 @@ _op_switch_:
 				s.operands = append(s.operands, resolved)
 
 			} else {
-				erro(pc(s, t), "ambiguous pattern: cannot determine if Glob or Regex. Use {g %[1]v} or {r %[1]v}", t.sym, unwind{})
+				e := _f("ambiguous pattern: cannot determine if Glob or Regex. Use {g %[1]v} or {r %[1]v}", t.sym)
+				s.ops = append(s.ops, opDebug)
+				s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
 			}
 
 		case *list:
@@ -3953,7 +3971,10 @@ _op_switch_:
 			break _op_switch_
 
 		default:
-			erro(pc(s,arg), "VM execution trap: opEval unexpected %T", arg, unwind{})
+			e := _f("VM execution trap: opEval unexpected %s", ts(arg,s)).erro()
+			s.ops = append(s.ops, opDebug)
+			s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
+			s.results = append(s.results, nil)
 		}
 
 	case opClosure, opDelegate:
@@ -3984,11 +4005,14 @@ _op_switch_:
 		cons := s.operands[l-1].([]any)
 		s.operands = s.operands[:l-1]
 
-		x := cons[0].(resolve_result)
-		o := cons[1].([]Value)
-		a := cons[2].([]Value)
-
-		if x.obj == nil { x.obj = x.Value }
+		var x resolve_result
+		var o, a []Value
+		if len(cons) != 3 { goto _corrupted_evoke } else {
+			if t, ok := cons[0].(resolve_result); ok { x = t } else { goto _corrupted_evoke }
+			if t, ok := cons[1].([]Value); ok { o = t } else { goto _corrupted_evoke }
+			if t, ok := cons[2].([]Value); ok { a = t } else { goto _corrupted_evoke }
+			if x.obj == nil { x.obj = x.Value }
+		}
 
 		for i := len(s.evoking) - 1; i >= 0; i-- {
 			if s.evoking[i] == x {
@@ -4030,8 +4054,18 @@ _op_switch_:
 		case Value: //*word, *raw, *strlit, *decimal, undef:
 			s.results = append(s.results, t)
 		default:
-			erro(pc(s,x), "opEvoke: unexpected %[1]T %[1]v", x.obj, unwind{})
+			e := _f("VM execution trap: opEvoke unexpected %s", ts(x.obj,s)).erro()
+			s.ops = append(s.ops, opDebug)
+			s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
 		}
+
+		break _op_switch_
+
+	_corrupted_evoke:
+		e := _f("corrupted evoke: %v %v", ts(cons,s), cons)
+		s.ops = append(s.ops, opDebug)
+		s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
+		s.results = append(s.results, nil)
 
 	case opCartesianCompose:
 		constructOp := s.operands[l-1].(evalop)
@@ -4354,7 +4388,12 @@ _op_switch_:
 			case *escaped:    str = leaf.s
 			case *strlit:     str = leaf.s
 			case *regexquote: str = leaf.text
-			default: erro(s.Context, "unsupported regex unroll node: %T", val, unwind{})
+			default:
+				e := _f("VM execution trap: unsupported match unroll node %s", ts(val,s)).erro()
+				s.ops = append(s.ops, opDebug)
+				s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
+				s.results = append(s.results, nil)
+				break _op_switch_
 			}
 
 			if str == "" { break _op_switch_ }
@@ -4517,7 +4556,8 @@ _op_switch_:
 			case *escaped:    str = leaf.s
 			case *strlit:     str = leaf.s
 			case *regexquote: str = leaf.text
-			default: erro(s.Context, "unsupported regex unroll node: %T", val, unwind{})
+			default:
+				erro(s.Context, "unsupported regex unroll node: %T", val, unwind{})
 			}
 
 			if str == "" { break _op_switch_ }
@@ -4665,7 +4705,9 @@ _op_switch_:
 	case opDebug: s.opDebug(l, rl)
 	case opEnd: s.err = io.EOF
 	default:
-		erro(s, "VM execution trap: unimplemented op: %v", op, unwind{})
+		e := _f("VM execution trap: unimplemented op %v", op).erro()
+		s.ops = append(s.ops, opDebug)
+		s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
 	}
 }
 
@@ -4943,7 +4985,9 @@ _query_pos:
 	prompt(s.Context, format.shared(), args...)
 
 	for _, a := range args {
-		if _, ok := a.(unwind); ok { panic("debug unwind") }
+		if _, ok := a.(unwind); ok {
+			panic("debug unwind")
+		}
 	}
 }
 
@@ -6998,7 +7042,11 @@ type tracked_stub struct {
 	args  []any // Preserves the raw arguments for opDebug to unpack
 }
 
-func (t *tracked_stub) String() string { return "tracked_stub{}" }
+func (t *tracked_stub) String() string {
+	var b compactbuilds
+	b.writef("tracked_stub{%s}", ts(t.args))
+	return b.shared()
+}
 
 // track captures the current runtime callstack location to yield a structural "loc"
 // stub for debugging VM operations. It natively unpacks structs like callstack{num: x}.
@@ -7131,8 +7179,12 @@ const (
 
 type diagtype int
 type diag struct{ t diagtype; f string; a []any }
+func (d *diag) dt(t diagtype) *diag { d.t = t; return d }
+func (d *diag) erro() *diag { d.t = diagError; return d }
+func (d *diag) warn() *diag { d.t = diagWarn; return d }
+func (d *diag) info() *diag { d.t = diagInfo; return d }
 func _ft(t diagtype, f string, a ...any) *diag { return &diag{t, f, a} }
-func _f(f string, a ...any) *diag { return &diag{0, f, a} }
+func _f(f string, a ...any) *diag { return &diag{diagDebug, f, a} }
 
 // DOD: Deferred format template and Small Buffer Optimization (SBO)
 type diagpoint struct {
