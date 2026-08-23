@@ -2990,6 +2990,7 @@ const (
 	opQualword          // Combines N results into a qualword node
 	opGlobbrace         // Combines N results into a globbrace node
 	opPath              // Combines N results into a path node
+	opArrow
 	opDelegate
 	opClosure
 	opConjunct          // Merges results into a logical AND node
@@ -3080,6 +3081,7 @@ var evalopNames = [...]string{
 	"opQualword",
 	"opGlobbrace",
 	"opPath",
+	"opArrow",
 	"opDelegate",
 	"opClosure",
 	"opConjunct",
@@ -4027,6 +4029,28 @@ _op_switch_:
 			s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
 			s.results = append(s.results, nil)
 		}
+
+	case opSelect: // Works with opForEach to evaluate unrolled value!
+		cons := s.operands[l-1].([]Value)
+		s.operands = s.operands[:l-1]
+
+		obj, arg := cons[0], cons[1]
+
+		e := _f("VM execution trap: unimplemented %v %s %s", op, ts(obj,s), ts(arg,s)).erro()
+		s.ops = append(s.ops, opDebug)
+		s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
+		s.results = append(s.results, nil)
+
+	case opArrow:
+		cons := s.operands[l-1].([]Value)
+		s.operands = s.operands[:l-1]
+
+		obj, arg := cons[0], cons[1]
+
+		e := _f("VM execution trap: unimplemented %v %s %s", op, ts(obj,s), ts(arg,s)).erro()
+		s.ops = append(s.ops, opDebug)
+		s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
+		s.results = append(s.results, nil)
 
 	case opClosure, opDelegate:
 		cons := s.operands[l-1].([]any)
@@ -11510,15 +11534,15 @@ func (p *compiler) rule_params(args []Value) (err error) {
 	return
 }
 
-type closure_selection struct{}
-type selection struct{}
+type is_selection_closure struct{}
+type is_selection struct{}
 type selection_ctx struct{ Context ; closure bool }
 func (p selection_ctx) do(ctx Context, op any) (_ any) {
 	switch t := op.(type) {
 	case inner_cast: return p.Context
 	case dynamic_cast: return t.ctx(p, p.Context)
-	case closure_selection: return p.closure
-	case selection: return true
+	case is_selection_closure: return p.closure
+	case is_selection: return true
 	}
 	return p.Context.do(ctx, op)
 }
@@ -12130,7 +12154,7 @@ func (p *compiler) is_dot_term() bool {
 	switch p.tok {
 	case SPACE, LPAREN, COLON, PCON, ASSIGN: fallthrough
 	case SELECT_PROP, SELECT_PROG1, SELECT_PROG2:
-		if true || truly(p, selection{}) { return true }
+		if true || truly(p, is_selection{}) { return true }
 	}
 	return p.is_end_of_line() || p.is_list_term()
 }
@@ -12540,20 +12564,20 @@ func (p *compiler) resolve(pos Pos, sym Symbol, isClosure bool) (result Value) {
 	return
 }
 
-type opt_ident struct{}
-type opt_ident_ctx struct{ Context }
-func (c *opt_ident_ctx) do(ctx Context, op any) (_ any) {
+type is_optional_enabled struct{}
+type enable_optional_ctx struct{ Context }
+func (c *enable_optional_ctx) do(ctx Context, op any) (_ any) {
     switch t := op.(type) {
 	case inner_cast: return c.Context
 	case dynamic_cast: return t.ctx(c, c.Context)
-    case opt_ident_ctx: return c
-	case opt_ident: return true
+	case is_optional_enabled: return true
     }
     return c.Context.do(ctx, op)
 }
-func optional_ident(ctx Context) Context {
-    if do(ctx, opt_ident_ctx{}) == nil { ctx = &opt_ident_ctx{ctx} }
-    return ctx
+
+func _enable_optional_ctx(ctx Context) Context {
+	if truly(ctx, is_optional_enabled{}) { return ctx }
+	return &enable_optional_ctx{ctx}
 }
 
 type symident struct{}
@@ -12568,7 +12592,7 @@ func (c *ident_ctx) do(ctx Context, op any) (_ any) {
     case delegate_ident: c.nil = 1; return
     case  closure_ident: c.nil = 2; return
     case  set_opt_ident: c.nil = 3; return
-    case opt_ident: if c.nil > 0 { return true }
+    case is_optional_enabled: if c.nil > 0 { return true }
     case ident_ctx: switch t.Context { case nil, c, c.Context: return c }
 	case symident: return true
     }
@@ -12841,7 +12865,7 @@ func ident(ctx Context, x Value) string {
 		return ""
 	}
 }
-func (p *compiler) identity(tok token, name Value, isClosure bool) (obj Value, sym Symbol, opts []Value) {
+func (p *compiler) resolveIdentity(tok token, name Value, isClosure bool) (obj Value, sym Symbol, opts []Value) {
 	// Obtains and cast (if needed) ctx into an ident_ctx.
 	ic, cc := identity_ctx(p.Context)
 	if ic.nil > 0 {
@@ -12863,7 +12887,7 @@ func (p *compiler) identity(tok token, name Value, isClosure bool) (obj Value, s
 		return x, symEmpty, opts
 
 	case *argumented:
-		obj, sym, opts = p.identity(tok, x.Value, isClosure)
+		obj, sym, opts = p.resolveIdentity(tok, x.Value, isClosure)
 		opts = append(opts, merge(x.args...)...)
 		return
 
@@ -12885,7 +12909,7 @@ func (p *compiler) identity(tok token, name Value, isClosure bool) (obj Value, s
 	}
 
 	if sym == symEmpty {
-		if truly(p.Context, opt_ident{}) { return name, sym, opts }
+		if truly(p.Context, is_optional_enabled{}) { return name, sym, opts }
 		erro(pc(p,name), "empty ident: %v (nil=%d) : %s", name, ic.nil, ts(name,p))
 		return // Ensure we halt execution safely
 	}
@@ -12893,7 +12917,7 @@ func (p *compiler) identity(tok token, name Value, isClosure bool) (obj Value, s
 	switch tok {
 	case LPAREN:
 		if obj = p.resolve(name.Pos(), sym, isClosure); obj != nil { return }
-		if truly(p.Context, opt_ident{}) { return name, sym, opts }
+		if truly(p.Context, is_optional_enabled{}) { return name, sym, opts }
 
 	case LBRACE:
 		if e := p.project.entry(p, name); !e.valid() {
@@ -12911,6 +12935,21 @@ func (p *compiler) identity(tok token, name Value, isClosure bool) (obj Value, s
 		_fMapKeys(". %v", p.project.projs),
 		trace_ctx{100}, callstack{num:10})
 
+	return
+}
+
+func (p *compiler) identity(tok token, closure bool) (name, obj Value, sym Symbol, opts []Value) {
+	sc := selection_ctx{p.Context, closure}; defer func() { p.Context = sc.Context } ()
+	p.Context = sc
+
+	name = p.expr()
+
+	if closure || isOptional(name) {
+		defer func(c Context) { p.Context = c } (p.Context)
+		p.Context = _enable_optional_ctx(p.Context)
+	}
+
+	obj, sym, opts = p.resolveIdentity(tok, name, closure)
 	return
 }
 
@@ -12984,23 +13023,12 @@ func (p *compiler) calling() (result Value) {
 	switch p.tok {
 	case LPAREN, LBRACE: // $(...), ${...}
 		tok = p.tok
-		p.step()
 
-		if p.tok == SPACE { erro(p, "unexpected spaces") }
-
-		sc := selection_ctx{p.Context, closure}
-		p.Context = sc
-		name = p.expr()
-		p.Context = sc.Context
-
-		var is_optional_ident bool
-		if closure || isOptional(name) {
-			defer func(c Context) { p.Context = c } (p.Context)
-			p.Context = optional_ident(p.Context)
-			is_optional_ident = true
+		if p.step(); p.tok == SPACE {
+			erro(p, "unexpected spaces", unwind{})
 		}
 
-		obj, sym, opts = p.identity(tok, name, closure)
+		name, obj, sym, opts = p.identity(tok, closure) 
 
 		// Extract arguments dynamically based on context symbol
 		if (tok == LPAREN && p.tok != RPAREN) || (tok == LBRACE && p.tok != RBRACE) {
@@ -13010,20 +13038,20 @@ func (p *compiler) calling() (result Value) {
 			switch sym {
 			case symEmpty: p.spaces()
 			case symAnd, symOr, symCase:
-				if !is_optional_ident {
+				if !truly(p.Context, is_optional_enabled{}) {
 					defer func(c Context) { p.Context = c } (p.Context)
-					p.Context = optional_ident(p.Context)
+					p.Context = _enable_optional_ctx(p.Context)
 				}
 			case symGrep:
 				p.Context = &parse_grep_ctx{p.Context, objbase{valbase{p.pos}, _term(p.Context).scope}, nil}
 			}
 
 			// 1. Parse the FIRST argument
-			// 🟢 FIX: Restore `parseValues()` to properly gather space-separated sequences
+			// 🟢 Use `parseValues()` to properly gather space-separated sequences
 			// (like `$0 $1 $2`) into discrete `list` arguments before the COMMA!
 			args = append(args, _list(p.parseValues()...))
 
-			// 2. THE DOD FIX: Push foreach loop-variable shielding ONLY for the body!
+			// 2. Push foreach loop-variable shielding ONLY for the body!
 			if sym == symForeach {
 				a := &auto{knownobject{objbase{valbase{p.pos}, _term(p.Context).scope}, symUnderscore}}
 				fc := &parse_foreach_ctx{p.Context, a}; defer func() { p.Context = fc.Context } ()
@@ -13057,7 +13085,7 @@ func (p *compiler) calling() (result Value) {
 	case STRING, STRCOMP:
 		tok = p.tok
 		name = p.expr()
-		obj, sym, opts = p.identity(tok, name, closure)
+		obj, sym, opts = p.resolveIdentity(tok, name, closure)
 
 	case WORD:
 		if p.sym != symUnderscore {
@@ -13311,8 +13339,8 @@ expr_loop:
 					isOptional := false
 					fi := len(c.frames) - 1
 
-					// Rule 2: via '→' (Current frame is already building a selection)
-					if c.frames[fi].ctor == opSelect {
+					// 🟢 FIX: Check for BOTH opSelect and opArrow!
+					if c.frames[fi].ctor == opSelect || c.frames[fi].ctor == opArrow {
 						isOptional = true
 					} else {
 						// Safe Scanner Peek (1 Token)
@@ -13948,7 +13976,15 @@ expr_loop:
 			c.ops = append(c.ops, opReduce)
 			execute()
 			c.ops = append(c.ops, opResolve, opSwap, opIdent, opSwap, opFrame)
-			c.operands = append(c.operands, c.tok, 1, 1, 1, opSelect)
+
+			// 🟢 FIX: Dynamically select opArrow vs opSelect based on Delegate execution context
+			op := evalop(opSelect)
+			if tok != SELECT_PROP && !truly(c.Context, is_selection{}) {
+				op = opArrow
+			}
+
+			// 🟢 Push `tok` (the actual operator), NOT `c.tok` (the lookahead token)
+			c.operands = append(c.operands, tok, 1, 1, 1, op)
 			execute()
 			continue
 		}
