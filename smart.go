@@ -3290,6 +3290,28 @@ type ident_result struct { Value; name Symbol }
 type resolve_result struct { Value; obj Value }
 type loop_sep struct { posym }
 
+func (p ident_result) Pos() (_ Pos) {
+	if p.Value != nil { return p.Value.Pos() }
+	return
+}
+
+func (p resolve_result) Pos() (_ Pos) {
+	if p.Value != nil { return p.Value.Pos() }
+	return
+}
+
+func (p ident_result) String() string {
+	var b compactbuilds
+	b.writef("ident_result{%v|%v}", p.Value, p.name)
+	return b.shared()
+}
+
+func (p resolve_result) String() string {
+	var b compactbuilds
+	b.writef("resolve_result{%v|%v}", p.Value, p.obj)
+	return b.shared()
+}
+
 type restore_context struct { Context }
 func (c restore_context) String() string {
 	var b compactbuilds
@@ -3553,7 +3575,9 @@ _op_switch_:
 			s.operands = append(s.operands, t, opIdent)
 			break _op_switch_ // Suspend current operation
 		default:
-			erro(pc(s.Context, x), "FIXME: opIdent unhandled %[1]T %[1]v", x, unwind{})
+			e := _f("VM execution trap: opIdent unexpected %s", ts(x,s)).erro()
+			s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
+			s.ops = append(s.ops, opDebug)
 		}
 
 		s.results = append(s.results, id)
@@ -4432,7 +4456,7 @@ _op_switch_:
 					var rem []posym
 					if right.Symbol != symEmpty { rem = append(rem, right) }
 					if targetIdx+1 < len(s.tie.syms) { rem = append(rem, s.tie.syms[targetIdx+1:]...) }
-					s.tie.syms = rem 
+					s.tie.syms = rem
 				} else {
 					if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
 				}
@@ -4472,7 +4496,7 @@ _op_switch_:
 
 		if matched {
 			left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, size)
-			
+
 			// 🟢 Accumulate
 			for i := range s.stems {
 				if s.stems[i].start == -1 {
@@ -4499,7 +4523,7 @@ _op_switch_:
 		switch anchor.op {
 		case regex_syntax.OpBeginLine, regex_syntax.OpBeginText: matched = atBOF
 		case regex_syntax.OpEndLine, regex_syntax.OpEndText:     matched = atEOF
-		case regex_syntax.OpWordBoundary, regex_syntax.OpNoWordBoundary: matched = true 
+		case regex_syntax.OpWordBoundary, regex_syntax.OpNoWordBoundary: matched = true
 		}
 
 		if !matched {
@@ -4610,7 +4634,7 @@ _op_switch_:
 
 				if idx == limitByte && idx >= 0 {
 					left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, limitByte)
-					
+
 					// 🟢 Accumulate consumed tokens to all open reverse stems
 					var consumed []posym
 					if right.Symbol != symEmpty { consumed = append(consumed, right) }
@@ -4666,7 +4690,7 @@ _op_switch_:
 			for _, sym := range s.tie.syms { totalLen += sym.len() }
 
 			left, right, targetIdx := __posymSeqSplitAt(s.tie.syms, totalLen - size)
-			
+
 			// 🟢 Accumulate
 			var consumed []posym
 			if right.Symbol != symEmpty { consumed = append(consumed, right) }
@@ -4694,7 +4718,7 @@ _op_switch_:
 		switch anchor.op {
 		case regex_syntax.OpBeginLine, regex_syntax.OpBeginText: matched = atEOF // FLIPPED
 		case regex_syntax.OpEndLine, regex_syntax.OpEndText:     matched = atBOF // FLIPPED
-		case regex_syntax.OpWordBoundary, regex_syntax.OpNoWordBoundary: matched = true 
+		case regex_syntax.OpWordBoundary, regex_syntax.OpNoWordBoundary: matched = true
 		}
 
 		if !matched {
@@ -4762,7 +4786,7 @@ _op_switch_:
 			if sym == symEmpty { sym = intern(strconv.Itoa(capIdx)) }
 			// 🟢 Push an OPEN capture group marker (-1 for forward)
 			s.stems = append(s.stems, capture{
-				start: -1, 
+				start: -1,
 				end:   -1,
 				name:  posym{pos, sym},
 				syms:  nil,
@@ -4810,7 +4834,7 @@ _op_switch_:
 			if sym == symEmpty { sym = intern(strconv.Itoa(capIdx)) }
 			// 🟢 Push an OPEN capture group marker (-2 for reverse)
 			s.stems = append(s.stems, capture{
-				start: -2, 
+				start: -2,
 				end:   -1,
 				name:  posym{pos, sym},
 				syms:  nil,
@@ -5037,18 +5061,33 @@ func (s *symstr) pop_head() posym {
 }
 
 func (s *symstr) opDebug(l, rl int) {
+	var args, extra []any
+	var format compactbuilds
+	format.setRaw(true)
+
+	defer func() {
+		if e := recover(); e != nil {
+			format.write("%v\n")
+			args = append(args, e)
+		}
+
+		args = append(args, extra...)
+		prompt(s.Context, format.shared(), args...)
+
+		for _, a := range args {
+			if _, ok := a.(unwind); ok {
+				panic("debug unwind")
+			}
+		}
+	} ()
+
 	var trace string
-	var extra []any
 	if t, ok := s.operands[l-1].(*tracked_stub); ok {
 		trace, extra = string(t.trace), t.args
 		s.operands = s.operands[:l-1]
 	}
 
-	var format compactbuilds
-	format.setRaw(true)
-
 	var pos Pos
-	var args []any
 	var isRes bool
 	var val any
 	if l = len(s.operands); l > 0 { val = s.operands[l-1] }
@@ -5058,7 +5097,7 @@ _query_pos:
 		switch t := val.(type) {
 		case posym: pos = t.Pos // Extract Pos natively
 		case Pos: pos = t
-		case Value: pos = t.Pos()
+		case Value: pos = t.Pos() // 🟢 Native nil-pointer panic expected and desired here if state is corrupted
 		case []Value: if len(t) > 0 { pos = t[0].Pos() }
 		}
 	}
@@ -5066,6 +5105,7 @@ _query_pos:
 		val, isRes = s.results[rl-1], true
 		goto _query_pos
 	}
+	if pos == NoPos { pos = s.loc }
 
 	if p, ok := do(s.Context, get_fatpos{pos}).(Position); ok && p.valid() {
 		format.write("%s:%d:")
@@ -5076,17 +5116,19 @@ _query_pos:
 		}
 	}
 
+	// 🟢 FIX: Save index to safely replace "VALUE" without overwriting p.Filename
+	statusIdx := len(args)
 	format.write("[%s] VM Tick: %d\n")
 	args = append(args, "VALUE", s.opsDone)
 
 	if err, ok := val.(error); ok && err != nil {
 		s.err = err
-		s.operands = s.operands[:l-2]
-		args[0] = "ERROR"
+		s.operands = s.operands[:l-2] // 🟢 Strict precondition
+		args[statusIdx] = "ERROR"
 		format.write("  Error      : %v\n")
 		args = append(args, err)
 	} else if val == nil {
-		args[0] = "<nil-value>"
+		args[statusIdx] = "<nil-value>"
 	} else {
 		format.write("  Value Type : %T\n  Value      : %v\n")
 		args = append(args, val, val)
@@ -5119,15 +5161,6 @@ _query_pos:
 	} else {
 		format.write("\n  Results    : %v\n%s")
 		args = append(args, s.results, trace)
-	}
-
-	args = append(args, extra...)
-	prompt(s.Context, format.shared(), args...)
-
-	for _, a := range args {
-		if _, ok := a.(unwind); ok {
-			panic("debug unwind")
-		}
 	}
 }
 
@@ -13410,7 +13443,7 @@ expr_loop:
 					for len(hexStr) < 2 && c.tok != EOF {
 						s := c.lit
 						if c.tok == WORD { s = c.sym.String() }
-						
+
 						valid := 0
 						for valid < len(s) && len(hexStr)+valid < 2 {
 							ch := s[valid]
@@ -13454,7 +13487,7 @@ expr_loop:
 				for len(octStr) < 3 && c.tok != EOF {
 					s := c.lit
 					if c.tok == WORD { s = c.sym.String() }
-					
+
 					valid := 0
 					for valid < len(s) && len(octStr)+valid < 3 {
 						ch := s[valid]
@@ -26427,10 +26460,12 @@ func ts(i any, o ...any) (s string) {
 		b.write(" ")
 		b.write(_ts(x.val))
 		content = b.shared()
+	case ident_result:
+		if x.Value == nil { content = _ts(x.Value) } else { content = "<nil-value>" }
+		content += "|" + x.name.String()
 	case resolve_result:
-		var obj string
-		if x.obj == nil { obj = "<nil>" } else { obj = _ts(x.obj) }
-		content = _ts(x.Value) + "|" + obj
+		if x.Value == nil { content = _ts(x.Value) } else { content = "<nil-value>" }
+		if x.obj == nil { content += "<nil>" } else { content += "|"+_ts(x.obj) }
 	case *argumented_ctx:
 		content = x.val.String() + "(" + wrap(ts_barrier{cc}, x.val.Pos(), x.args) + ")"
 	case   *argumented:
