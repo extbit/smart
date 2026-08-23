@@ -652,6 +652,8 @@ const (
 	sym_Os  // Os
 	sym_m   // m
 	sym_mm  // mm
+	sym_n   // n
+	sym_r   // r
 	sym_s   // s
 	sym_S   // S
 	sym_so  // so
@@ -1048,7 +1050,7 @@ var coreSymRaws = []string{
 	"test", "bugs", "bug", "dev", "silent",
 
 	"src", "bin", "log", "exe", "dyn", "llc", "cpp", "cxx",
-	"c", "cc", "o", "O", "Os", "m", "mm", "s", "S", "so", "h", "hh",
+	"c", "cc", "o", "O", "Os", "m", "mm", "n", "r", "s", "S", "so", "h", "hh",
 
 	"package", "version", "vendor", "url", "bugreport", "tar", "tarname", "have",
 	"fPIC", "fcxx", "fmodules", "fvisibility",
@@ -3450,7 +3452,7 @@ _op_switch_:
 			sym := symEmpty; if t.bool { sym = symOn } else { sym = symOff }
 			s.syms = append(s.syms, posym{t.pos, sym})
 		case *escaped:
-			s.syms = append(s.syms, posym{t.pos, intern(t.s)})
+			s.syms = append(s.syms, posym{t.pos, t.s})
 		case *raw:
 			s.syms = append(s.syms, posym{t.pos, __symbol(s.Context, t)})
 		case *defcaps:
@@ -4401,8 +4403,8 @@ _op_switch_:
 			switch leaf := arg.(type) {
 			case *word:       needle = leaf.s
 			case *punct:      needle = leaf.s
+			case *escaped:    needle = leaf.s
 			case *raw:        needle = intern(leaf.s)
-			case *escaped:    needle = intern(leaf.s)
 			case *strlit:     needle = intern(leaf.s)
 			case *regexquote: needle = intern(leaf.text)
 			default:
@@ -4585,8 +4587,8 @@ _op_switch_:
 			switch leaf := val.(type) {
 			case *word:       needle = leaf.s
 			case *punct:      needle = leaf.s
+			case *escaped:    needle = leaf.s
 			case *raw:        needle = intern(leaf.s)
-			case *escaped:    needle = intern(leaf.s)
 			case *strlit:     needle = intern(leaf.s)
 			case *regexquote: needle = intern(leaf.text)
 			default:
@@ -5732,7 +5734,7 @@ func _hash(ctx Context, h uint64, vs ...Value) uint64 {
 		case *word:        h = mixUint64(h, uint64(p.s))
 		case *file:        h = mixUint64(h, uint64(p.fullname()))
 		case *float:       h = mixUint64(h, math.Float64bits(p.float64)) // FIXED: Zero-loss float hashing
-		case *escaped:     h = mixString(h, p.s)
+		case *escaped:     h = mixUint64(h, uint64(p.s))
 		case *loc:         h = _hash(ctx, h, p.Value)
 		case *globrange:   h = _hash(ctx, h, p.Value)
 		case *rule:        h = _hash(ctx, h, p.target)
@@ -13381,12 +13383,111 @@ expr_loop:
 				val = c.expr()
 				if c.tok == RPAREN { c.step() }
 			}
-			c.ops = append(c.ops, opRet)
-			c.operands = append(c.operands, val)
-			execute()
-			continue expr_loop
+			goto skip_step // 🟢 Route to skip_step so it triggers auto-compounding!
 
 		case ESCAPE:
+			switch lit { // Auto switch-on regex mode
+			case `A`, `B`, `D`, `P`, `W`, `Q`, `b`, `d`, `p`, `w`: setRegex()
+			}
+
+			// 🟢 Universal Hexadecimal Escape: \x7F or \x{10FFFF}
+			if lit == "x" {
+				loc := c.loc
+				c.step() // Eat \x
+				var braced bool
+				var hexStr string
+
+				if c.tok == LBRACE {
+					c.step() // Eat {
+					for c.tok != RBRACE && c.tok != EOF {
+						if c.tok == WORD { hexStr += c.sym.String() } else { hexStr += c.lit }
+						c.step()
+					}
+					if c.tok == RBRACE { c.step() } // Eat }
+					braced = true
+				} else {
+					// Extract exactly 2 hex digits
+					for len(hexStr) < 2 && c.tok != EOF {
+						s := c.lit
+						if c.tok == WORD { s = c.sym.String() }
+						
+						valid := 0
+						for valid < len(s) && len(hexStr)+valid < 2 {
+							ch := s[valid]
+							if (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F') {
+								valid++
+							} else {
+								break
+							}
+						}
+
+						if valid > 0 {
+							hexStr += s[:valid]
+							if valid == len(s) {
+								c.step() // Consumed full token
+							} else {
+								// Partially consumed; slice and preserve the rest of the token for the next iteration!
+								c.lit = s[valid:]
+								if c.tok == WORD { c.sym = intern(c.lit) }
+								break
+							}
+						} else {
+							break
+						}
+					}
+				}
+
+				if i, e := strconv.ParseInt(hexStr, 16, 64); e == nil {
+					val = &escaped_hex{hexadecimal{integer{valbase{loc}, i, intern(hexStr)}}, braced}
+				} else {
+					erro(c, "invalid hex escape: \\x%s", hexStr, unwind{})
+				}
+				goto skip_step // 🟢 Route to skip_step
+			}
+
+			// 🟢 Universal Octal Escape: \0 to \377 (up to 3 digits)
+			if lit[0] >= '0' && lit[0] <= '7' {
+				loc := c.loc
+				octStr := lit
+				c.step() // Eat the initial escape token (e.g. \1)
+
+				for len(octStr) < 3 && c.tok != EOF {
+					s := c.lit
+					if c.tok == WORD { s = c.sym.String() }
+					
+					valid := 0
+					for valid < len(s) && len(octStr)+valid < 3 {
+						ch := s[valid]
+						if ch >= '0' && ch <= '7' {
+							valid++
+						} else {
+							break
+						}
+					}
+
+					if valid > 0 {
+						octStr += s[:valid]
+						if valid == len(s) {
+							c.step() // Consumed full token
+						} else {
+							// Partially consumed; slice and preserve the rest of the token
+							c.lit = s[valid:]
+							if c.tok == WORD { c.sym = intern(c.lit) }
+							break
+						}
+					} else {
+						break
+					}
+				}
+
+				if i, e := strconv.ParseInt(octStr, 8, 64); e == nil {
+					val = &escaped_oct{octal{integer{valbase{loc}, i, intern(octStr)}}}
+				} else {
+					erro(c, "invalid octal escape: \\%s", octStr, unwind{})
+				}
+				goto skip_step // 🟢 Route to skip_step
+			}
+
 			if isRegex {
 				switch lit {
 				case `d`, `D`, `s`, `S`, `w`, `W`:
@@ -13413,10 +13514,7 @@ expr_loop:
 					nc := &regexnamedclass{valbase{loc}, class, regexClassUnicode, negated, nil}
 					nc.runes = parseRegexClass(nc.String()) // Evaluate the perfectly reconstructed source string
 					val = nc
-					c.ops = append(c.ops, opRet)
-					c.operands = append(c.operands, val)
-					execute()
-					continue expr_loop
+					goto skip_step // 🟢 Route to skip_step
 				case `Q`:
 					loc := c.loc
 					c.step() // Eat \Q
@@ -13436,13 +13534,12 @@ expr_loop:
 					}
 					if c.tok == ESCAPE && c.lit == `E` { c.step() } // Eat \E
 					val = &regexquote{valbase{loc}, b.shared()}
-					c.ops = append(c.ops, opRet)
-					c.operands = append(c.operands, val)
-					execute()
-					continue expr_loop
+					goto skip_step // 🟢 Route to skip_step
 				}
 			}
-			val = &escaped{valbase{c.loc}, c.lit}
+			if sym == symEmpty { sym = intern(lit) }
+			if checkpoints && sym.String() != lit { erro(pc(c,c.loc), "%s != %s", sym, lit) }
+			val = &escaped{valbase{c.loc}, sym}
 			c.expect(ESCAPE)
 			goto skip_step
 
@@ -13564,10 +13661,10 @@ expr_loop:
 		if val != nil {
 			fi := len(c.frames) - 1
 
-			// Automatically open an inner frame for contiguous segments,
-			// EXCLUSIVELY inside regex domains, and exclude structural prefix markers.
+			// 🟢 FIX: Automatically open an inner frame for contiguous segments inside ALL structural frames.
+			// This guarantees concatenated nodes (like `foo$(vals)`) natively bond into compounds.
 			shouldCompound := false
-			if isRegex && (c.frames[fi].ctor == opPath || c.frames[fi].ctor == opURL || c.frames[fi].ctor == opQualword) {
+			if o := c.frames[fi].ctor; o == opRet || o == opPath || o == opURL || o == opQualword {
 				shouldCompound = true
 				switch val.(type) {
 				case valbase, *punct:
@@ -13591,10 +13688,12 @@ expr_loop:
 		}
 
 		fi := len(c.frames)-1
+		ctor := c.frames[fi].ctor
 
 		switch c.tok {
 		case LINEND, RPAREN, RBRACK, RBRACE, RBOT_CORNER, RTOP_CORNER, RANGLE, RCHEVRON, COMPOSED, SEMICOLON, EOF:
 			break expr_loop
+
 		case SPACE:
 			if truly(c.Context, braced_space_as_lit{}) {
 				break // Break switch, continue loop. The next iteration will parse it as a literal atom!
@@ -13614,21 +13713,23 @@ expr_loop:
 
 			c.step()
 
-			if false && fi > 0 && c.frames[fi].ctor == opCompound {
+			// 🟢 FIX: Protect root frame! Only reduce if opCompound is a child frame.
+			if fi > startFrames && ctor == opCompound {
 				c.ops = append(c.ops, opReduce)
 				execute()
 				fi = len(c.frames) - 1
+				ctor = c.frames[fi].ctor
 			}
 
-			if c.frames[fi].ctor == opRet {
+			if ctor == opRet {
 				c.frames[fi].ctor = opQualword
-			} else if c.frames[fi].ctor == opPath || c.frames[fi].ctor == opPair || c.frames[fi].ctor == opFlag || c.frames[fi].ctor == opURL {
+			} else if ctor == opPath || ctor == opPair || ctor == opFlag || ctor == opURL {
 				c.ops = append(c.ops, opFrame)
 				c.operands = append(c.operands, 1, opQualword)
 				execute()
-			} else if c.frames[fi].ctor != opQualword {
+			} else if ctor != opQualword {
 				// If the parent frame is ALREADY opQualword, just reduce the segment!
-				if fi > 0 && c.frames[fi-1].ctor == opQualword {
+				if fi > startFrames && c.frames[fi-1].ctor == opQualword {
 					c.ops = append(c.ops, opReduce)
 				} else {
 					c.ops = append(c.ops, opFrame, opReduce)
@@ -13641,19 +13742,22 @@ expr_loop:
 		case PCON:
 			c.step()
 
-			if isRegex && fi > 0 && c.frames[fi].ctor == opCompound {
+			// 🟢 FIX: Protect root frame!
+			if fi > startFrames && ctor == opCompound {
 				c.ops = append(c.ops, opReduce)
 				execute()
 				fi = len(c.frames) - 1
+				ctor = c.frames[fi].ctor
 			}
 
 			if truly(c.Context, is_url_parser{}) {
-				if c.frames[fi].ctor == opQualword || c.frames[fi].ctor == opURLAuth {
+				if fi > startFrames && (ctor == opQualword || ctor == opURLAuth) {
 					c.ops = append(c.ops, opReduce)
 					execute()
 					fi = len(c.frames) - 1
+					ctor = c.frames[fi].ctor
 				}
-				if c.frames[fi].ctor == opURL {
+				if ctor == opURL {
 					c.ops = append(c.ops, opRet)
 					c.operands = append(c.operands, &punct{valbase{c.loc}, symEmptyPrefix})
 
@@ -13665,15 +13769,15 @@ expr_loop:
 				}
 			}
 
-			if c.frames[fi].ctor == opRet {
+			if ctor == opRet {
 				c.frames[fi].ctor = opPath
-			} else if c.frames[fi].ctor == opPair || c.frames[fi].ctor == opFlag {
+			} else if ctor == opPair || ctor == opFlag {
 				c.ops = append(c.ops, opFrame)
 				c.operands = append(c.operands, 1, opPath)
 				execute()
-			} else if c.frames[fi].ctor != opPath {
+			} else if ctor != opPath {
 				// If the parent frame is ALREADY opPath, just reduce the segment!
-				if fi > 0 && c.frames[fi-1].ctor == opPath {
+				if fi > startFrames && c.frames[fi-1].ctor == opPath {
 					c.ops = append(c.ops, opReduce)
 				} else {
 					c.ops = append(c.ops, opFrame, opReduce)
@@ -13693,7 +13797,8 @@ expr_loop:
 			}
 
 			c.step()
-			if c.frames[fi].ctor == opRet {
+
+			if ctor == opRet {
 				c.frames[fi].ctor = opCompound
 			} else {
 				c.ops = append(c.ops, opFrame, opReduce)
@@ -13704,9 +13809,10 @@ expr_loop:
 
 		case ASSIGN: // key=val
 			c.step()
-			if c.frames[fi].ctor == opRet {
+
+			if ctor == opRet {
 				c.frames[fi].ctor = opPair
-			} else if c.frames[fi].ctor == opPair || c.frames[fi].ctor == opURLQuery || c.frames[fi].ctor == opCompound || c.frames[fi].ctor == opList {
+			} else if ctor == opPair || ctor == opURLQuery || ctor == opCompound || ctor == opList {
 				c.ops = append(c.ops, opFrame)
 				c.operands = append(c.operands, 1, opPair) // Bind inside the query!
 				execute()
@@ -13745,7 +13851,8 @@ expr_loop:
 		case CLOSURE:
 			if truly(c.Context, is_url_query_parser{}) {
 				c.step() // Eat `&`
-				if c.frames[fi].ctor == opPair || c.frames[fi].ctor == opCompound {
+				// 🟢 FIX: Protect root frame!
+				if fi > startFrames && (ctor == opPair || ctor == opCompound) {
 					c.ops = append(c.ops, opReduce)
 					execute()
 				}
@@ -13768,9 +13875,7 @@ expr_loop:
 
 		case SELECT_PROP, SELECT_PROG1, SELECT_PROG2:
 			c.step()
-			if c.frames[fi].ctor == opRet {
-				c.frames[fi].ctor = opCompound
-			}
+			if ctor == opRet { c.frames[fi].ctor = opCompound }
 			c.ops = append(c.ops, opReduce)
 			execute()
 			c.ops = append(c.ops, opResolve, opSwap, opIdent, opSwap, opFrame)
@@ -13779,7 +13884,7 @@ expr_loop:
 			continue
 		}
 
-		if c.frames[fi].ctor == opRet { c.frames[fi].ctor = opCompound }
+		if ctor == opRet { c.frames[fi].ctor = opCompound }
 	}
 
 	for len(c.frames) > startFrames+1 {
@@ -20191,9 +20296,9 @@ func (p *argumented) ctx(ctx Context) *argumented_ctx {
 type negative struct{ Value }
 func (p negative) String() string { return `!`+p.Value.String() }
 
-type escaped struct{ valbase; s string }
+type escaped struct{ valbase; s Symbol }
 func (_ *escaped) kind() Kind { return KindEscaped }
-func (p *escaped) String() string { return "\\" + p.s }
+func (p *escaped) String() string { return "\\" + p.s.String() }
 
 type boolean struct{ valbase; bool }
 func (_ *boolean) kind() Kind { return KindBoolean }
@@ -20246,6 +20351,18 @@ func (p *decimal) String() string { return strconv.FormatInt(int64(p.int64),10) 
 type hexadecimal struct{ integer }
 func (p *hexadecimal) kind() Kind { return p.integer.kind()|KindHexadecimal }
 func (p *hexadecimal) String() string { return "0x"+strconv.FormatInt(int64(p.int64),16) }
+
+type escaped_oct struct{ octal }
+type escaped_hex struct{ hexadecimal; braced bool }
+func (p *escaped_oct) String() string {
+	return `\` + p.sym.String()
+}
+func (p *escaped_hex) String() string {
+	if p.braced {
+		return `\x{` + p.sym.String() + `}`
+	}
+	return `\x` + p.sym.String()
+}
 
 const epsilon = 1e-15 /* 1e-16 */
 
@@ -22852,9 +22969,9 @@ func __builds(ctx Context, sb *compactbuilds, v any) {
 		}
 	case *escaped:
 		switch t.s {
-		case "n": sb.writeByte('\n')
-		case "r": sb.writeByte('\r')
-		default:  sb.write(t.s)
+		case sym_n: sb.writeByte('\n')
+		case sym_r: sb.writeByte('\r')
+		default:  sb.write(t.s.String())
 		}
 	case *dbstub: // Discards explictly!
 	default:
@@ -22935,7 +23052,7 @@ func __true(ctx Context, v Value) (res bool) {
 	case *strcomp: return t.elements.true(ctx)
 	case *strlit: return t.s != ""
 	case *raw: return t.s != ""
-	case *escaped: return t.s != ""
+	case *escaped: return t.s != symEmpty
 	case *builtin: return t.t != nil
 	case self: return t.name != symEmpty
 	case *project: return t.name != symEmpty
