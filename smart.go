@@ -4120,7 +4120,7 @@ _op_switch_:
 			lhs = rr.obj
 			if lhs == nil || isNull(lhs) { lhs = rr.Value }
 		}
-		
+
 		// 2. Unwrap RHS
 		if rr, ok := rhs.(resolve_result); ok {
 			rhs = rr.obj
@@ -13125,7 +13125,7 @@ func (p *compiler) calling() (result Value) {
 			erro(p, "unexpected spaces", unwind{})
 		}
 
-		name, obj, sym, opts = p.identity(tok, closure) 
+		name, obj, sym, opts = p.identity(tok, closure)
 
 		// Extract arguments dynamically based on context symbol
 		if (tok == LPAREN && p.tok != RPAREN) || (tok == LBRACE && p.tok != RBRACE) {
@@ -13455,6 +13455,18 @@ expr_loop:
 					}
 
 					if isOptional {
+						// 🟢 Reduce pending structural frames (Compound, Qualword) so LHS is fully bound!
+						for fi >= startFrames {
+							ctor := c.frames[fi].ctor
+							if ctor == opCompound || ctor == opQualword /* || ctor == opPath */ {
+								c.ops = append(c.ops, opReduce)
+								execute()
+								fi = len(c.frames) - 1
+							} else {
+								break
+							}
+						}
+
 						lastIdx := len(c.results) - 1
 						if lastIdx >= c.frames[fi].i {
 							prev := c.results[lastIdx].(Value)
