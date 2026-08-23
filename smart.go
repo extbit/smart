@@ -3182,6 +3182,12 @@ type frame struct {
 	ctor evalop // The constructor operation (opPath, opQualword, etc.)
 }
 
+func (f frame) String() string {
+	var b compactbuilds
+	b.writef("frame{%d %s}", f.i, f.ctor)
+	return b.shared()
+}
+
 type capture struct {
 	start int
 	end   int
@@ -3549,41 +3555,41 @@ _op_switch_:
 		x := s.operands[l-1]
 		s.operands = s.operands[:l-1]
 
-		// 🟢 Temporarily unwrap to inspect the core target, but preserve the outer wrapper!
 		originalX := x
-		if opt, ok := x.(*optional); ok { x = opt.v }
 
 		var id ident_result
+
+	_trampoline_x:
 		switch t := x.(type) {
-		case *word: id = ident_result{originalX.(Value), t.s}
-		case *auto: id = ident_result{originalX.(Value), t.name}
-		case *def:
-			id = ident_result{resolve_result{originalX.(Value), t}, t.name}
-		case *builtin:
-			id = ident_result{resolve_result{originalX.(Value), t}, t.name}
-		case resolve_result:
-			var name Symbol
-			switch o := t.obj.(type) {
-			case *def: name = o.name
-			case *auto: name = o.name
-			case *builtin: name = o.name
-			case *word: name = o.s
-			default:
-				e := _f("VM execution trap: opIdent unexpected %s", ts(t.obj,s)).erro()
-				s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
-				s.ops = append(s.ops, opDebug)
-				break _op_switch_
+		case resolve_result: x = t.obj; goto _trampoline_x
+		case *optional: x = t.v; goto _trampoline_x
+		case *word: id.name = t.s
+		case *auto: id.name = t.name
+		case *def:  id.name = t.name
+		case *builtin: id.name = t.name
+		case *qualword:
+			if len(t.elems) == 2 {
+				if _, ok := t.elems[0].(valbase); ok {
+					x = t.elems[1]
+					goto _trampoline_x
+				}
 			}
-			id = ident_result{originalX.(Value), name} // Pass original intact!
+			e := _f("VM execution trap: opIdent unexpected %s", ts(t,s)).erro()
+			s.operands = append(s.operands, track(e, callstack{num:3}))
+			s.ops = append(s.ops, opDebug)
+			break _trampoline_x
 		case *list:
+			if len(t.elems) == 1 { x = t.elems[0]; goto _trampoline_x }
 			s.ops = append(s.ops, opForEach)
 			s.operands = append(s.operands, t, opIdent)
 			break _op_switch_
 		default:
-			e := _f("VM execution trap: opIdent unexpected %s", ts(originalX,s)).erro()
+			e := _f("VM execution trap: opIdent unexpected %s %s", ts(originalX,s), ts(x,s)).erro()
 			s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
 			s.ops = append(s.ops, opDebug)
 		}
+
+		if id.Value == nil { id.Value = originalX.(Value) }
 
 		s.results = append(s.results, id)
 
@@ -4068,8 +4074,11 @@ _op_switch_:
 			if x, opt := t.obj.(*optional); opt {
 				s.results = append(s.results, &arrow{valbase{s.loc}, SELECT_PROP, x, arg})
 				break _op_switch_
-			} else {
+			} else if t.obj != nil && !isNull(t.obj) {
 				target = t.obj
+				goto _switch_target_type
+			} else {
+				target = t.Value
 				goto _switch_target_type
 			}
 		}
@@ -5149,12 +5158,30 @@ func (s *symstr) opDebug(l, rl int) {
 			args = append(args, e)
 		}
 
-		args = append(args, extra...)
+		var uw bool
+		var d []*diag
+		for _, a := range extra {
+			switch t := a.(type) {
+			case unwind: uw = true
+			case *diag:
+				for _, d := range d { args = append(args, d) }
+				d = []*diag{t}
+				continue
+			case []*diag:
+				for _, d := range d { args = append(args, d) }
+				d = t
+				continue
+			}
+			args = append(args, a)
+		}
+
 		prompt(s.Context, format.shared(), args...)
 
-		for _, a := range args {
-			if _, ok := a.(unwind); ok {
-				panic("debug unwind")
+		if uw {
+			switch len(d) {
+			case 0 : panic("VM execution trap: unwind")
+			case 1 : panic(d[0])
+			default: panic(d)
 			}
 		}
 	} ()
@@ -7415,6 +7442,7 @@ const (
 
 type diagtype int
 type diag struct{ t diagtype; f string; a []any }
+func (d *diag) Error() string { return fmt.Sprintf(d.f, d.a...) }
 func (d *diag) dt(t diagtype) *diag { d.t = t; return d }
 func (d *diag) erro() *diag { d.t = diagError; return d }
 func (d *diag) warn() *diag { d.t = diagWarn; return d }
@@ -14024,13 +14052,24 @@ expr_loop:
 
 			if ctor == opRet { c.frames[fi].ctor = opCompound }
 
-			// 🟢 FIX: Dynamically select opArrow vs opSelect based on Delegate execution context
+			// 🟢 Reduce pending structural frames (Compound, Qualword, Path) so LHS is fully bound!
+			for fi >= startFrames && (ctor == opCompound || ctor == opQualword /* || ctor == opPath */) {
+				c.ops = append(c.ops, opReduce)
+				execute()
+				if fi = len(c.frames) - 1; fi != -1 {
+					ctor = c.frames[fi].ctor
+				} else if false {
+					debug(c, "%v %v %v", ctor, c.frames, ts(c.results,c))
+				}
+			}
+
+			// 🟢 Dynamically select opArrow vs opSelect based on Delegate execution context
 			op := opSelect
 			if tok != SELECT_PROP && !truly(c.Context, is_selection{}) { op = opArrow }
 
-			// 🟢 Push `tok` (the actual operator), NOT `c.tok` (the lookahead token)
+			// 🟢 Push `tok` (the actual operator)
 			c.operands = append(c.operands, tok, 1, 1, 1, op)
-			c.ops = append(c.ops, opResolve, opSwap, opIdent, opSwap, opFrame, opReduce)
+			c.ops = append(c.ops, opResolve, opSwap, opIdent, opSwap, opFrame)
 
 			execute()
 			continue
@@ -14800,7 +14839,7 @@ func (p *compiler) braced_dot() Value {
 	}
 
 	// 1. Built-in Structural Aliases
-	if targetSym == symSelf || targetSym == intern("self") {
+	if targetSym == symSelf {
 		if p.project != nil { return self{p.project, pos} }
 		return &null{valbase{pos}}
 	} else if targetSym == symConfigure || targetSym == intern("configure") {
@@ -26586,7 +26625,7 @@ func ts(i any, o ...any) (s string) {
 		content += "|" + x.name.String()
 	case resolve_result:
 		if x.Value == nil { content = _ts(x.Value) } else { content = "<nil-value>" }
-		if x.obj == nil { content += "<nil>" } else { content += "|"+_ts(x.obj) }
+		if x.obj == nil { content += "|<nil>" } else { content += "|"+_ts(x.obj) }
 	case *argumented_ctx:
 		content = x.val.String() + "(" + wrap(ts_barrier{cc}, x.val.Pos(), x.args) + ")"
 	case   *argumented:
