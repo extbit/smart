@@ -3568,14 +3568,16 @@ _op_switch_:
 			case *auto: name = o.name
 			case *builtin: name = o.name
 			case *word: name = o.s
+			default:
+				e := _f("VM execution trap: opIdent unexpected %s", ts(t.obj,s)).erro()
+				s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
+				s.ops = append(s.ops, opDebug)
+				break _op_switch_
 			}
 			id = ident_result{originalX.(Value), name} // Pass original intact!
 		case *list:
-			if len(t.elems) > 1 {
-				warn(pc(s.Context,t.Pos()), "opIdent: multiple idents: %v", t)
-			}
 			s.ops = append(s.ops, opForEach)
-			s.operands = append(s.operands, originalX, opIdent)
+			s.operands = append(s.operands, t, opIdent)
 			break _op_switch_
 		default:
 			e := _f("VM execution trap: opIdent unexpected %s", ts(originalX,s)).erro()
@@ -3590,11 +3592,7 @@ _op_switch_:
 		tok := s.operands[l-2].(token)
 		s.operands = s.operands[:l-2]
 
-		// 🟢 Unwrap the target
-		actualVal := id.Value
-		if opt, ok := actualVal.(*optional); ok { actualVal = opt.v }
-
-		if rr, ok := actualVal.(resolve_result); ok {
+		if rr, ok := id.Value.(resolve_result); ok {
 			// Persist the id.Value (which retains the optional wrap)
 			s.results = append(s.results, resolve_result{id.Value, rr.obj})
 			break _op_switch_
@@ -3603,18 +3601,26 @@ _op_switch_:
 		var res Value
 		switch tok {
 		case SELECT_PROP, SELECT_PROG1, SELECT_PROG2:
-			erro(pc(s.Context,id.Pos()), "TODO: resolve_project: %v %v", id.Value, id.name)
-		case STRCOMP:
+			if p := project_resolve(s.Context, id.name); p != nil {
+				res = p
+			} else if _, opt := id.Value.(*optional); opt {
+				res = id.Value
+			} else {
+				e := _f("VM execution trap: no such project '%s'; %s", id.name, ts(id.Value,s)).erro()
+				s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
+				s.ops = append(s.ops, opDebug)
+			}
+		case STRCOMP: // $"id"
 			erro(pc(s.Context,id.Pos()), "TODO: %v %v", id.Value, id.name)
-		case STRING:
+		case STRING: // $'id'
 			erro(pc(s.Context,id.Pos()), "TODO: %v %v", id.Value, id.name)
-		case LPAREN:
+		case LPAREN: // $(id)
 			if d := auto_find(s.Context, id.name); d != nil && d.value != nil {
 				res = d
 			} else {
 				res = project_resolve(s.Context, id.name)
 			}
-		case LBRACE:
+		case LBRACE: // ${id}
 			if t := project_entry(s.Context, id.name); t.valid() { res = t }
 		case ILLEGAL:
 			erro(pc(s.Context,id.Pos()), "ILLEGAL: %v %v", id.Value, id.name)
@@ -3631,14 +3637,18 @@ _op_switch_:
 		tok := s.operands[l-2].(token)
 		s.operands = s.operands[:l-2]
 
-		// 🟢 Unwrap the target
-		actualVal := id.Value
-		if opt, ok := actualVal.(*optional); ok { actualVal = opt.v }
-
 		var res Value
 		switch tok {
 		case SELECT_PROP, SELECT_PROG1, SELECT_PROG2:
-			erro(pc(s.Context,id.Pos()), "TODO: resolve_project: %v %v", id.Value, id.name)
+			if p := project_resolve(s.Context, id.name); p != nil {
+				res = p
+			} else if _, opt := id.Value.(*optional); opt {
+				res = id.Value
+			} else if false {
+				e := _f("VM execution trap: no such project '%s'; %s", id.name, ts(id.Value,s)).erro()
+				s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
+				s.ops = append(s.ops, opDebug)
+			}
 		case STRCOMP:
 			erro(pc(s.Context,id.Pos()), "TODO: %v %v", id.Value, id.name)
 		case STRING:
@@ -4030,13 +4040,41 @@ _op_switch_:
 			s.results = append(s.results, nil)
 		}
 
-	case opSelect: // Works with opForEach to evaluate unrolled value!
+	case opSelect:
 		cons := s.operands[l-1].([]Value)
 		s.operands = s.operands[:l-1]
 
-		obj, arg := cons[0], cons[1]
+		target, arg := cons[0], cons[1]
 
-		e := _f("VM execution trap: unimplemented %v %s %s", op, ts(obj,s), ts(arg,s)).erro()
+		var res Value
+
+		// Perform Selection
+	_switch_target_type:
+		switch t := target.(type) {
+		case *project:
+			var prop Value = arg
+			if rr, ok := prop.(resolve_result); ok { prop = rr.Value }
+
+			res = t.resolve(s.Context, __symbol(s.Context, prop))
+
+			if res != nil {
+				s.results = append(s.results, res)
+				break _op_switch_
+			} else if _, opt := prop.(*optional); opt {
+				s.results = append(s.results, &arrow{valbase{s.loc}, SELECT_PROP, t, arg})
+				break _op_switch_
+			}
+		case resolve_result:
+			if x, opt := t.obj.(*optional); opt {
+				s.results = append(s.results, &arrow{valbase{s.loc}, SELECT_PROP, x, arg})
+				break _op_switch_
+			} else {
+				target = t.obj
+				goto _switch_target_type
+			}
+		}
+
+		e := _f("VM execution trap: property %s not found in %s", ts(arg,s), ts(target,s)).erro()
 		s.ops = append(s.ops, opDebug)
 		s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
 		s.results = append(s.results, nil)
@@ -4045,12 +4083,21 @@ _op_switch_:
 		cons := s.operands[l-1].([]Value)
 		s.operands = s.operands[:l-1]
 
-		obj, arg := cons[0], cons[1]
+		lhs, rhs := cons[0], cons[1]
 
-		e := _f("VM execution trap: unimplemented %v %s %s", op, ts(obj,s), ts(arg,s)).erro()
-		s.ops = append(s.ops, opDebug)
-		s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
-		s.results = append(s.results, nil)
+		if rr, ok := lhs.(resolve_result); ok {
+			lhs = rr.obj
+			if lhs == nil || isNull(lhs) { lhs = rr.Value }
+		}
+		
+		// 2. Unwrap RHS
+		if rr, ok := rhs.(resolve_result); ok {
+			rhs = rr.obj
+			if rhs == nil || isNull(rhs) { rhs = rr.Value }
+		}
+
+		// 3. Construct the Bare Arrow (Assuming SELECT_PROP is `->`, you can dynamically pass tok if needed)
+		s.results = append(s.results, &arrow{valbase{s.loc}, SELECT_PROP, lhs, rhs})
 
 	case opClosure, opDelegate:
 		cons := s.operands[l-1].([]any)
@@ -13971,20 +14018,20 @@ expr_loop:
 			break expr_loop
 
 		case SELECT_PROP, SELECT_PROG1, SELECT_PROG2:
+			tok = c.tok
+
 			c.step()
+
 			if ctor == opRet { c.frames[fi].ctor = opCompound }
-			c.ops = append(c.ops, opReduce)
-			execute()
-			c.ops = append(c.ops, opResolve, opSwap, opIdent, opSwap, opFrame)
 
 			// 🟢 FIX: Dynamically select opArrow vs opSelect based on Delegate execution context
-			op := evalop(opSelect)
-			if tok != SELECT_PROP && !truly(c.Context, is_selection{}) {
-				op = opArrow
-			}
+			op := opSelect
+			if tok != SELECT_PROP && !truly(c.Context, is_selection{}) { op = opArrow }
 
 			// 🟢 Push `tok` (the actual operator), NOT `c.tok` (the lookahead token)
 			c.operands = append(c.operands, tok, 1, 1, 1, op)
+			c.ops = append(c.ops, opResolve, opSwap, opIdent, opSwap, opFrame, opReduce)
+
 			execute()
 			continue
 		}
