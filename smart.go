@@ -3565,8 +3565,8 @@ _op_switch_:
 		case *optional: x = t.v; goto _trampoline_x
 		case *word: id.name = t.s
 		case *auto: id.name = t.name
-		case *def:  id.name = t.name
-		case *builtin: id.name = t.name
+		case *def: id = ident_result{resolve_result{originalX.(Value), t}, t.name}
+		case *builtin: id = ident_result{resolve_result{originalX.(Value), t}, t.name}
 		case *qualword:
 			if len(t.elems) == 2 {
 				if _, ok := t.elems[0].(valbase); ok {
@@ -3607,12 +3607,21 @@ _op_switch_:
 		var res Value
 		switch tok {
 		case SELECT_PROP, SELECT_PROG1, SELECT_PROG2:
-			if p := project_resolve(s.Context, id.name); p != nil {
+			if _, ok := id.Value.(*qualword); ok {
+				switch id.name {
+				case symSelf:
+					res = self{ do(s.Context, get_project{}).(*project), s.loc } // skips _project(s.Context)
+				default:
+					e := _f("VM execution trap: opResolve unexpected %s via %s", id.name, ts(id.Value,s)).erro()
+					s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
+					s.ops = append(s.ops, opDebug)
+				}
+			} else if p := project_resolve(s.Context, id.name); p != nil {
 				res = p
-			} else if _, opt := id.Value.(*optional); opt {
+			} else if _, ok := id.Value.(*optional); ok {
 				res = id.Value
 			} else {
-				e := _f("VM execution trap: no such project '%s'; %s", id.name, ts(id.Value,s)).erro()
+				e := _f("VM execution trap: no such project '%s' via %s", id.name, ts(id.Value,s)).erro()
 				s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
 				s.ops = append(s.ops, opDebug)
 			}
@@ -3646,7 +3655,17 @@ _op_switch_:
 		var res Value
 		switch tok {
 		case SELECT_PROP, SELECT_PROG1, SELECT_PROG2:
-			if p := project_resolve(s.Context, id.name); p != nil {
+			if _, ok := id.Value.(*qualword); ok {
+				switch id.name {
+				case symSelf:
+					// FIXME: it should do `get_project{}` in the closure contexts.
+					res = self{ do(s.Context, get_project{}).(*project), s.loc } // skips _project(s.Context)
+				default:
+					e := _f("VM execution trap: opResolve unexpected %s via %s", id.name, ts(id.Value,s)).erro()
+					s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
+					s.ops = append(s.ops, opDebug)
+				}
+			} else if p := project_resolve(s.Context, id.name); p != nil {
 				res = p
 			} else if _, opt := id.Value.(*optional); opt {
 				res = id.Value
@@ -4053,10 +4072,12 @@ _op_switch_:
 		target, arg := cons[0], cons[1]
 
 		var res Value
+		var isSelf Pos
 
 		// Perform Selection
-	_switch_target_type:
+	_trampoline_target:
 		switch t := target.(type) {
+		case self: target, isSelf = t.project, t.pos; goto _trampoline_target
 		case *project:
 			var prop Value = arg
 			if rr, ok := prop.(resolve_result); ok { prop = rr.Value }
@@ -4067,7 +4088,8 @@ _op_switch_:
 				s.results = append(s.results, res)
 				break _op_switch_
 			} else if _, opt := prop.(*optional); opt {
-				s.results = append(s.results, &arrow{valbase{s.loc}, SELECT_PROP, t, arg})
+				if isSelf == NoPos { target = bare_proj{t,s.loc} } else { target = bare_self{t,isSelf} }
+				s.results = append(s.results, &arrow{valbase{s.loc}, SELECT_PROP, target, arg})
 				break _op_switch_
 			}
 		case resolve_result:
@@ -4076,14 +4098,14 @@ _op_switch_:
 				break _op_switch_
 			} else if t.obj != nil && !isNull(t.obj) {
 				target = t.obj
-				goto _switch_target_type
-			} else {
+				goto _trampoline_target
+			} else if false {
 				target = t.Value
-				goto _switch_target_type
+				goto _trampoline_target
 			}
 		}
 
-		e := _f("VM execution trap: property %s not found in %s", ts(arg,s), ts(target,s)).erro()
+		e := _f("VM execution trap: property %s not found in %s", ts(arg,s), ts(cons[0],s)).erro()
 		s.ops = append(s.ops, opDebug)
 		s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
 		s.results = append(s.results, nil)
@@ -26599,6 +26621,7 @@ func ts(i any, o ...any) (s string) {
 	case          *def: if x == nil { content = "<nil-def>" } else { content = x.name.String() }
 	case      *project: content = x.name.String()
 	case          self: content = x.name.String()
+	case     bare_self: content = x.name.String()
 	case     *regexpat: content = x.String()
 	case     *globmeta: content = x.sym.String()
 	case    *globrange: content = x.Value.String()
@@ -28494,6 +28517,13 @@ func (p self) String() string {
 	if p.project == nil { return "{self <nil>}" }
 	return "{self "+p.name.String()+"}"
 }
+
+type bare_self struct { *project; pos Pos }
+type bare_proj struct { *project; pos Pos }
+func (p bare_self) Pos() Pos { return p.pos }
+func (p bare_self) String() string { return ".self" }
+func (p bare_proj) Pos() Pos { return p.pos }
+func (p bare_proj) String() string { return p.name.String() }
 
 func (_ *project) kind() Kind { return KindObject|KindKnownObject|KindProject }
 func (p *project) Pos() Pos { return p.pos }
