@@ -3547,16 +3547,19 @@ _op_switch_:
 		x := s.operands[l-1]
 		s.operands = s.operands[:l-1]
 
+		// 🟢 Temporarily unwrap to inspect the core target, but preserve the outer wrapper!
+		originalX := x
+		if opt, ok := x.(*optional); ok { x = opt.v }
+
 		var id ident_result
 		switch t := x.(type) {
-		case *word: id = ident_result{t, t.s}
-		case *auto: id = ident_result{t, t.name}
-		case *def://, *rule, matched_rule:
-			id = ident_result{resolve_result{t,t},t.name}
+		case *word: id = ident_result{originalX.(Value), t.s}
+		case *auto: id = ident_result{originalX.(Value), t.name}
+		case *def:
+			id = ident_result{resolve_result{originalX.(Value), t}, t.name}
 		case *builtin:
-			id = ident_result{resolve_result{t,t},t.name}
+			id = ident_result{resolve_result{originalX.(Value), t}, t.name}
 		case resolve_result:
-			// 🟢 SAFE FALLBACK: Extract name safely, don't double-wrap, no panic!
 			var name Symbol
 			switch o := t.obj.(type) {
 			case *def: name = o.name
@@ -3564,18 +3567,16 @@ _op_switch_:
 			case *builtin: name = o.name
 			case *word: name = o.s
 			}
-			id = ident_result{t, name} // Pass original 't' completely intact!
+			id = ident_result{originalX.(Value), name} // Pass original intact!
 		case *list:
 			if len(t.elems) > 1 {
 				warn(pc(s.Context,t.Pos()), "opIdent: multiple idents: %v", t)
-				// FIXME: needs to extend opIdent, opResolve(Closure), etc.
 			}
-			// If it's a list, unroll it into identifiers dynamically
 			s.ops = append(s.ops, opForEach)
-			s.operands = append(s.operands, t, opIdent)
-			break _op_switch_ // Suspend current operation
+			s.operands = append(s.operands, originalX, opIdent)
+			break _op_switch_
 		default:
-			e := _f("VM execution trap: opIdent unexpected %s", ts(x,s)).erro()
+			e := _f("VM execution trap: opIdent unexpected %s", ts(originalX,s)).erro()
 			s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
 			s.ops = append(s.ops, opDebug)
 		}
@@ -3584,24 +3585,29 @@ _op_switch_:
 
 	case opResolve:
 		id := s.operands[l-1].(ident_result)
-		tok := s.operands[l-2].(token) // t.l (LPAREN, STRCOMP, etc.)
+		tok := s.operands[l-2].(token)
 		s.operands = s.operands[:l-2]
 
-		if rr, ok := id.Value.(resolve_result); ok {
-			s.results = append(s.results, rr)
-			break _op_switch_ // Suspend current operation cleanly.
+		// 🟢 Unwrap the target
+		actualVal := id.Value
+		if opt, ok := actualVal.(*optional); ok { actualVal = opt.v }
+
+		if rr, ok := actualVal.(resolve_result); ok {
+			// Persist the id.Value (which retains the optional wrap)
+			s.results = append(s.results, resolve_result{id.Value, rr.obj})
+			break _op_switch_
 		}
 
 		var res Value
-		switch tok { // Fix: use `tok` instead of `p.l`
+		switch tok {
 		case SELECT_PROP, SELECT_PROG1, SELECT_PROG2:
 			erro(pc(s.Context,id.Pos()), "TODO: resolve_project: %v %v", id.Value, id.name)
-		case STRCOMP: // TODO: $"foo"
+		case STRCOMP:
 			erro(pc(s.Context,id.Pos()), "TODO: %v %v", id.Value, id.name)
-		case STRING:  // TODO: $'foo'
+		case STRING:
 			erro(pc(s.Context,id.Pos()), "TODO: %v %v", id.Value, id.name)
 		case LPAREN:
-			if d := auto_find(s.Context, id.name); d != nil /* && d != x */ && d.value != nil {
+			if d := auto_find(s.Context, id.name); d != nil && d.value != nil {
 				res = d
 			} else {
 				res = project_resolve(s.Context, id.name)
@@ -3616,7 +3622,6 @@ _op_switch_:
 			res = auto_find(s.Context, id.name)
 		}
 
-		// Push both the callee node and the resolved value to results
 		s.results = append(s.results, resolve_result{id.Value, res})
 
 	case opResolveClosure:
@@ -3624,16 +3629,20 @@ _op_switch_:
 		tok := s.operands[l-2].(token)
 		s.operands = s.operands[:l-2]
 
+		// 🟢 Unwrap the target
+		actualVal := id.Value
+		if opt, ok := actualVal.(*optional); ok { actualVal = opt.v }
+
 		var res Value
 		switch tok {
 		case SELECT_PROP, SELECT_PROG1, SELECT_PROG2:
 			erro(pc(s.Context,id.Pos()), "TODO: resolve_project: %v %v", id.Value, id.name)
-		case STRCOMP: // TODO: $"foo"
+		case STRCOMP:
 			erro(pc(s.Context,id.Pos()), "TODO: %v %v", id.Value, id.name)
-		case STRING:  // TODO: $'foo'
+		case STRING:
 			erro(pc(s.Context,id.Pos()), "TODO: %v %v", id.Value, id.name)
 		case LPAREN:
-			if d := auto_find(s.Context, id.name); d != nil /* && d != x */ && d.value != nil {
+			if d := auto_find(s.Context, id.name); d != nil && d.value != nil {
 				res = d
 			} else {
 				res = closure_resolve(s.Context, id.name)
@@ -3648,8 +3657,6 @@ _op_switch_:
 			res = auto_find(s.Context, id.name)
 		}
 
-		// Push both the callee node and the resolved value to results
-		// Future optimization: drop `x` if legacy funcs are updated to not require it
 		s.results = append(s.results, resolve_result{id.Value, res})
 
 	case opCallback:
@@ -4869,7 +4876,7 @@ _op_switch_:
 	case opDebug: s.opDebug(l, rl)
 	case opEnd: s.err = io.EOF
 	default:
-		e := _f("VM execution trap: unimplemented op %v", op).erro()
+		e := _f("VM execution trap: unimplemented %v", op).erro()
 		s.ops = append(s.ops, opDebug)
 		s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
 	}
@@ -10226,11 +10233,8 @@ const (
 	KindPlainLine
 	KindPlain
 
+    KindOptional
     KindInteger
-    KindBinary
-    KindOctal
-    KindDecimal
-    KindHexadecimal
 
     KindFloat
     KindRaw
@@ -10305,10 +10309,6 @@ var kindNames = []struct {
 	{KindPlainLine, "PlainLine"},
 	{KindPlain, "Plain"},
 	{KindInteger, "Integer"},
-	{KindBinary, "Binary"},
-	{KindOctal, "Octal"},
-	{KindDecimal, "Decimal"},
-	{KindHexadecimal, "Hexadecimal"},
 	{KindFloat, "Float"},
 	{KindRaw, "Raw"},
 	{KindStrLit, "StrLit"},
@@ -12994,7 +12994,7 @@ func (p *compiler) calling() (result Value) {
 		p.Context = sc.Context
 
 		var is_optional_ident bool
-		if closure || optional(name) {
+		if closure || isOptional(name) {
 			defer func(c Context) { p.Context = c } (p.Context)
 			p.Context = optional_ident(p.Context)
 			is_optional_ident = true
@@ -13302,9 +13302,45 @@ expr_loop:
 			val = &globmeta{valbase{c.loc}, tok2sym[tok]}
 
 		case SAST, QUE, PLUS:
-			if tok == QUE && truly(c.Context, is_url_parser{}) {
-				goto skip_step
+			if tok == QUE {
+				if truly(c.Context, is_url_parser{}) {
+					goto skip_step
+				}
+				// 🟢 If QUE (?) acts as an Optional Modifier in standard expressions
+				if !isRegex && !isGlob {
+					isOptional := false
+					fi := len(c.frames) - 1
+
+					// Rule 2: via '→' (Current frame is already building a selection)
+					if c.frames[fi].ctor == opSelect {
+						isOptional = true
+					} else {
+						// Safe Scanner Peek (1 Token)
+						snap_scan := c.scanner.scanstate
+						c.step(); nextTok := c.tok
+						c.scanner.scanstate = snap_scan
+
+						// Rule 1 & 3: before '→' (Next token is a selector)
+						if nextTok == SELECT_PROP || nextTok == SELECT_PROG1 || nextTok == SELECT_PROG2 {
+							isOptional = true
+						} else if nextTok == RPAREN {
+							// Rule 4: delegate name tail $(foobar?)
+							isOptional = true
+						}
+					}
+
+					if isOptional {
+						lastIdx := len(c.results) - 1
+						if lastIdx >= c.frames[fi].i {
+							prev := c.results[lastIdx].(Value)
+							c.results = c.results[:lastIdx] // Pop the target
+							val = &optional{valbase{c.loc}, prev}
+							goto single_token_done
+						}
+					}
+				}
 			}
+
 			if !isRegex {
 				if !isGlob { c.Context = oneshot_glob_expr_ctx{c.Context}; isGlob = true }
 				if tok == PLUS {
@@ -19608,17 +19644,18 @@ func hashPath(prefix, hashee0 string, hasheeN ...any) (string, error) {
 	return sb.String(), nil
 }
 
-func optional(v Value) (_ bool) {
+func isOptional(v Value) (_ bool) {
     switch t := v.(type) {
-    case *loc: return optional(t.Value)
-    case *arrow: return optional(t.o) || optional(t.s)
-    case *list: for _, e := range t.elems { if optional(e) { return true } }
+    case *loc: return isOptional(t.Value)
+    case *arrow: return isOptional(t.o) || isOptional(t.s)
+    case *list: for _, e := range t.elems { if isOptional(e) { return true } }
+	case *optional: return true
 	case *compound:
-		if i := t.len()-1; 0 < i {
+		if false { if i := t.len()-1; 0 < i {
 			if x, y := t.elems[i].(*globmeta); y {
 				return x.sym == symQues
 			}
-		}
+		}}
     }
     return
 }
@@ -20329,6 +20366,10 @@ func (p *argumented) ctx(ctx Context) *argumented_ctx {
 type negative struct{ Value }
 func (p negative) String() string { return `!`+p.Value.String() }
 
+type optional struct{ valbase; v Value }
+func (_ *optional) kind() Kind { return KindOptional }
+func (p *optional) String() string { return p.v.String()+"?" }
+
 type escaped struct{ valbase; s Symbol }
 func (_ *escaped) kind() Kind { return KindEscaped }
 func (p *escaped) String() string { return "\\" + p.s.String() }
@@ -20370,19 +20411,15 @@ type integer struct{ valbase; int64; sym Symbol }
 func (_ *integer) kind() Kind { return KindInteger }
 
 type binary struct{ integer }
-func (p *binary) kind() Kind { return p.integer.kind()|KindBinary }
 func (p *binary) String() string { return "0b"+strconv.FormatInt(int64(p.int64),2) }
 
 type octal struct{ integer }
-func (p *octal) kind() Kind { return p.integer.kind()|KindOctal }
 func (p *octal) String() string { return "0"+strconv.FormatInt(int64(p.int64),8) }
 
 type decimal struct{ integer }
-func (p *decimal) kind() Kind { return p.integer.kind()|KindDecimal }
 func (p *decimal) String() string { return strconv.FormatInt(int64(p.int64),10) }
 
 type hexadecimal struct{ integer }
-func (p *hexadecimal) kind() Kind { return p.integer.kind()|KindHexadecimal }
 func (p *hexadecimal) String() string { return "0x"+strconv.FormatInt(int64(p.int64),16) }
 
 type escaped_oct struct{ octal }
@@ -26429,6 +26466,7 @@ func ts(i any, o ...any) (s string) {
 	case  matched_rule: content = _ts(x.target)
 	case         *rule: content = _ts(x.target)
 	case  *disjunction: content = _ts(x.val)
+	case     *optional: content = _ts(x.v)
 	case      *percpat: content = _ts(x.Prefix) + " " + _ts(x.Suffix)
 	case         *pair: content = _ts(x.key) + " " + _ts(x.val)
 	case        *arrow: content = _ts(x.o) + x.t.String() + _ts(x.s)
