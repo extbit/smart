@@ -4208,8 +4208,8 @@ _op_switch_:
 			s.results = append(s.results, t)
 		default:
 			e := _f("VM execution trap: opEvoke unexpected %s", ts(x.obj,s)).erro()
-			s.ops = append(s.ops, opDebug)
 			s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
+			s.ops = append(s.ops, opDebug)
 		}
 
 		break _op_switch_
@@ -4578,7 +4578,7 @@ _op_switch_:
 		classNode := s.operands[l-1].(Value)
 		s.operands = s.operands[:l-1]
 
-		if !s.tie.ensure_syms() || len(s.tie.syms) == 0 {
+		if !s.tie.ensure_syms() {
 			if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
 			break _op_switch_
 		}
@@ -4601,6 +4601,18 @@ _op_switch_:
 			if t.op == regex_syntax.OpAnyChar { matched = true }
 		case *globmeta:
 			if t.sym == symQues { matched = (r != '/') } else { matched = true }
+		case *globrange:
+			if !t.static {
+				// TODO: Dynamic evaluation fallback
+				e := _f("VM execution trap: opMatchClass unimplemented dynamic evaluation %s", ts(t,s)).erro()
+				s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
+				s.ops = append(s.ops, opDebug)
+			} else {
+				for i := 0; i < len(t.runes); i += 2 {
+					if r >= t.runes[i] && r <= t.runes[i+1] { matched = true; break }
+				}
+				if t.negated { matched = !matched }
+			}
 		}
 
 		if matched {
@@ -4768,7 +4780,7 @@ _op_switch_:
 		classNode := s.operands[l-1].(Value)
 		s.operands = s.operands[:l-1]
 
-		if !s.tie.ensure_syms() || len(s.tie.syms) == 0 {
+		if !s.tie.ensure_syms() {
 			if len(s.backtracks) > 0 { s.unwind(nil) } else { s.err = errMatchFailed }
 			break _op_switch_
 		}
@@ -4792,6 +4804,18 @@ _op_switch_:
 			if t.op == regex_syntax.OpAnyChar { matched = true }
 		case *globmeta:
 			if t.sym == symQues { matched = (r != '/') } else { matched = true }
+		case *globrange:
+			if !t.static {
+				// TODO: Dynamic evaluation fallback
+				e := _f("VM execution trap: opMatchClass unimplemented dynamic evaluation %s", ts(t,s)).erro()
+				s.operands = append(s.operands, track(e, callstack{num:3}, unwind{}))
+				s.ops = append(s.ops, opDebug)
+			} else {
+				for i := 0; i < len(t.runes); i += 2 {
+					if r >= t.runes[i] && r <= t.runes[i+1] { matched = true; break }
+				}
+				if t.negated { matched = !matched }
+			}
 		}
 
 		if matched {
@@ -11934,15 +11958,17 @@ func (p *compiler) globrange() (x *globrange) {
 	// 4. Pre-Compile the Static Spans (The JIT Fast-Path)
 	if x.static {
 		r := []rune(staticStr)
+		var fastRanges []rune
 		for i := 0; i < len(r); i++ {
 			// Mathematical Lookahead: Current Char -> Dash -> Next Char
 			if i+2 < len(r) && r[i+1] == '-' {
-				x.spans = append(x.spans, globspan{min: r[i], max: r[i+2]})
+				fastRanges = append(fastRanges, r[i], r[i+2])
 				i += 2 // Skip the dash and max character
 			} else {
-				x.runes += string(r[i]) // Flat rune match
+				fastRanges = append(fastRanges, r[i], r[i]) // Flat match becomes [char, char]
 			}
 		}
+		x.runes = fastRanges
 	}
 
 	return x
@@ -13362,15 +13388,36 @@ expr_loop:
 		case BAR:
 			setRegex() // `|` natively forces Regex Alternation context
 			c.step()
-			fi := len(c.frames) - 1
-			if c.frames[fi].ctor == opRet { c.frames[fi].ctor = opCompound }
 
+			// 1. Reduce pending high-precedence frames (like Compound, Qualword)
+			for {
+				fi := len(c.frames) - 1
+				if fi > startFrames {
+					ctor := c.frames[fi].ctor
+					if ctor == opCompound || ctor == opQualword || ctor == opPath {
+						c.ops = append(c.ops, opReduce)
+						execute()
+						continue
+					}
+				}
+				break
+			}
+
+			// 2. Ensure we are collecting the alternatives into an opList
+			fi := len(c.frames) - 1
+			if c.frames[fi].ctor == opRet {
+				c.frames[fi].ctor = opList // Elevate the root frame to a list
+			} else if c.frames[fi].ctor != opList {
+				c.ops = append(c.ops, opFrame)
+				c.operands = append(c.operands, 1, opList)
+				execute()
+			}
+
+			// 3. Open a new Compound frame for the next alternative!
 			c.ops = append(c.ops, opFrame)
-			c.operands = append(c.operands, 0, opRet) // Pull 0
-			c.ops = append(c.ops, opFrame)
-			c.operands = append(c.operands, 1, opDisjunct) // Pull 1
-			c.ops = append(c.ops, opReduce)
+			c.operands = append(c.operands, 0, opCompound)
 			execute()
+
 			continue expr_loop
 
 		case BINARY: if i, e := strconv.ParseInt(lit[2:], 2, 64); e == nil { val = _binary(c.loc, i, sym) } else { erro(c, "%v", e, unwind{}); break expr_loop }
@@ -13777,6 +13824,22 @@ expr_loop:
 			}
 			goto skip_step
 		case LBRACK:// Regex: Character Classes; Glob: Range
+			if !isRegex && !isGlob {
+				snap := c.scanner.scanstate
+				c.step() // Look past the initial '['
+
+				if c.tok == CARET || c.tok == LBOT_CORNER {
+					setRegex()
+				} else if c.tok == LBRACK {
+					c.step()
+					if c.tok == COLON {
+						setRegex()
+					}
+				}
+
+				c.scanner.scanstate = snap // Seamless rollback!
+			}
+
 			if isRegex {
 				loc := c.loc
 				var b compactbuilds
@@ -13829,9 +13892,92 @@ expr_loop:
 				ss := b.shared()
 				val = &regexclass{valbase{loc}, ss, parseRegexClass(ss)}
 				goto single_token_done
+			} else {
+				// 🟢 GlobRange Parser Implementation
+				loc := c.loc
+				c.step() // Eat '['
+
+				negated, caret := false, false
+				if c.tok == EXC {
+					negated = true
+					c.step()
+				} else if c.tok == CARET {
+					caret = true
+					negated = true
+					c.step()
+				}
+
+				var b compactbuilds
+				b.setRaw(true)
+				isDynamic := false
+				var elems []Value
+
+				for c.tok != EOF {
+					if c.tok == RBRACK {
+						break
+					}
+
+					if c.tok == DELEGATE || c.tok == CLOSURE {
+						isDynamic = true
+						elems = append(elems, c.calling())
+						continue
+					}
+
+					var s string
+					if c.tok == ESCAPE {
+						s = `\` + c.lit
+					} else if c.tok == WORD {
+						s = c.sym.String()
+					} else if c.lit == "" {
+						s = tok2sym[c.tok].String()
+					} else {
+						s = c.lit
+					}
+
+					if !isDynamic { b.write(s) }
+
+					if c.tok == ESCAPE {
+						elems = append(elems, &escaped{valbase{c.loc}, intern(c.lit)})
+					} else {
+						elems = append(elems, &raw{valbase{c.loc}, s})
+					}
+					c.step()
+				}
+
+				var inner Value
+				if len(elems) == 1 {
+					inner = elems[0]
+				} else if len(elems) > 0 {
+					inner = &compound{elements{elems}}
+				} else {
+					inner = _null(loc)
+				}
+
+				gr := &globrange{
+					Value: inner,
+					negated: negated,
+					caret: caret,
+					static: !isDynamic,
+				}
+
+				if !isDynamic {
+					r := []rune(b.shared())
+					var fastRanges []rune
+					for i := 0; i < len(r); i++ {
+						// 🟢 Fast VM Pre-Compiler: Current Char -> Dash -> Next Char
+						if i+2 < len(r) && r[i+1] == '-' {
+							fastRanges = append(fastRanges, r[i], r[i+2])
+							i += 2 // Skip dash and max bound
+						} else {
+							fastRanges = append(fastRanges, r[i], r[i]) // Flat char encoding
+						}
+					}
+					gr.runes = fastRanges
+				}
+
+				val = gr
+				goto single_token_done
 			}
-			val = c.glob(nil)
-			goto skip_step
 
 		case LBOT_CORNER, LTOP_CORNER: val = c.corner_list(); goto skip_step
 		case DELEGATE: val = c.calling(); goto skip_step
@@ -22323,16 +22469,12 @@ func (p *globbrace) String() string { return "{glob "+p.compound.String()+"}" }
 type globmeta struct{ valbase ; sym Symbol }
 func (p *globmeta) String() string { return p.sym.String() }
 
-// globspan represents a pre-compiled rune boundary (e.g., 'a' to 'z')
-type globspan struct { min, max rune }
-
 // `[a-c]`, `[abc]`, `[a$(var)c]`, `[a$(spaces)c]`, `[!abc]`, `[^abc]`, [a-c0-9],
 type globrange struct {
-	Value  // The fallback AST node for dynamically evaluating $(var) at runtime
+	Value          // The fallback AST node for dynamically evaluating $(var) at runtime
 	negated, caret bool
-	static  bool // True if the range contains zero dynamic variables (e.g., no $(var))
-	runes   string // A flat string of exact-match chars (e.g., "abc")
-	spans   []globspan // Pre-parsed ranges (e.g., [{'a', 'z'}, {'0', '9'}])
+	static  bool   // True if the range contains zero dynamic variables (e.g., no $(var))
+	runes   []rune // Fast VM execution ranges [lo, hi, lo, hi...]
 }
 
 func (p *globrange) String() string {
