@@ -4582,7 +4582,7 @@ _op_switch_:
 		case *matchgroup:
 			s.ops = append(s.ops, opMatchCapEnd, opMatch, opMatchCapStart)
 			s.operands = append(s.operands, t, t.val, t)
-			if true { prompt(s, "MatchGroup: %v\n", ts(t.val,s)) }
+			if false { prompt(s, "MatchGroup: %v\n", ts(t.val,s)) }
 		case *regexalt:
 			// 🟢 Natively register forks BEFORE pushing Branch 0 so undoStack is perfectly clean!
 			for i := len(t.elems) - 1; i >= 1; i-- {
@@ -5165,9 +5165,10 @@ _op_switch_:
 		if capIdx != 0 {
 			startVal := -1
 			if op == opMatchCapStartRev { startVal = -2 }
+
 			s.stems = append(s.stems, capture{
 				start: startVal,
-				end:   capIdx, // 🟢 Store the absolute unique ID here!
+				end:   capIdx,
 				name:  posym{pos, sym},
 				syms:  nil,
 			})
@@ -5178,19 +5179,21 @@ _op_switch_:
 		s.operands[l-1] = nil
 		s.operands = s.operands[:l-1]
 
+		var pos Pos
 		var capIdx int
 		switch t := node.(type) {
-		case *matchgroup: capIdx = t.cap
-		case *globmeta:   capIdx = 1
+		case *matchgroup: pos, capIdx = t.Pos(), t.cap
+		case *globmeta:   pos, capIdx = t.Pos(), 1
 		default:          capIdx = 0
 		}
 
 		if capIdx != 0 {
 			targetStart := -1
 			if op == opMatchCapEndRev { targetStart = -2 }
+
 			for i := len(s.stems) - 1; i >= 0; i-- {
-				// 🟢 Safely match by absolute ID (end), avoiding name collisions!
-				if s.stems[i].start == targetStart && s.stems[i].end == capIdx {
+				// 🟢 Match closure by exact AST source position!
+				if s.stems[i].start == targetStart && s.stems[i].name.Pos == pos {
 					s.stems[i].start = 1 // Closed
 					break
 				}
@@ -5989,131 +5992,89 @@ func (s *symstr) match(pattern, target Value) (matched bool, res, rem Value, ste
 		matched = s.tie.exhausted()
 	}
 
-	// 1. Extract `res` natively from the virtual capture group
-	var fullMatchSyms []posym
-	var filteredStems []capture
+	// 🟢 Guard AST and Stem extraction behind `if matched`
+	if matched {
+		// 1. Extract `res` natively from the virtual capture group
+		var fullMatchSyms []posym
+		var filteredStems []capture
 
-	// Only scan stems added during THIS match
-	for i := snapStems; i < len(s.stems); i++ {
-		cap := s.stems[i]
-		if cap.name.Symbol == fullMatchGrp.name && i == snapStems {
-			fullMatchSyms = cap.syms
-		} else {
-			filteredStems = append(filteredStems, cap)
-		}
-	}
-	s.stems = append(s.stems[:snapStems], filteredStems...) // Clean up the virtual group
-
-	if len(fullMatchSyms) > 0 {
-		elems := s.pump_reduce(fullMatchSyms)
-		if len(elems) == 1 {
-			res = elems[0]
-		} else if len(elems) > 1 {
-			res = _compound(elems...)
-		}
-	} else if rl := len(s.results); rl > snapRes {
-		res = s.results[rl-1].(Value)
-	}
-
-	// 2. Extract `rem` natively without destroying the remaining AST!
-	var remElems []Value
-	if len(s.tie.syms) > 0 {
-		remElems = append(remElems, s.tie.pump_reduce(s.tie.syms)...)
-		s.tie.syms = nil
-	}
-
-	// Mutate target tape: safely change ONLY the exact opYieldSym used for the pump!
-	for i := len(s.tie.operands) - 1; i >= 0; i-- {
-		if loop, ok := s.tie.operands[i].(*op_loop); ok && loop.op == opYieldSym {
-			loop.op = opRet
-			break
-		} else if op, ok := s.tie.operands[i].(evalop); ok && op == opYieldSym {
-			s.tie.operands[i] = opRet
-			break
-		}
-	}
-
-	// Flush the tape natively (Must clear tape error first!)
-	s.tie.err = nil
-	for len(s.tie.ops) > 0 && s.tie.err == nil {
-		s.tie.step()
-	}
-
-	for _, rs := range s.tie.results {
-		if rs != nil {
-			if val, ok := rs.(Value); ok {
-				remElems = append(remElems, val)
+		for i := snapStems; i < len(s.stems); i++ {
+			cap := s.stems[i]
+			if cap.name.Symbol == fullMatchGrp.name && i == snapStems {
+				fullMatchSyms = cap.syms
+			} else {
+				filteredStems = append(filteredStems, cap)
 			}
 		}
-	}
-	s.tie.results = nil
+		s.stems = append(s.stems[:snapStems], filteredStems...)
 
-	if len(remElems) > 0 {
-		if trail && len(remElems) > 1 {
-			// Reverse elements back to chronological AST order!
-			for i, j := 0, len(remElems)-1; i < j; i, j = i+1, j-1 {
-				remElems[i], remElems[j] = remElems[j], remElems[i]
+		if len(fullMatchSyms) > 0 {
+			elems := s.pump_reduce(fullMatchSyms)
+			if len(elems) == 1 {
+				res = elems[0]
+			} else if len(elems) > 1 {
+				res = _compound(elems...)
+			}
+		} else if rl := len(s.results); rl > snapRes {
+			res = s.results[rl-1].(Value)
+		}
+
+		// 3. Extract `stems` natively via isolated mini-pumps
+		activeStems := s.stems[snapStems:]
+
+		// 🟢 Statically collect capture positions in AST syntax order
+		var capPositions []Pos
+		var scanCaps func(Value)
+		scanCaps = func(node Value) {
+			if node == nil { return }
+			switch t := node.(type) {
+			case braced_regex: scanCaps(t.Value)
+			case *matchgroup:
+				capPositions = append(capPositions, t.Pos())
+				scanCaps(t.val)
+			case *compound:
+				for _, e := range t.elems { scanCaps(e) }
+			case *regexalt:
+				for _, e := range t.elems { scanCaps(e) }
+			case *regexrep:
+				scanCaps(t.val)
+			case *disjunction:
+				scanCaps(t.val)
+			case *globmeta:
+				capPositions = append(capPositions, t.Pos())
 			}
 		}
+		scanCaps(pattern)
 
-		if len(remElems) == 1 {
-			rem = remElems[0]
-		} else {
-			rem = &compound{elements{remElems}}
-		}
-	}
+		maxCap := len(capPositions)
+		if maxCap > 0 {
+			stems = make([]Value, maxCap)
+			posToIndex := make(map[Pos]int, maxCap)
+			for i, p := range capPositions {
+				posToIndex[p] = i
+			}
 
-	// 3. Extract `stems` natively via isolated mini-pumps
-	activeStems := s.stems[snapStems:]
+			for _, capture := range activeStems {
+				if capture.syms == nil { continue }
 
-	// 🟢 Statically count maximum capture groups from AST
-	maxCap := 0
-	var scanCaps func(Value)
-	scanCaps = func(node Value) {
-		if node == nil { return }
-		switch t := node.(type) {
-		case braced_regex: scanCaps(t.Value)
-		case *matchgroup:
-			if t.cap > maxCap { maxCap = t.cap }
-			scanCaps(t.val)
-		case *compound:
-			for _, e := range t.elems { scanCaps(e) }
-		case *regexalt:
-			for _, e := range t.elems { scanCaps(e) }
-		case *regexrep:
-			scanCaps(t.val)
-		case *disjunction:
-			scanCaps(t.val)
-		case *globmeta:
-			if maxCap < 1 { maxCap = 1 }
-		}
-	}
-	scanCaps(pattern)
+				// 🟢 Look up stem slot index by AST position
+				idx, exists := posToIndex[capture.name.Pos]
+				if !exists { continue } // Skip virtual full-match group
 
-	// 🟢 Pre-allocate exact array length required by tests
-	if maxCap > 0 {
-		stems = make([]Value, maxCap)
-		for _, capture := range activeStems {
-			// Skip tombstoned/erased stems
-			if capture.syms == nil { continue }
+				var stem Value
+				if len(capture.syms) > 0 {
+					elems := s.pump_reduce(capture.syms)
+					if len(elems) == 1 {
+						stem = elems[0]
+					} else if len(elems) > 1 {
+						stem = _compound(elems...)
+					}
 
-			var stem Value
-			if len(capture.syms) > 0 {
-				elems := s.pump_reduce(capture.syms)
-				if len(elems) == 1 {
-					stem = elems[0]
-				} else if len(elems) > 1 {
-					stem = _compound(elems...)
+					if capture.name.Symbol != symEmpty && stem != nil {
+						stem = &named_stem{stem, capture.name.Symbol}
+					}
 				}
 
-				if capture.name.Symbol != symEmpty && stem != nil {
-					stem = &named_stem{stem, capture.name.Symbol}
-				}
-			}
-
-			// 🟢 Place visited stem directly at its absolute index (1-based)
-			idx := capture.end - 1
-			if idx >= 0 && idx < maxCap {
 				if trail {
 					stems[maxCap-1-idx] = stem
 				} else {
@@ -6121,6 +6082,44 @@ func (s *symstr) match(pattern, target Value) (matched bool, res, rem Value, ste
 				}
 			}
 		}
+	} else {
+		// Strict conformance: Yield nil / empty stems when match fails
+		res = nil
+		stems = nil
+	}
+
+	// 2. Extract `rem` natively (Runs unconditionally so remainder is captured on failure)
+	var remElems []Value
+	if len(s.tie.syms) > 0 {
+		remElems = append(remElems, s.tie.pump_reduce(s.tie.syms)...)
+		s.tie.syms = nil
+	}
+
+	for i := len(s.tie.operands) - 1; i >= 0; i-- {
+		if loop, ok := s.tie.operands[i].(*op_loop); ok && loop.op == opYieldSym {
+			loop.op = opRet; break
+		} else if op, ok := s.tie.operands[i].(evalop); ok && op == opYieldSym {
+			s.tie.operands[i] = opRet; break
+		}
+	}
+
+	s.tie.err = nil
+	for len(s.tie.ops) > 0 && s.tie.err == nil { s.tie.step() }
+
+	for _, rs := range s.tie.results {
+		if rs != nil {
+			if val, ok := rs.(Value); ok { remElems = append(remElems, val) }
+		}
+	}
+	s.tie.results = nil
+
+	if len(remElems) > 0 {
+		if trail && len(remElems) > 1 {
+			for i, j := 0, len(remElems)-1; i < j; i, j = i+1, j-1 {
+				remElems[i], remElems[j] = remElems[j], remElems[i]
+			}
+		}
+		if len(remElems) == 1 { rem = remElems[0] } else { rem = &compound{elements{remElems}} }
 	}
 
 	if checkpoints {
