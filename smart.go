@@ -3546,24 +3546,156 @@ _op_switch_:
 		// Re-queue to continue the driver loop for remaining symbols
 		if len(s.syms) > 0 { s.ops = append(s.ops, opReduceSym) }
 
-		// Natively resolve the single symbol to its pristine AST Value
-		switch sym := ps.Symbol; sym.Kind() {
-		case SymInt:
-			vocab.nummut.RLock()
-			s.results = append(s.results, _decimal(ps.Pos, int64(vocab.numbers[sym.Idx()]), sym))
-			vocab.nummut.RUnlock()
-		case SymFlt:
-			vocab.nummut.RLock()
-			s.results = append(s.results, _float(ps.Pos, math.Float64frombits(vocab.numbers[sym.Idx()]), sym))
-			vocab.nummut.RUnlock()
-		// case SymRaw:
-		// 	vocab.strmut.RLock()
-		// 	s.results = append(s.results, &raw{valbase{ps.Pos}, vocab.strings[sym.Idx()]})
-		// 	vocab.strmut.RUnlock()
-		case SymPct:
-			s.results = append(s.results, _punct(ps.Pos, sym))
+		var val Value
+		switch sym := ps.Symbol; sym {
+		case symSlash:
+			if rl > 0 {
+				top := s.results[rl-1]
+				if ph, ok := top.(*path); ok {
+					ph.elems = append(ph.elems, nil) // Add a slot for the right-hand side
+				} else {
+					s.results[rl-1] = &path{elements{[]Value{top.(Value), nil}}} // 🟢 Safe Cast
+				}
+				break _op_switch_
+			}
+			// Absolute path starting with /
+			s.results = append(s.results, &path{elements{[]Value{_punct(ps.Pos, sym), nil}}})
+			break _op_switch_
+
+		case symDot:
+			if rl > 0 {
+				top := s.results[rl-1]
+				if ph, ok := top.(*path); ok && len(ph.elems) > 0 {
+					last := ph.elems[len(ph.elems)-1]
+					if qw, isQw := last.(*qualword); isQw {
+						qw.elems = append(qw.elems, nil)
+					} else if last != nil {
+						ph.elems[len(ph.elems)-1] = &qualword{elements{[]Value{last, nil}}}
+					}
+				} else if qw, ok := top.(*qualword); ok {
+					qw.elems = append(qw.elems, nil)
+				} else {
+					s.results[rl-1] = &qualword{elements{[]Value{top.(Value), nil}}} // 🟢 Safe Cast
+				}
+				break _op_switch_
+			}
+			val = _punct(ps.Pos, sym)
+
 		default:
-			s.results = append(s.results, _word(ps.Pos, sym))
+			switch sym.Kind() {
+			case SymInt:
+				vocab.nummut.RLock()
+				val = _decimal(ps.Pos, int64(vocab.numbers[sym.Idx()]), sym)
+				vocab.nummut.RUnlock()
+			case SymFlt:
+				vocab.nummut.RLock()
+				val = _float(ps.Pos, math.Float64frombits(vocab.numbers[sym.Idx()]), sym)
+				vocab.nummut.RUnlock()
+			case SymPct:
+				val = _punct(ps.Pos, sym)
+			default:
+				val = _word(ps.Pos, sym)
+			}
+		}
+
+		if val != nil {
+			// 1. Structural Reduction for Strings (strcomp)
+			// strictly ONLY double-quotes (")
+			if p, isPunct := val.(*punct); isPunct && p.s.String() == `"` {
+				var folded bool
+				if rl >= 2 {
+					if openP, isP := s.results[rl-2].(*punct); isP && openP.s.String() == `"` {
+						inner := s.results[rl-1]
+						s.results[rl-2] = &strcomp{valbase{openP.Pos()}, elements{[]Value{inner.(Value)}}}
+						s.results = s.results[:rl-1]
+						folded = true
+					}
+				} else if rl >= 1 {
+					if openP, isP := s.results[rl-1].(*punct); isP && openP.s.String() == `"` {
+						s.results[rl-1] = &strcomp{valbase{openP.Pos()}, elements{nil}}
+						folded = true
+					}
+				}
+
+				if folded {
+					// Cascade the newly completed strcomp into any waiting builder slot!
+					rl = len(s.results)
+					if rl >= 2 {
+						top := s.results[rl-1]
+						prev := s.results[rl-2]
+						
+						if ph, ok := prev.(*path); ok && len(ph.elems) > 0 {
+							lastIdx := len(ph.elems) - 1
+							if qw, isQw := ph.elems[lastIdx].(*qualword); isQw && len(qw.elems) > 0 && qw.elems[len(qw.elems)-1] == nil {
+								qw.elems[len(qw.elems)-1] = top.(Value)
+								s.results = s.results[:rl-1]
+							} else if ph.elems[lastIdx] == nil {
+								ph.elems[lastIdx] = top.(Value)
+								s.results = s.results[:rl-1]
+							}
+						} else if qw, ok := prev.(*qualword); ok && len(qw.elems) > 0 && qw.elems[len(qw.elems)-1] == nil {
+							qw.elems[len(qw.elems)-1] = top.(Value)
+							s.results = s.results[:rl-1]
+						}
+					}
+					break _op_switch_
+				}
+
+				// 🟢 Bypass cascade ONLY for OPENING QUOTES so they stay on stack!
+				s.results = append(s.results, val)
+				break _op_switch_
+			}
+
+			// 2. Cascade ANY OTHER value into structural builders and coalesce words
+			if rl > 0 {
+				top := s.results[rl-1]
+				cascaded := false
+				var targetSlot *Value
+
+				// Locate the deepest active structural slot
+				if ph, ok := top.(*path); ok && len(ph.elems) > 0 {
+					lastIdx := len(ph.elems) - 1
+					if qw, isQw := ph.elems[lastIdx].(*qualword); isQw && len(qw.elems) > 0 {
+						targetSlot = &qw.elems[len(qw.elems)-1]
+					} else {
+						targetSlot = &ph.elems[lastIdx]
+					}
+				} else if qw, ok := top.(*qualword); ok && len(qw.elems) > 0 {
+					targetSlot = &qw.elems[len(qw.elems)-1]
+				}
+
+				if targetSlot != nil {
+					// 🟢 Universal Cascade: If the slot is empty, fill it with ANY value!
+					if *targetSlot == nil {
+						*targetSlot = val
+						cascaded = true
+					} else if w, isWord := val.(*word); isWord {
+						// Coalesce shattered words inside the structural builders
+						if lw, isLw := (*targetSlot).(*word); isLw {
+							*targetSlot = _word(lw.Pos(), intern(lw.s.String() + w.s.String()))
+							cascaded = true
+						}
+					}
+				}
+
+				if cascaded {
+					break _op_switch_
+				}
+
+				// Top-level coalesce
+				if w, isWord := val.(*word); isWord {
+					if p, isPunct := top.(*punct); isPunct && p.s == symDot {
+						s.results[rl-1] = _word(p.Pos(), intern("." + w.s.String()))
+						break _op_switch_
+					}
+					if tw, isTopWord := top.(*word); isTopWord {
+						s.results[rl-1] = _word(tw.Pos(), intern(tw.s.String() + w.s.String()))
+						break _op_switch_
+					}
+				}
+			}
+
+			s.results = append(s.results, val)
 		}
 
 	case opLoop:
@@ -5375,60 +5507,38 @@ func (s *symstr) pump() {
 	}
 }
 
-func (s *symstr) pump_reduce(syms []posym) []Value {
+// Upgraded to return a single, fully structured AST Value!
+func (s *symstr) pump_reduce(syms []posym) Value {
 	if len(syms) == 0 { return nil }
 
-	// 🟢 Isolate the mini-pump state to prevent executing leftover regex instructions!
+	// 1. Isolate the mini-pump state
 	savedErr := s.err
 	savedOps := s.ops
 	s.err = nil
-	s.ops = []evalop{opReduceSym} // ONLY run opReduceSym
+	s.ops = []evalop{opReduceSym}
 
 	baseRes := len(s.results)
 	s.syms = syms
 
 	for len(s.ops) > 0 && s.err == nil { s.step() }
 
-	// 🟢 Restore VM state safely
+	// 2. Restore VM state safely
 	s.err = savedErr
 	s.ops = savedOps
 
 	newRes := len(s.results) - baseRes
-
 	if newRes <= 0 { return nil }
 
-	// elems := make([]Value, newRes)
-	// for i := 0; i < newRes; i++ {
-	// 	elems[i] = s.results[baseRes+i].(Value)
-	// }
-
-	var elems []Value
-	var pendingWord *word
-
+	// 3. Extract the clean AST
+	elems := make([]Value, newRes)
 	for i := 0; i < newRes; i++ {
-		val := s.results[baseRes+i].(Value)
-
-		// 🟢 The Restitcher: Recombine shattered fragments!
-		if w, isWord := val.(*word); isWord {
-			if pendingWord == nil {
-				// 🟢 Clone the struct safely to avoid corrupting global AST caches!
-				pendingWord = &word{w.valbase, w.s}
-			} else {
-				pendingWord.s = intern(pendingWord.s.String() + w.s.String())
-			}
-		} else {
-			if pendingWord != nil {
-				elems = append(elems, pendingWord)
-				pendingWord = nil
-			}
-			elems = append(elems, val)
-		}
+		elems[i] = s.results[baseRes+i].(Value)
 	}
 
-	if pendingWord != nil { elems = append(elems, pendingWord) }
-
 	s.results = s.results[:baseRes] // Clean up the VM stack
-	return elems
+
+	if len(elems) == 1 { return elems[0] }
+	return &compound{elements{elems}}
 }
 
 // exhausted returns true if the engine has successfully completed its
@@ -6009,12 +6119,7 @@ func (s *symstr) match(pattern, target Value) (matched bool, res, rem Value, ste
 		s.stems = append(s.stems[:snapStems], filteredStems...)
 
 		if len(fullMatchSyms) > 0 {
-			elems := s.pump_reduce(fullMatchSyms)
-			if len(elems) == 1 {
-				res = elems[0]
-			} else if len(elems) > 1 {
-				res = _compound(elems...)
-			}
+			res = s.pump_reduce(fullMatchSyms)
 		} else if rl := len(s.results); rl > snapRes {
 			res = s.results[rl-1].(Value)
 		}
@@ -6063,13 +6168,7 @@ func (s *symstr) match(pattern, target Value) (matched bool, res, rem Value, ste
 
 				var stem Value
 				if len(capture.syms) > 0 {
-					elems := s.pump_reduce(capture.syms)
-					if len(elems) == 1 {
-						stem = elems[0]
-					} else if len(elems) > 1 {
-						stem = _compound(elems...)
-					}
-
+					stem = s.pump_reduce(capture.syms)
 					if capture.name.Symbol != symEmpty && stem != nil {
 						stem = &named_stem{stem, capture.name.Symbol}
 					}
@@ -6091,7 +6190,7 @@ func (s *symstr) match(pattern, target Value) (matched bool, res, rem Value, ste
 	// 2. Extract `rem` natively (Runs unconditionally so remainder is captured on failure)
 	var remElems []Value
 	if len(s.tie.syms) > 0 {
-		remElems = append(remElems, s.tie.pump_reduce(s.tie.syms)...)
+		remElems = append(remElems, s.tie.pump_reduce(s.tie.syms))
 		s.tie.syms = nil
 	}
 
