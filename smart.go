@@ -4436,7 +4436,43 @@ _op_switch_:
 		elems := s.operands[l-1].([]Value)
 		s.operands[l-1] = nil
 		s.operands = s.operands[:l-1]
-		s.results = append(s.results, &qualword{elements{elems}})
+
+		if len(elems) == 0 {
+			s.results = append(s.results, _null(s.loc))
+			break _op_switch_
+		}
+
+		// 🟢 Null Propagation: If the head target is null, the qualification evaluates to null
+		first := elems[0]
+		if first == nil {
+			s.results = append(s.results, _null(s.loc))
+			break _op_switch_
+		}
+		if _, isNull := first.(valbase); isNull {
+			s.results = append(s.results, first)
+			break _op_switch_
+		}
+		if _, isNullPtr := first.(*valbase); isNullPtr {
+			s.results = append(s.results, first)
+			break _op_switch_
+		}
+
+		// Filter out trailing-dot null placeholders if target is evaluated
+		var valid []Value
+		for _, e := range elems {
+			if e == nil { continue }
+			if _, isNull := e.(valbase); isNull { continue }
+			if _, isNullPtr := e.(*valbase); isNullPtr { continue }
+			valid = append(valid, e)
+		}
+
+		if len(valid) == 1 {
+			s.results = append(s.results, valid[0])
+		} else if len(valid) == 0 {
+			s.results = append(s.results, _null(s.loc))
+		} else {
+			s.results = append(s.results, &qualword{elements{valid}})
+		}
 
 	case opGlobbrace:
 		elems := s.operands[l-1].([]Value)
@@ -13681,7 +13717,16 @@ func (p *compiler) calling() (result Value) {
 		if tok == LPAREN { p.expect(RPAREN) } else { p.expect(RBRACE) }
 
 	case BINARY, OCTAL, INTEGER, HEXADECIMAL, FLOATING:
-		tok, name = p.tok, p.expr() // $0, $1, $(1.2), $(0x1)...
+		tok = p.tok
+		switch tok {
+		case BINARY: if i, e := strconv.ParseInt(p.lit[2:], 2, 64); e == nil { name = _binary(p.pos, i, p.sym) } else { erro(p, "%v", e, unwind{}) }
+		case OCTAL: if i, e := strconv.ParseInt(p.lit[1:], 8, 64); e == nil { name = _octal(p.pos, i, p.sym) } else { erro(p, "%v", e, unwind{}) }
+		case INTEGER: if i, e := strconv.ParseInt(p.lit, 10, 64); e == nil { name = _decimal(p.pos, i, p.sym) } else { erro(p, "%v", e, unwind{}) }
+		case HEXADECIMAL: if i, e := strconv.ParseInt(p.lit[2:], 16, 64); e == nil { name = _hexadecimal(p.pos, i, p.sym) } else { erro(p, "%v", e, unwind{}) }
+		case FLOATING: if f, e := strconv.ParseFloat(strings.Replace(p.lit,"_","",-1), 64); e == nil { name = _float(p.pos, f, p.sym) } else { erro(p, "%v", e, unwind{}) }
+		}
+		p.step() // Eat exactly the numeric token and stop!
+
 		sym = __symbol(p, name)
 		obj = p.resolve(name.Pos(), sym, closure)
 
@@ -13731,7 +13776,7 @@ func (p *compiler) calling() (result Value) {
 	}
 
 	if obj == nil {
-		erro(pc(p,name.Pos()), _f("nil symbol; tok=%v sym=%v name=%v", tok, sym, name), trace_ctx{100}, callstack{num: 10}, unwind{})
+		erro(pc(p,name.Pos()), _f("nil symbol; tok=%v sym=%v name=%v", tok, sym, ts(name,p)), trace_ctx{100}, callstack{num: 10}, unwind{})
 	}
 
 	// 4. Delegate/Closure Factory Construction
